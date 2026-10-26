@@ -1,0 +1,40 @@
+{
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['config:recommended', 'helpers:pinGitHubActionDigests'],
+  labels: ['dependencies'],
+  // Nothing newer than 3 days is proposed: a fresh release can still be pulled or turn out hostile.
+  minimumReleaseAge: '3 days',
+  internalChecksFilter: 'strict',
+  // Main takes squash merges only, and automerge waits on the ruleset's required checks.
+  automergeStrategy: 'squash',
+  packageRules: [
+    {
+      matchDepTypes: ['devDependencies'],
+      automerge: true,
+    },
+    {
+      matchUpdateTypes: ['digest', 'pinDigest'],
+      automerge: true,
+    },
+    {
+      description: 'Runtime deps and Node majors need a human.',
+      matchDepTypes: ['dependencies'],
+      automerge: false,
+    },
+    {
+      matchPackageNames: ['node', '@types/node', 'gcr.io/distroless/**'],
+      matchUpdateTypes: ['major'],
+      automerge: false,
+    },
+  ],
+  customManagers: [
+    {
+      customType: 'regex',
+      description: 'The pinned-stable HA the e2e runs against is marked with this comment; the minimum is unmarked and never moves.',
+      managerFilePatterns: ['/^\\.github/workflows/[^/]+\\.ya?ml$/'],
+      matchStrings: ['# renovate: pinned-stable HA\\n\\s*[\\w-]+:\\s*["\']?(?<currentValue>\\d{4}\\.\\d+\\.\\d+)'],
+      datasourceTemplate: 'github-releases',
+      depNameTemplate: 'home-assistant/core',
+    },
+  ],
+}
