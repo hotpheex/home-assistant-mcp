@@ -37,15 +37,17 @@ const house = fc.record({
     ),
   ),
 });
-const target = fc.oneof(
-  fc.record({ domain: fc.constantFrom('light', 'lock', '*') }),
-  fc.record({ area: fc.constantFrom(...AREAS) }),
-  fc.record({ label: fc.constantFrom(...LABELS) }),
-);
-const rule = fc.record(
-  { caller: fc.constant('agent'), services: fc.uniqueArray(fc.constantFrom(...PATTERNS), { minLength: 1, maxLength: 2 }), targets: fc.array(target, { minLength: 1, maxLength: 2 }) },
-  { requiredKeys: ['caller', 'services'] },
-);
+const byDomain = fc.record({ domain: fc.constantFrom('light', 'lock', '*') });
+const byArea = fc.record({ area: fc.constantFrom(...AREAS) });
+const byLabel = fc.record({ label: fc.constantFrom(...LABELS) });
+const ruleOf = (target: fc.Arbitrary<{ domain: string } | { area: string } | { label: string }>, requiredKeys: ('caller' | 'services' | 'targets')[]) =>
+  fc.record(
+    { caller: fc.constant('agent'), services: fc.uniqueArray(fc.constantFrom(...PATTERNS), { minLength: 1, maxLength: 2 }), targets: fc.array(target, { minLength: 1, maxLength: 2 }) },
+    { requiredKeys },
+  );
+const rule = ruleOf(fc.oneof(byDomain, byArea, byLabel), ['caller', 'services']);
+// A domain Deny or one withholding entirely hides how area and label Denies expand, so those are drawn most often.
+const deny = fc.oneof({ arbitrary: rule, weight: 1 }, { arbitrary: ruleOf(fc.oneof(byArea, byLabel), ['caller', 'services', 'targets']), weight: 3 });
 const callTarget = fc.oneof(
   fc.record({ entity_id: fc.oneof(fc.constant('all'), fc.subarray(ENTITY_IDS, { minLength: 1 })) }),
   fc.record({ area_id: fc.constantFrom(...AREAS) }),
@@ -53,7 +55,7 @@ const callTarget = fc.oneof(
   fc.record({ device_id: fc.constantFrom('d1', 'd2') }),
 );
 const call = fc.record({ service: fc.constantFrom(...SERVICES), target: callTarget, inData: fc.boolean() });
-const scenario = fc.record({ house, grants: fc.array(rule, { minLength: 1, maxLength: 3 }), denies: fc.array(rule, { minLength: 1, maxLength: 2 }), calls: fc.array(call, { minLength: 3, maxLength: 8 }) });
+const scenario = fc.record({ house, grants: fc.array(rule, { minLength: 1, maxLength: 3 }), denies: fc.array(deny, { minLength: 1, maxLength: 2 }), calls: fc.array(call, { minLength: 3, maxLength: 8 }) });
 
 type House = Registry;
 type Rule = { services: string[]; targets?: ({ domain: string } | { area: string } | { label: string })[] };
@@ -130,7 +132,7 @@ test('property: every service call HA receives acts only on entities a Grant cov
       }
       assert.ok(ha.received.every((r) => r.token === USERS_TOKEN));
     }),
-    { numRuns: 100 },
+    { numRuns: 150 },
   );
   assert.ok(forwarded > 0, 'no generated call was ever allowed, so the property checked nothing');
 });
