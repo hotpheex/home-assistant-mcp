@@ -3,6 +3,7 @@ import {
   createConnection,
   createLongLivedTokenAuth,
   ERR_CANNOT_CONNECT,
+  ERR_CONNECTION_LOST,
   ERR_INVALID_AUTH,
   type Connection,
 } from 'home-assistant-js-websocket';
@@ -24,6 +25,19 @@ export type Command = { type: string } & Record<string, unknown>;
 
 /** Nothing left the process. */
 export class HaUnavailable extends Error {}
+/** The connection dropped after a write was sent, so it may or may not have run. */
+export class OutcomeUnknown extends Error {}
+/** HA answered with an error result; the message is HA's. */
+export class HaError extends Error {}
+
+/** The client rejects with a bare 3 when nothing was sent, and with a whole envelope coded 3 when the result never came. */
+function failureOf(e: unknown, write: boolean): unknown {
+  if (e === ERR_CONNECTION_LOST) return new HaUnavailable();
+  if (typeof e !== 'object' || e === null) return e;
+  if ('error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST) return write ? new OutcomeUnknown() : new HaUnavailable();
+  if ('code' in e && typeof e.code === 'string' && 'message' in e) return new HaError(String(e.message));
+  return e;
+}
 
 export interface Gate {
   send(allowed: Allowed, command: Command): Promise<unknown>;
@@ -91,7 +105,11 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       }
       const conn = connections.get(allowed.tier);
       if (!conn?.connected) throw new HaUnavailable();
-      return conn.sendMessagePromise({ ...command });
+      try {
+        return await conn.sendMessagePromise({ ...command });
+      } catch (e) {
+        throw failureOf(e, command === allowed.command);
+      }
     },
     close() {
       closed = true;

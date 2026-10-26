@@ -3,7 +3,7 @@ import * as z from 'zod';
 import pkg from '../package.json' with { type: 'json' };
 import type { Authenticated } from './auth.ts';
 import { decideRead, decideServiceCall, grantsFor, planServiceCall, type Allowed, type Operation } from './evaluator.ts';
-import { HaUnavailable, type Command, type Gate } from './gate.ts';
+import { HaError, HaUnavailable, OutcomeUnknown, type Command, type Gate } from './gate.ts';
 import type { Audit } from './log.ts';
 import type { Policy } from './policy.ts';
 import { expandAll, extract, mergeTarget } from './resolver.ts';
@@ -45,6 +45,18 @@ const page = {
 const text = (value: unknown): CallToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
 const failure = (message: string): CallToolResult => ({ isError: true, content: [{ type: 'text', text: message }] });
 
+/** About 80 kB keeps a result under Claude Code's default MCP output limit. */
+const RESPONSE_CAP = 80_000;
+
+/** A write has already run, so an oversize response is cut with a visible marker rather than refused. */
+function writeResult(value: unknown): CallToolResult {
+  const full = Buffer.from(JSON.stringify(value));
+  if (full.length <= RESPONSE_CAP) return text(value);
+  const marker = `\n[truncated: the response was ${full.length} bytes, over the ${RESPONSE_CAP}-byte cap; the call ran]`;
+  const kept = full.subarray(0, RESPONSE_CAP - Buffer.byteLength(marker)).toString().replace(/\uFFFD$/, '');
+  return { content: [{ type: 'text', text: kept + marker }] };
+}
+
 /** A failure the Caller can act on, returned as an isError result. */
 class ToolFailure extends Error {}
 
@@ -55,9 +67,16 @@ async function read<T>(ctx: Context, allowed: Allowed | undefined, command: { ty
     return (await ctx.gate.send(allowed, command)) as T;
   } catch (e) {
     if (e instanceof HaUnavailable) throw new ToolFailure('HA unavailable: nothing was sent to Home Assistant. Try again later.');
+    if (e instanceof OutcomeUnknown) {
+      throw new ToolFailure('Outcome unknown: the connection to Home Assistant dropped after the call was sent. Check state before retrying.');
+    }
+    if (e instanceof HaError) throw new ToolFailure(`Home Assistant error: ${e.message}`);
     throw e;
   }
 }
+
+/** Sends the exact write the evaluator allowed. */
+const write = <T>(ctx: Context, allowed: Allowed) => read<T>(ctx, allowed, allowed.command!);
 
 interface HaState {
   entity_id: string;
@@ -160,9 +179,9 @@ const callService = defineTool({
       audit({ decision: 'deny', entities: expansion.entities, grants, denies: decision.denies, uncovered });
       return denial;
     }
-    const result = await read<{ context: { id: string }; response?: unknown }>(ctx, decision.allowed, decision.allowed.command!);
+    const result = await write<{ context: { id: string }; response?: unknown }>(ctx, decision.allowed);
     audit({ decision: 'allow', entities: expansion.entities, grants, context_id: result.context.id });
-    return text({ entity_ids: expansion.entities, context_id: result.context.id, ...('response' in result ? { response: result.response } : {}) });
+    return writeResult({ entity_ids: expansion.entities, context_id: result.context.id, ...('response' in result ? { response: result.response } : {}) });
   },
 });
 

@@ -129,6 +129,9 @@ export async function startFakeHa(options: FakeHaOptions) {
   const received: Received[] = [];
   const registry = options.registry ?? { entities: [], devices: [], areas: [], floors: [], labels: [] };
   let contexts = 0;
+  const drop = new Set<string>();
+  let down = false;
+  let refused = 0;
   const handlers: Record<string, (token: string, msg: Received['message']) => unknown> = {
     supported_features: () => null,
     get_states: () =>
@@ -167,6 +170,10 @@ export async function startFakeHa(options: FakeHaOptions) {
   const http = createServer((_req, res) => res.writeHead(404).end());
   const wss = new WebSocketServer({ server: http, path: '/api/websocket' });
   wss.on('connection', (ws) => {
+    if (down) {
+      refused++;
+      return ws.terminate();
+    }
     let token: string | undefined;
     let lastId = 0;
     const send = (m: unknown) => ws.send(JSON.stringify(m));
@@ -189,6 +196,7 @@ export async function startFakeHa(options: FakeHaOptions) {
         return send({ id, type: 'result', success: false, error: { code: 'id_reuse', message: 'Identifier values have to increase.' } });
       }
       lastId = id;
+      if (drop.has(msg.type)) return ws.terminate();
       if (msg.type === 'ping') return send({ id, type: 'pong' });
       const handler = handlers[msg.type];
       if (!handler) {
@@ -208,6 +216,15 @@ export async function startFakeHa(options: FakeHaOptions) {
   return {
     url: `http://127.0.0.1:${port}`,
     received,
+    /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
+    drop,
+    /** Drops every connection and refuses new ones, until the client has seen the outage by trying to reconnect. */
+    async outage() {
+      down = true;
+      for (const ws of wss.clients) ws.terminate();
+      const before = refused;
+      for (let i = 0; i < 300 && refused === before; i++) await new Promise((r) => setTimeout(r, 10));
+    },
     async close() {
       for (const ws of wss.clients) ws.terminate();
       await new Promise((resolve) => wss.close(resolve));
