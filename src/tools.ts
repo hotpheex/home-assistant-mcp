@@ -13,13 +13,15 @@ import {
   HELPER_DOMAINS,
   planServiceCall,
   splitHelperId,
+  mergedUpdate,
   type Allowed,
   type ConfigKind,
   type ConfigWrite,
+  type ConfigWriteDecision,
   type Operation,
 } from './evaluator.ts';
 import { HaUnavailable, OutcomeUnknown, type Command, type Gate, type RestRequest } from './gate.ts';
-import type { Audit } from './log.ts';
+import { auditFor, type Audit } from './log.ts';
 import type { Policy } from './policy.ts';
 import { maskSecrets, redactedPath, stripBearerTokens } from './redaction.ts';
 import { domainsOf, expandAll, extract, mergeTarget } from './resolver.ts';
@@ -48,8 +50,9 @@ const OPERATION_NAME: Record<Operation, string> = {
 
 interface Context {
   policy: Policy;
-  caller: Authenticated;
+  auth: Authenticated;
   gate: Gate;
+  /** Writes a record naming this request's Caller, key, Operation and tool. */
   audit: Audit;
   options: AuditOptions;
 }
@@ -59,6 +62,8 @@ interface Decided {
   grants: number[];
   lacking: string;
   request: Record<string, unknown>;
+  /** The write decided here, so `run` sends what was checked rather than deciding again. */
+  allowed?: ConfigWriteDecision['allowed'];
 }
 
 interface ToolSpec<Input extends z.ZodType> {
@@ -67,7 +72,7 @@ interface ToolSpec<Input extends z.ZodType> {
   input: Input;
   annotations: { readOnlyHint: boolean; destructiveHint: boolean };
   decide?(args: z.output<Input>, ctx: Context): Decided;
-  run(args: z.output<Input>, ctx: Context): Promise<CallToolResult>;
+  run(args: z.output<Input>, ctx: Context, decided?: Decided): Promise<CallToolResult>;
 }
 
 const page = {
@@ -130,9 +135,6 @@ async function read<T>(ctx: Context, allowed: Allowed | undefined, command: Comm
   }
 }
 
-/** Sends the exact write the evaluator allowed. */
-const write = <T>(ctx: Context, allowed: Allowed) => read<T>(ctx, allowed, allowed.command as Command);
-
 /** A write has already run, so an oversize response is cut with a visible marker rather than refused. */
 function writeResult(value: unknown): CallToolResult {
   const full = Buffer.from(JSON.stringify(value));
@@ -144,11 +146,11 @@ function writeResult(value: unknown): CallToolResult {
 
 /** Sends a plain read, which the evaluator decides by the Caller alone. */
 const plainRead = <T>(ctx: Context, command: Command) =>
-  read<T>(ctx, decideRead(ctx.policy, ctx.caller.caller, 'plain_read').allowed, command);
+  read<T>(ctx, decideRead(ctx.policy, ctx.auth.caller, 'plain_read').allowed, command);
 
 /** Sends a config read at the admin tier and masks what comes back. */
 const configRead = async <T>(ctx: Context, command: Command, kind: ConfigKind = 'automation') =>
-  maskSecrets(await read(ctx, decideConfigRead(ctx.policy, ctx.caller.caller, kind).allowed, command)) as T;
+  maskSecrets(await read(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, command)) as T;
 
 /** Sends a config REST request; HA's error statuses become failures, except a 404 on GET, which means no such item. */
 async function rest(ctx: Context, allowed: Allowed | undefined, request: RestRequest): Promise<unknown> {
@@ -380,11 +382,11 @@ const getConfig = defineTool({
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
     }),
   annotations: { readOnlyHint: true, destructiveHint: false },
-  decide: ({ kind }, ctx) => ({ grants: decideConfigRead(ctx.policy, ctx.caller.caller, kind).grants, lacking: `${kind} config`, request: { kind } }),
+  decide: ({ kind }, ctx) => ({ grants: decideConfigRead(ctx.policy, ctx.auth.caller, kind).grants, lacking: `${kind} config`, request: { kind } }),
   async run({ kind, entity_id, id }, ctx) {
     if (kind === 'automation' || kind === 'script') return text(await configRead(ctx, { type: `${kind}/config`, entity_id }));
     if (kind === 'scene') {
-      const config = await rest(ctx, decideConfigRead(ctx.policy, ctx.caller.caller, kind).allowed, { method: 'GET', path: configPath(kind, id!) });
+      const config = await rest(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, { method: 'GET', path: configPath(kind, id!) });
       if (config === undefined) throw new ToolFailure(`Scene ${id} not found.`);
       return text({ config: maskSecrets(config) });
     }
@@ -478,7 +480,7 @@ const listServices = defineTool({
         fields: d.fields ?? {},
         target: d.target !== undefined,
         response: d.response !== undefined,
-        callable: callable(ctx.policy, ctx.caller.caller, service, d.target !== undefined),
+        callable: callable(ctx.policy, ctx.auth.caller, service, d.target !== undefined),
       }));
     return text(pageOf('services', services, args));
   },
@@ -506,11 +508,10 @@ const callService = defineTool({
   async run({ domain, service, target, data = {} }, ctx) {
     const name = `${domain}.${service}`;
     const requested = mergeTarget(target, data);
-    const audit = (record: Record<string, unknown>) =>
-      ctx.audit({ caller: ctx.caller.caller, key_hash_prefix: ctx.caller.keyHashPrefix, operation: 'service_call', tool: 'ha_call_service', service: name, target: requested, ...record });
+    const audit = (record: Record<string, unknown>) => ctx.audit({ service: name, target: requested, ...record });
     const denial = failure(`Denied: this Caller holds no Grant to call ${name} over ${Object.keys(requested).length ? JSON.stringify(requested) : 'no target'}. Do not retry this call.`);
 
-    const planned = planServiceCall(ctx.policy, ctx.caller.caller, name);
+    const planned = planServiceCall(ctx.policy, ctx.auth.caller, name);
     if (!planned.plan) {
       audit({ decision: 'deny', grants: [], denies: planned.denies });
       return denial;
@@ -543,7 +544,7 @@ const callService = defineTool({
       audit({ decision: 'deny', entities: expansion.entities, grants, denies: decision.denies, uncovered });
       return denial;
     }
-    const result = await write<{ context: { id: string }; response?: unknown }>(ctx, decision.allowed);
+    const result = await read<{ context: { id: string }; response?: unknown }>(ctx, decision.allowed, decision.allowed.write.command);
     if (ctx.options.auditWrites) audit({ decision: 'allow', entities: expansion.entities, grants, context_id: result.context.id });
     return writeResult({ entity_ids: expansion.entities, context_id: result.context.id, ...('response' in result ? { response: result.response } : {}) });
   },
@@ -572,31 +573,28 @@ const writeConfig = defineTool({
     }),
   annotations: { readOnlyHint: false, destructiveHint: true },
   decide: (change: ConfigWrite, ctx) => ({
-    grants: decideConfigWrite(ctx.policy, ctx.caller.caller, change).grants,
+    ...decideConfigWrite(ctx.policy, ctx.auth.caller, change),
     lacking: `config writes of ${change.kind}`,
     request: { kind: change.kind, action: change.action, id: change.id },
   }),
-  async run(change: ConfigWrite, ctx) {
+  async run(change: ConfigWrite, ctx, decided) {
     const { kind, action, id } = change;
+    if (!decided?.allowed) throw new Error('config write sent without an Allowed');
+    let { allowed } = decided;
     const marked = redactedPath(change.config);
     if (marked !== undefined) {
       throw new ToolFailure(`config carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
     }
-    let config = change.config;
-    // HA's config REST replaces the whole entry, so an update merges its top-level keys into the stored config.
     if (kind !== 'helper' && action !== 'delete') {
-      const lookup = decideConfigRead(ctx.policy, ctx.caller.caller, kind).allowed;
+      const lookup = decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed;
       const stored = (await rest(ctx, lookup, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
       if (action === 'create' && stored) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
       if (action === 'update' && !stored) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
-      config = { ...stored, ...config };
+      if (stored) allowed = mergedUpdate(allowed, stored);
     }
-    const { allowed, grants } = decideConfigWrite(ctx.policy, ctx.caller.caller, { ...change, config });
-    if (!allowed?.command) throw new Error('config write sent without an Allowed');
-    if (ctx.options.auditWrites) {
-      ctx.audit({ caller: ctx.caller.caller, key_hash_prefix: ctx.caller.keyHashPrefix, operation: 'config_write', tool: 'ha_write_config', kind, action, id, decision: 'allow', grants });
-    }
-    const result = 'type' in allowed.command ? await write(ctx, allowed) : await rest(ctx, allowed, allowed.command);
+    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: decided.grants });
+    const { write } = allowed;
+    const result = write.via === 'websocket' ? await read(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
     // A helper write echoes the whole stored item, keys the Caller did not send included.
     return writeResult({ kind, action, id, result: maskSecrets(result) });
   },
@@ -636,19 +634,18 @@ const GENERAL_INSTRUCTIONS = [
 ];
 const instructionsFor = (visible: ToolName[]) => [...visible.flatMap((name) => TOOL_INSTRUCTIONS[name] ?? []), ...GENERAL_INSTRUCTIONS].join('\n');
 
-/**
- * One server per request, listing only the tools whose kind the Caller holds. A hidden tool called
- * directly is refused and audited before its input is read, so nothing reaches HA.
- */
 /** Allowed Operations are audited only on the deployer's opt-in, so reads don't drown the log. */
 export interface AuditOptions {
   auditReads: boolean;
   auditWrites: boolean;
 }
 
-export function buildServer(policy: Policy, gate: Gate, audit: Audit, caller: Authenticated, options: AuditOptions): Server {
-  const ctx: Context = { policy, caller, gate, audit, options };
-  const holds = (name: ToolName) => grantsFor(policy, caller.caller, TOOL_KIND[name]).length > 0;
+/**
+ * One server per request, listing only the tools whose kind the Caller holds. A hidden tool called
+ * directly is refused and audited before its input is read, so nothing reaches HA.
+ */
+export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Authenticated, options: AuditOptions): Server {
+  const holds = (name: ToolName) => grantsFor(policy, auth.caller, TOOL_KIND[name]).length > 0;
   const visible = (Object.keys(TOOLS) as ToolName[]).filter(holds);
   const server = new Server(
     { name: pkg.name, version: pkg.version },
@@ -663,9 +660,9 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, caller: Au
     const { name } = params;
     if (!isTool(name)) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Tool ${name} not found`);
     const operation = TOOL_KIND[name];
-    const who = { caller: caller.caller, key_hash_prefix: caller.keyHashPrefix, operation, tool: name };
+    const ctx: Context = { policy, auth, gate, audit: auditFor(audit, auth, operation, name), options };
     if (!holds(name)) {
-      audit({ ...who, decision: 'deny', grants: [] });
+      ctx.audit({ decision: 'deny', grants: [] });
       return failure(`Denied: this Caller holds no Grant for ${OPERATION_NAME[operation]}. Do not retry this call.`);
     }
     const tool = TOOLS[name];
@@ -673,16 +670,16 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, caller: Au
     if (!args.success) {
       return failure(`Input validation error: ${args.error.issues.map((i) => `${i.path.join('.') || '(arguments)'}: ${i.message}`).join('; ')}`);
     }
-    const decided = tool.decide?.(args.data, ctx) ?? { grants: grantsFor(policy, caller.caller, operation), lacking: OPERATION_NAME[operation], request: {} };
+    const decided = tool.decide?.(args.data, ctx) ?? { grants: grantsFor(policy, auth.caller, operation), lacking: OPERATION_NAME[operation], request: {} };
     if (decided.grants.length === 0) {
-      audit({ ...who, ...decided.request, decision: 'deny', grants: [] });
+      ctx.audit({ ...decided.request, decision: 'deny', grants: [] });
       return failure(`Denied: this Caller holds no Grant for ${decided.lacking}. Do not retry this call.`);
     }
     if (options.auditReads && READS.has(operation)) {
-      audit({ ...who, decision: 'allow', grants: decided.grants, request: args.data });
+      ctx.audit({ decision: 'allow', grants: decided.grants, request: args.data });
     }
     try {
-      const result = await tool.run(args.data, ctx);
+      const result = await tool.run(args.data, ctx, decided);
       // A read is refused whole rather than cut off, so the Caller never reasons over a truncated answer.
       if (READS.has(operation) && Buffer.byteLength(JSON.stringify(result.content)) > BYTE_CAP) {
         return failure(`The response is over ${BYTE_CAP / 1000} kB, so nothing was returned: narrow the query with filters, a shorter window or a smaller limit.`);

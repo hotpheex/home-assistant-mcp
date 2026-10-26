@@ -7,7 +7,7 @@ import {
   ERR_INVALID_AUTH,
   type Connection,
 } from 'home-assistant-js-websocket';
-import { HELPER_DOMAINS, type Allowed, type Operation, type Tier } from './evaluator.ts';
+import { HELPER_DOMAINS, isIssued, type Allowed, type Operation, type Tier } from './evaluator.ts';
 import type { Log } from './log.ts';
 
 const MINIMUM_HA = [2026, 10] as const;
@@ -71,6 +71,10 @@ export interface Gate {
 
 const releaseOf = (version: string) => version.split('.').slice(0, 2).map(Number);
 const compare = (a: number[], b: readonly number[]) => (a[0]! - b[0]!) || (a[1]! - b[1]!);
+
+function issuedOnly(allowed: Allowed) {
+  if (!isIssued(allowed)) throw new Error('the gate sends only an Allowed the evaluator issued');
+}
 
 /**
  * The only code that reaches HA. It holds one connection per needed tier, plus REST for config, and exits the server
@@ -148,7 +152,9 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
 
   return {
     async send(allowed, command) {
-      if (command !== allowed.command && !READ_COMMANDS[allowed.operation]?.has(command.type)) {
+      issuedOnly(allowed);
+      const write = allowed.write?.via === 'websocket' && command === allowed.write.command;
+      if (!write && !READ_COMMANDS[allowed.operation]?.has(command.type)) {
         throw new Error(`${allowed.operation} may not send ${command.type}`);
       }
       const conn = connections.get(allowed.tier);
@@ -156,14 +162,16 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       try {
         return await conn.sendMessagePromise({ ...command });
       } catch (e) {
-        throw failureOf(e, command === allowed.command);
+        throw failureOf(e, write);
       }
     },
     ready,
     connected,
     async rest(allowed, request) {
+      issuedOnly(allowed);
+      const write = allowed.write?.via === 'rest' && request === allowed.write.request;
       const lookup = allowed.operation === 'config_read' && request.method === 'GET' && CONFIG_PATH.test(request.path);
-      if (request !== allowed.command && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
+      if (!write && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
       if (!connections.get(allowed.tier)?.connected) throw new HaUnavailable();
       let res: Response;
       try {
@@ -174,7 +182,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
         });
       } catch {
         // fetch cannot tell a refused connection from one dropped mid-request, so a write errs towards unknown.
-        throw request === allowed.command ? new OutcomeUnknown() : new HaUnavailable();
+        throw write ? new OutcomeUnknown() : new HaUnavailable();
       }
       // A 401 from HA is text/plain.
       return { status: res.status, body: await res.json().catch(() => null) };

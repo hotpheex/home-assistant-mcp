@@ -3,7 +3,7 @@ import { toNodeHandler } from '@modelcontextprotocol/node';
 import { createMcpHandler, type AuthInfo } from '@modelcontextprotocol/server';
 import { authenticator, type Authenticated } from './auth.ts';
 import type { Gate } from './gate.ts';
-import type { Audit, Log } from './log.ts';
+import { auditFor, type Audit, type Log } from './log.ts';
 import type { Policy } from './policy.ts';
 import { buildServer, type AuditOptions } from './tools.ts';
 
@@ -26,8 +26,7 @@ export function createHttp(policy: Policy, allowedOrigins: ReadonlySet<string>, 
     if (origin !== undefined && !allowedOrigins.has(origin)) return deny(res, 403);
     const result = authenticate(req.headers.authorization, new Date());
     if (!result.ok) {
-      const { reason, caller, keyHashPrefix } = result;
-      audit({ operation: 'authenticate', decision: 'deny', reason, remote: req.socket.remoteAddress, caller, key_hash_prefix: keyHashPrefix });
+      auditFor(audit, result, 'authenticate')({ decision: 'deny', reason: result.reason, remote: req.socket.remoteAddress });
       return deny(res, 401, { 'www-authenticate': 'Bearer' });
     }
     req.auth = { token: '', clientId: result.caller, scopes: [], extra: { caller: result } };

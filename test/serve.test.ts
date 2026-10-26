@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { OPERATION_TIER, type Operation } from '../src/evaluator.ts';
+import { decideServiceCall, NAME_LOOKUP, OPERATION_TIER, planServiceCall, type Allowed, type Operation } from '../src/evaluator.ts';
+import { openGate } from '../src/gate.ts';
+import { parsePolicy } from '../src/policy.ts';
 import { TOOL_KIND, type ToolName } from '../src/tools.ts';
 import { ADMIN_TOKEN, body, connect, ERAS, fakeHa, newKey, startServer, USERS_TOKEN } from './harness.ts';
 
@@ -172,6 +174,35 @@ const TIER_TOKEN = { users: USERS_TOKEN, admin: ADMIN_TOKEN };
 
 test('the admin pin: the admin tier serves exactly config read and config write', () => {
   assert.deepEqual(Object.keys(OPERATION_TIER).filter((op) => OPERATION_TIER[op as Operation] === 'admin'), ['config_read', 'config_write']);
+});
+
+test('the gate sends only an Allowed the evaluator issued, as issued: a forged, spread or altered one sends nothing', async (t) => {
+  const ha = await fakeHa(t);
+  const gate = openGate(ha.url, new Map([['users', USERS_TOKEN], ['admin', ADMIN_TOKEN]] as const), () => {}, (reason) => assert.fail(reason));
+  t.after(() => gate.close());
+  await gate.connected;
+  const before = ha.received.length;
+  const unlock = { type: 'call_service', domain: 'lock', service: 'unlock', target: { entity_id: ['lock.front_door'] }, service_data: {} };
+  const post = { method: 'POST', path: '/api/config/automation/config/x', body: {} } as const;
+  const forged: Allowed[] = [
+    { ...NAME_LOOKUP, operation: 'service_call', write: { via: 'websocket', command: unlock } },
+    { ...NAME_LOOKUP, operation: 'config_write', tier: 'admin', write: { via: 'rest', request: post } },
+  ];
+  await assert.rejects(gate.send(forged[0]!, unlock), /evaluator issued/);
+  await assert.rejects(gate.rest(forged[1]!, post), /evaluator issued/);
+  assert.throws(() => Object.assign(NAME_LOOKUP, { operation: 'service_call', write: { via: 'websocket', command: unlock } }), TypeError);
+  await assert.rejects(gate.send(NAME_LOOKUP, unlock), /may not send call_service/);
+
+  const policy = parsePolicy(`version: 1\ncallers: { agent: { keys: [] } }\ngrants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ domain: light }]\n`);
+  const expansion = { targeted: true, entities: ['light.kitchen'], grantEntities: [], denyEntities: [] };
+  const plan = planServiceCall(policy, 'agent', 'light.turn_on').plan!;
+  const { allowed } = decideServiceCall(policy, plan, expansion, { domain: 'light', service: 'turn_on', data: {}, responds: false });
+  const { target } = allowed!.write.command as unknown as { target: { entity_id: string[] } };
+  assert.throws(() => target.entity_id.push('lock.front_door'), TypeError);
+  const writes = () => ha.received.slice(before).filter((r) => r.message.type === 'call_service' || r.message.type.startsWith('POST '));
+  assert.deepEqual(writes(), []);
+  await gate.send(allowed!, allowed!.write.command);
+  assert.deepEqual(writes().map((r) => r.message.target), [{ entity_id: ['light.kitchen'] }]);
 });
 
 // The coverage matrix: every tool, from the code's own maps, against holding or lacking its kind.

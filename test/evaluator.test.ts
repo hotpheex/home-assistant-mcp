@@ -83,7 +83,7 @@ test('an allowed call carries exactly the checked entity_id list, and no target 
   const { plan } = planServiceCall(tablePolicy, 'agent', 'light.turn_on');
   assert.ok(plan);
   const expansion = { targeted: true, entities: ['light.b', 'light.a'], grantEntities: [], denyEntities: [] };
-  assert.deepEqual(decideServiceCall(tablePolicy, plan, expansion, { ...call, responds: true }).allowed?.command, {
+  assert.deepEqual(decideServiceCall(tablePolicy, plan, expansion, { ...call, responds: true }).allowed?.write.command, {
     type: 'call_service',
     domain: 'light',
     service: 'turn_on',
@@ -95,7 +95,7 @@ test('an allowed call carries exactly the checked entity_id list, and no target 
   const targetless = planServiceCall(policy, 'agent', 'shell_command.backup').plan;
   assert.ok(targetless);
   const none = { targeted: false, entities: [], grantEntities: [], denyEntities: [] };
-  assert.deepEqual(decideServiceCall(policy, targetless, none, { ...call, domain: 'shell_command', service: 'backup' }).allowed?.command, {
+  assert.deepEqual(decideServiceCall(policy, targetless, none, { ...call, domain: 'shell_command', service: 'backup' }).allowed?.write.command, {
     type: 'call_service',
     domain: 'shell_command',
     service: 'backup',

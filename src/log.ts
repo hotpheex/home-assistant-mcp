@@ -4,6 +4,12 @@ export type Log = (level: 'info' | 'warn' | 'error', msg: string, fields?: Recor
 /** An Audit record: names only, never service data, bodies or responses. */
 export type Audit = (record: Record<string, unknown>) => void;
 
+/** Binds the fields every record of one request shares: who asked (never the key itself), the Operation and the tool. */
+export const auditFor =
+  (audit: Audit, who: { caller?: string; keyHashPrefix?: string }, operation: string, tool?: string): Audit =>
+  (record) =>
+    audit({ caller: who.caller, key_hash_prefix: who.keyHashPrefix, operation, tool, ...record });
+
 export function logger(write: Write): { log: Log; audit: Audit } {
   const time = () => new Date().toISOString();
   return {

@@ -13,14 +13,35 @@ export const OPERATION_TIER = {
   config_write: 'admin',
 } as const satisfies Record<Operation, Tier>;
 
+export type WebSocketWrite = { readonly via: 'websocket'; readonly command: Command };
+/** The exact write a decision permits: a WebSocket command, or a request to HA's config REST API. */
+export type Write = WebSocketWrite | { readonly via: 'rest'; readonly request: RestRequest };
+
 declare const issued: unique symbol;
 /** A decision to send; the gate sends nothing else, and only this module can construct one. */
 export interface Allowed {
   readonly [issued]: true;
   readonly operation: Operation;
   readonly tier: Tier;
-  /** The exact write this decision permits, if any. */
-  readonly command?: Command | RestRequest;
+  readonly write?: Write;
+}
+
+/** Every Allowed this module issued; the type brand is only a compile-time signal, so the gate checks here at runtime. */
+const issuedDecisions = new WeakSet<Allowed>();
+export const isIssued = (allowed: Allowed) => issuedDecisions.has(allowed);
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value !== 'object' || value === null || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  for (const v of Object.values(value)) deepFreeze(v);
+  return value;
+}
+
+/** A frozen copy, so nothing the caller still holds can change what was checked, recorded as issued. */
+function issue<D extends Omit<Allowed, typeof issued>>(decision: D): Allowed & D {
+  const allowed = deepFreeze(structuredClone(decision)) as Allowed & D;
+  issuedDecisions.add(allowed);
+  return allowed;
 }
 
 /** Every Operation a Grant gives: a write also gives plain read, and a config write also gives config read. */
@@ -46,11 +67,11 @@ export type ReadDecision = { allowed: Allowed; grants: number[] } | { allowed: u
 export function decideRead(policy: Policy, caller: string, kind: ReadKind): ReadDecision {
   const grants = grantsFor(policy, caller, kind);
   if (grants.length === 0) return { allowed: undefined, grants: [] };
-  return { allowed: { operation: kind, tier: OPERATION_TIER[kind] } as Allowed, grants };
+  return { allowed: issue({ operation: kind, tier: OPERATION_TIER[kind] }), grants };
 }
 
 /** Resolving Policy names, for `check` and startup warnings, may send only plain read's read-only commands, at its tier. */
-export const NAME_LOOKUP = { operation: 'plain_read', tier: OPERATION_TIER.plain_read } as Allowed;
+export const NAME_LOOKUP = issue({ operation: 'plain_read', tier: OPERATION_TIER.plain_read });
 
 /** Delegating services act on whatever their data names, so only an exact name grants one. */
 export const isDelegating = (service: string) => service.startsWith('homeassistant.') || service === 'scene.apply';
@@ -99,7 +120,7 @@ export function planServiceCall(policy: Policy, caller: string, service: string)
       denies,
       grantSelectors: selectorsOf(grants.map((i) => policy.grants[i]!)),
       denySelectors: selectorsOf(denies.map((i) => policy.denies[i]!)),
-      lookup: { operation: 'service_call', tier: OPERATION_TIER.service_call } as Allowed,
+      lookup: issue({ operation: 'service_call', tier: OPERATION_TIER.service_call }),
     },
   };
 }
@@ -127,7 +148,7 @@ export interface ServiceCall {
 }
 
 export type ServiceDecision =
-  | { allowed: Allowed; grants: number[]; denies: []; uncovered: [] }
+  | { allowed: Allowed & { write: WebSocketWrite }; grants: number[]; denies: []; uncovered: [] }
   | { allowed: undefined; grants: []; denies: number[]; uncovered: string[] };
 
 export const TARGET_KEYS = ['entity_id', 'device_id', 'area_id', 'floor_id', 'label_id'] as const;
@@ -152,16 +173,16 @@ export function decideServiceCall(policy: Policy, plan: ServicePlan, expansion: 
   if (uncovered.length > 0 || denies.length > 0) return { allowed: undefined, grants: [], denies, uncovered };
 
   const data = Object.fromEntries(Object.entries(call.data).filter(([k]) => !(TARGET_KEYS as readonly string[]).includes(k)));
-  const command: Command = Object.freeze({
+  const command: Command = {
     type: 'call_service',
     domain: call.domain,
     service: call.service,
     ...(expansion.targeted ? { target: { entity_id: entities } } : {}),
     service_data: data,
     ...(call.responds ? { return_response: true } : {}),
-  });
+  };
   const grants = expansion.targeted ? plan.grants.filter((i) => entities.some((e) => covers(i, e))) : plan.grants;
-  return { allowed: { operation: 'service_call', tier: OPERATION_TIER.service_call, command } as Allowed, grants, denies: [], uncovered: [] };
+  return { allowed: issue({ operation: 'service_call', tier: OPERATION_TIER.service_call, write: { via: 'websocket', command } }), grants, denies: [], uncovered: [] };
 }
 
 export type ConfigKind = NonNullable<Grant['config_write']>;
@@ -180,7 +201,7 @@ export function decideConfigRead(policy: Policy, caller: string, kind: ConfigKin
   if (kind === 'automation' || kind === 'script') return decideRead(policy, caller, 'config_read');
   const grants = writersOf(policy, caller, kind);
   if (grants.length === 0) return { allowed: undefined, grants: [] };
-  return { allowed: { operation: 'config_read', tier: OPERATION_TIER.config_read } as Allowed, grants };
+  return { allowed: issue({ operation: 'config_read', tier: OPERATION_TIER.config_read }), grants };
 }
 
 export interface ConfigWrite {
@@ -192,16 +213,26 @@ export interface ConfigWrite {
 }
 
 /** HA's config REST for automations, scripts and scenes; the helper domain's own WebSocket commands for a helper. */
-function requestOf({ kind, action, id, config = {} }: ConfigWrite): Command | RestRequest {
-  if (kind !== 'helper') return action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config };
+function writeOf({ kind, action, id, config = {} }: ConfigWrite): Write {
+  const rest = (request: RestRequest) => ({ via: 'rest', request }) as const;
+  if (kind !== 'helper') return rest(action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config });
   const [domain, item] = splitHelperId(id);
-  if (action === 'create') return { ...config, type: `${domain}/create` };
-  return { ...(action === 'update' && config), type: `${domain}/${action}`, [`${domain}_id`]: item };
+  if (action === 'create') return { via: 'websocket', command: { ...config, type: `${domain}/create` } };
+  return { via: 'websocket', command: { ...(action === 'update' && config), type: `${domain}/${action}`, [`${domain}_id`]: item } };
 }
 
+export type ConfigWriteDecision = { allowed: Allowed & { write: Write }; grants: number[] } | { allowed: undefined; grants: [] };
+
 /** A config write needs a config-write Grant of its kind; the Allowed names the exact request. */
-export function decideConfigWrite(policy: Policy, caller: string, write: ConfigWrite): ReadDecision {
+export function decideConfigWrite(policy: Policy, caller: string, write: ConfigWrite): ConfigWriteDecision {
   const grants = writersOf(policy, caller, write.kind);
   if (grants.length === 0) return { allowed: undefined, grants: [] };
-  return { allowed: { operation: 'config_write', tier: OPERATION_TIER.config_write, command: Object.freeze(requestOf(write)) } as Allowed, grants };
+  return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: writeOf(write) }), grants };
+}
+
+/** HA's config REST replaces a whole entry, so an allowed update's POST is reissued over the stored config it changes. */
+export function mergedUpdate(allowed: Allowed, stored: Record<string, unknown>): Allowed & { write: Write } {
+  const { write } = allowed;
+  if (!isIssued(allowed) || write?.via !== 'rest' || write.request.method !== 'POST') throw new Error('only an issued config POST merges');
+  return issue({ ...allowed, write: { via: 'rest', request: { ...write.request, body: { ...stored, ...(write.request.body as object) } } } });
 }
