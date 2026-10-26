@@ -182,11 +182,12 @@ const inWindow = (when: string, msg: Message) =>
 
 /** Hand-written HA 2026.10: speaks the WebSocket protocol to the real client and records every command. */
 export async function startFakeHa(options: FakeHaOptions) {
-  const version = options.version ?? '2026.10.4';
+  let version = options.version ?? '2026.10.4';
   const received: Received[] = [];
   let contexts = 0;
   const drop = new Set<string>();
   let down = false;
+  let hung = false;
   let refused = 0;
   const entities = options.entities ?? [];
   const entityEntry = (e: FakeEntity) => {
@@ -301,6 +302,7 @@ export async function startFakeHa(options: FakeHaOptions) {
         return send({ id, type: 'result', success: false, error: { code: 'id_reuse', message: 'Identifier values have to increase.' } });
       }
       lastId = id;
+      if (hung) return;
       if (drop.has(msg.type)) return ws.terminate();
       if (msg.type === 'ping') return send({ id, type: 'pong' });
       const handler = handlers[msg.type];
@@ -329,6 +331,21 @@ export async function startFakeHa(options: FakeHaOptions) {
       for (const ws of wss.clients) ws.terminate();
       const before = refused;
       for (let i = 0; i < 300 && refused === before; i++) await new Promise((r) => setTimeout(r, 10));
+    },
+    /** Accepts connections again after an outage, and answers again after a hang. */
+    restore() {
+      down = false;
+      hung = false;
+    },
+    /** Keeps every connection open but answers nothing, as a half-open TCP connection does. */
+    hang() {
+      hung = true;
+    },
+    /** Drops every connection, as an HA restart does, optionally coming back at another version or without a token. */
+    restart(change: { version?: string; revoke?: string } = {}) {
+      version = change.version ?? version;
+      if (change.revoke !== undefined) delete options.users[change.revoke];
+      for (const ws of wss.clients) ws.terminate();
     },
     async close() {
       for (const ws of wss.clients) ws.terminate();

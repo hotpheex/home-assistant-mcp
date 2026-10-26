@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
 import type { FakeHaOptions, Registry } from './fake-ha.ts';
-import { body, connect, fakeHa, newKey, startServer, USERS_TOKEN } from './harness.ts';
+import { body, connect, fakeHa, newKey, startServer, until, USERS_TOKEN } from './harness.ts';
 
 const entity = (entity_id: string, fields: Partial<Registry['entities'][number]> = {}) => ({
   entity_id,
@@ -246,7 +246,7 @@ test('a service that responds returns its response; an oversize one is truncated
 });
 
 test('"HA unavailable" when nothing was sent; "outcome unknown" when the connection drops after the call was sent', async (t) => {
-  const { call, sent, ha } = await serve(t, grantLights);
+  const { call, sent, ha, client, server } = await serve(t, grantLights);
   const args = { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } };
   ha.drop.add('call_service');
   const unknown = await call(args);
@@ -257,7 +257,14 @@ test('"HA unavailable" when nothing was sent; "outcome unknown" when the connect
   await ha.outage();
   const unavailable = await call(args);
   assert.equal(textOf(unavailable), 'HA unavailable: nothing was sent to Home Assistant. Try again later.');
+  const read = await client.callTool({ name: 'ha_get_states', arguments: {} });
+  assert.equal(textOf(read), 'HA unavailable: nothing was sent to Home Assistant. Try again later.');
+
+  // Nothing was queued: once HA is back, the refused call never fires.
+  ha.restore();
+  await until(() => server.records().filter((r) => r.msg === 'connected to Home Assistant').length === 2, 'HA reconnection', 5000);
   assert.equal(sent().filter((m) => m.type === 'call_service').length, 1);
+  assert.equal(sent().filter((m) => m.type === 'get_states').length, 0);
 });
 
 test('ha_list_services lists every service with its fields, target, response and whether this Caller may call it', async (t) => {

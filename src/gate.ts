@@ -11,6 +11,8 @@ import type { Allowed, Operation, Tier } from './evaluator.ts';
 import type { Log } from './log.ts';
 
 const MINIMUM_HA = [2026, 10] as const;
+/** The client has no timeout, so a half-open connection would hang every send; a ping unanswered for a whole beat drops it. */
+const HEARTBEAT_MS = 30_000;
 /** The pinned-stable HA the suite runs against; a newer release warns but serves. */
 const TESTED_HA = [2026, 10] as const;
 
@@ -50,6 +52,8 @@ function failureOf(e: unknown, write: boolean): unknown {
 
 export interface Gate {
   send(allowed: Allowed, command: Command): Promise<unknown>;
+  /** Every needed tier is connected and checked. */
+  ready(): boolean;
   close(): void;
 }
 
@@ -81,6 +85,12 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
     log('info', 'connected to Home Assistant', { tier, ha_version: conn.haVersion });
   }
 
+  /** A connection lost during the checks only delays them: the client reconnects, and `ready` runs them again. */
+  const checked = (tier: Tier, conn: Connection) =>
+    check(tier, conn).catch((e: unknown) => {
+      if (!(failureOf(e, false) instanceof HaUnavailable)) fatal(`the ${tier}-tier check failed: ${String(e)}`);
+    });
+
   async function connect(tier: Tier, token: string) {
     let conn: Connection | undefined;
     // Our own backoff loop rather than the client's, so close() also stops a server still waiting for HA.
@@ -97,15 +107,29 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
     opened.add(conn);
     conn.addEventListener('ready', () => {
       connections.delete(tier);
-      void check(tier, conn).catch((e: unknown) => fatal(`the ${tier}-tier check failed: ${String(e)}`));
+      void checked(tier, conn);
     });
     conn.addEventListener('reconnect-error', (_conn, error) => {
       if (error === ERR_INVALID_AUTH) fatal(`Home Assistant rejected the ${tier}-tier token`);
     });
-    await check(tier, conn).catch((e: unknown) => fatal(`the ${tier}-tier check failed: ${String(e)}`));
+    await checked(tier, conn);
   }
 
   for (const [tier, token] of tokens) void connect(tier, token);
+
+  const unanswered = new Set<Connection>();
+  const heartbeat = setInterval(() => {
+    for (const conn of opened) {
+      if (!conn.connected) continue;
+      // Dropping rejects the sends waiting on it, readiness falls, and the client reconnects.
+      if (unanswered.delete(conn)) conn.reconnect(true);
+      else {
+        unanswered.add(conn);
+        conn.ping().then(() => unanswered.delete(conn), () => unanswered.delete(conn));
+      }
+    }
+  }, HEARTBEAT_MS);
+  heartbeat.unref();
 
   return {
     async send(allowed, command) {
@@ -120,8 +144,10 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
         throw failureOf(e, command === allowed.command);
       }
     },
+    ready: () => [...tokens.keys()].every((tier) => connections.get(tier)?.connected),
     close() {
       closed = true;
+      clearInterval(heartbeat);
       for (const conn of opened) conn.close();
       connections.clear();
     },

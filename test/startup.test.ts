@@ -101,6 +101,20 @@ test('the server exits when HA is below 2026.10', async (t) => {
   assert.ok(cli.records().some((r) => r.level === 'error' && /2026\.9\.3 is below/.test(String(r.msg))));
 });
 
+const whileRunning = [
+  { name: 'HA rejects its token', change: { revoke: USERS_TOKEN }, error: /rejected the users-tier token/ },
+  { name: 'a reconnect finds HA below 2026.10', change: { version: '2026.9.3' }, error: /2026\.9\.3 is below/ },
+];
+for (const { name, change, error } of whileRunning) {
+  test(`the running server exits non-zero when ${name}`, async (t) => {
+    const ha = await fakeHa(t);
+    const server = await startServer(t, grantsPlainRead, ha);
+    ha.restart(change);
+    assert.equal(await server.exited, 1);
+    assert.ok(server.records().some((r) => r.level === 'error' && error.test(String(r.msg))));
+  });
+}
+
 test('the server exits when the users-tier token belongs to an HA admin', async (t) => {
   const ha = await fakeHa(t);
   const cli = await runCli(t, ['serve'], env(grantsPlainRead, { HAMCP_HA_URL: ha.url, HAMCP_HA_USERS_TOKEN: ADMIN_TOKEN }));
@@ -122,4 +136,63 @@ test('an admin token no Grant needs is warned about and never used', async (t) =
   await client.callTool({ name: 'ha_get_states', arguments: {} });
   assert.ok(server.records().some((r) => r.level === 'warn' && /HAMCP_HA_ADMIN_TOKEN/.test(String(r.msg))));
   assert.deepEqual(new Set(ha.received.map((r) => r.token)), new Set([USERS_TOKEN]));
+});
+
+/** What an orchestrator's probe sees: the status and body, with no key. */
+async function probe(address: string, path: '/healthz' | '/readyz') {
+  const res = await fetch(`http://${address}${path}`);
+  return { status: res.status, body: await res.text() };
+}
+
+test('the server listens while HA is down, reports readiness from its HA connections, and reconnects with backoff', async (t) => {
+  const ha = await fakeHa(t);
+  const down = ha.outage();
+  const cli = await runCli(t, ['serve'], env(grantsPlainRead, { HAMCP_HA_URL: ha.url }));
+  await down;
+  const address = cli.handle!.address;
+  assert.deepEqual(await probe(address, '/healthz'), { status: 200, body: '' });
+  assert.deepEqual(await probe(address, '/readyz'), { status: 503, body: '' });
+
+  ha.restore();
+  await until(() => cli.records().some((r) => r.msg === 'connected to Home Assistant'), 'HA connection', 5000);
+  assert.deepEqual(await probe(address, '/readyz'), { status: 200, body: '' });
+
+  await ha.outage();
+  assert.deepEqual(await probe(address, '/readyz'), { status: 503, body: '' });
+  assert.deepEqual(await probe(address, '/healthz'), { status: 200, body: '' });
+  ha.restore();
+  await until(() => cli.records().filter((r) => r.msg === 'connected to Home Assistant').length === 2, 'HA reconnection', 5000);
+  assert.deepEqual(await probe(address, '/readyz'), { status: 200, body: '' });
+});
+
+test('a heartbeat finds a half-open connection: the call waiting on it fails with "HA unavailable" and readiness drops', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const ha = await fakeHa(t);
+  const server = await startServer(t, grantsPlainRead, ha);
+  const client = await connect(t, server.url, key.key, 'modern');
+  ha.hang();
+  const pending = client.callTool({ name: 'ha_get_states', arguments: {} });
+  await until(() => ha.received.some((r) => r.message.type === 'get_states'), 'the read to reach HA');
+  t.mock.timers.tick(30_000);
+  await until(() => ha.received.some((r) => r.message.type === 'ping'), 'a heartbeat ping');
+  t.mock.timers.tick(30_000);
+  const result = (await pending) as { content: { text: string }[] };
+  assert.equal(result.content[0]?.text, 'HA unavailable: nothing was sent to Home Assistant. Try again later.');
+  assert.deepEqual(await probe(server.handle!.address, '/readyz'), { status: 503, body: '' });
+});
+
+test('readiness waits for every needed tier, and a connection lost during the checks is retried rather than fatal', async (t) => {
+  const ha = await fakeHa(t);
+  ha.drop.add('auth/current_user');
+  const policy = `${grantsPlainRead}  - caller: reader\n    read: config\n`;
+  const cli = await runCli(t, ['serve'], env(policy, { HAMCP_HA_URL: ha.url, HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN }));
+  const address = cli.handle!.address;
+  await until(() => cli.records().some((r) => r.msg === 'connected to Home Assistant' && r.tier === 'admin'), 'admin connection');
+  await until(() => ha.received.filter((r) => r.message.type === 'auth/current_user').length >= 2, 'a second users-tier check', 5000);
+  assert.deepEqual(await probe(address, '/readyz'), { status: 503, body: '' });
+
+  ha.drop.delete('auth/current_user');
+  await until(() => cli.records().some((r) => r.msg === 'connected to Home Assistant' && r.tier === 'users'), 'users connection', 5000);
+  assert.deepEqual(await probe(address, '/readyz'), { status: 200, body: '' });
+  assert.ok(!cli.records().some((r) => r.level === 'error'));
 });

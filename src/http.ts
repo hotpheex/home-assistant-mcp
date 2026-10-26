@@ -17,7 +17,11 @@ export function createHttp(policy: Policy, allowedOrigins: ReadonlySet<string>, 
   });
   const handle = toNodeHandler(mcp);
   const http = createServer((req: IncomingMessage & { auth?: AuthInfo }, res) => {
-    if (new URL(req.url ?? '/', 'http://x').pathname !== '/mcp') return deny(res, 404);
+    const path = new URL(req.url ?? '/', 'http://x').pathname;
+    // Probes are unauthenticated, so they answer with a status and nothing else.
+    if (path === '/healthz') return deny(res, 200);
+    if (path === '/readyz') return deny(res, gate.ready() ? 200 : 503);
+    if (path !== '/mcp') return deny(res, 404);
     const origin = req.headers.origin;
     if (origin !== undefined && !allowedOrigins.has(origin)) return deny(res, 403);
     const result = authenticate(req.headers.authorization, new Date());
