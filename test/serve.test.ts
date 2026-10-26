@@ -25,7 +25,7 @@ for (const era of ERAS) {
     const listed = await client.listTools();
     assert.deepEqual(
       listed.tools.map((tool) => tool.name),
-      ['ha_get_states'],
+      ['ha_get_states', 'ha_list_services'],
     );
     if (era === 'modern') assert.equal(listed.cacheScope, 'private');
 
@@ -140,6 +140,7 @@ const GRANT_FOR: Record<Operation, string> = {
 const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_get_states: {},
   ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
+  ha_list_services: {},
 };
 const TIER_TOKEN = { users: USERS_TOKEN, admin: ADMIN_TOKEN };
 

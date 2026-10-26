@@ -107,7 +107,7 @@ const textOf = (result: unknown) => (result as { content: { text: string }[] }).
 
 test('a service-call Grant lists ha_call_service with the plain-read tools', async (t) => {
   const { client } = await serve(t, grantLights);
-  assert.deepEqual((await client.listTools()).tools.map((d) => d.name).sort(), ['ha_call_service', 'ha_get_states']);
+  assert.deepEqual((await client.listTools()).tools.map((d) => d.name).sort(), ['ha_call_service', 'ha_get_states', 'ha_list_services']);
 });
 
 test('a service no Grant names is refused before any outbound message', async (t) => {
@@ -258,6 +258,51 @@ test('"HA unavailable" when nothing was sent; "outcome unknown" when the connect
   const unavailable = await call(args);
   assert.equal(textOf(unavailable), 'HA unavailable: nothing was sent to Home Assistant. Try again later.');
   assert.equal(sent().filter((m) => m.type === 'call_service').length, 1);
+});
+
+test('ha_list_services lists every service with its fields, target, response and whether this Caller may call it', async (t) => {
+  const rules = `grants:
+  - caller: agent
+    services: [light.*, lock.unlock, shell_command.backup, rest_command.ping]
+  - caller: agent
+    services: [light.turn_on]
+    targets: [{ area: kitchen }]
+denies:
+  - caller: agent
+    services: [rest_command.ping]
+    targets: [{ label: night }]
+`;
+  const { client, sent } = await serve(t, rules);
+  const list = async (args: Record<string, unknown>) => body(await client.callTool({ name: 'ha_list_services', arguments: args }));
+  assert.deepEqual(await list({ domain: 'light' }), {
+    total: 2,
+    offset: 0,
+    has_more: false,
+    services: [
+      { service: 'light.turn_off', fields: {}, target: true, response: false, callable: false },
+      { service: 'light.turn_on', name: 'Turn on', fields: { brightness: { selector: { number: {} } } }, target: true, response: false, callable: true },
+    ],
+  });
+  const all = (await list({ limit: 500 })) as { total: number; services: { service: string; callable: boolean; response: boolean }[] };
+  assert.equal(all.total, 9);
+  assert.deepEqual(
+    all.services.filter((s) => s.callable).map((s) => s.service),
+    ['light.turn_on', 'shell_command.backup'],
+  );
+  assert.equal(all.services.find((s) => s.service === 'rest_command.ping')?.response, true);
+  assert.deepEqual(new Set(sent().map((m) => m.type)), new Set(['get_services']));
+});
+
+test("ha_get_states area and label filters mean what HA's own target of that area or label means", async (t) => {
+  const { client, sent } = await serve(t, 'grants:\n  - caller: agent\n    read: plain\n');
+  const ids = async (args: Record<string, unknown>) =>
+    ((body(await client.callTool({ name: 'ha_get_states', arguments: args })) as { states: { entity_id: string }[] }).states).map((s) => s.entity_id);
+  assert.deepEqual(await ids({ area: 'kitchen' }), ['light.kitchen', 'switch.coffee_maker']);
+  assert.deepEqual(await ids({ label: 'garden' }), ['light.garden_bulb']);
+  assert.deepEqual(await ids({ area: 'kitchen', label: 'garden' }), []);
+  assert.deepEqual(await ids({ area: 'kitchen', domain: 'switch' }), ['switch.coffee_maker']);
+  assert.deepEqual(await ids({ area: 'attic' }), []);
+  assert.deepEqual(sent().find((m) => m.type === 'extract_from_target'), { type: 'extract_from_target', target: { area_id: ['kitchen'] }, expand_group: false });
 });
 
 test('homeassistant services and scene.apply are covered only by exact name', async (t) => {

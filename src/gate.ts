@@ -16,7 +16,7 @@ const TESTED_HA = [2026, 10] as const;
 
 /** Read Operations, and a service call's lookups, may send only these read-only commands. */
 const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
-  plain_read: new Set(['get_states']),
+  plain_read: new Set(['get_states', 'get_services', 'extract_from_target']),
   config_read: new Set(),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };

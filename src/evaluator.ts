@@ -101,6 +101,13 @@ export function planServiceCall(policy: Policy, caller: string, service: string)
   };
 }
 
+/** Whether some call of the service could be allowed: a targeted one needs a Grant with Targets, a targetless one no Deny. */
+export function callable(policy: Policy, caller: string, service: string, targeted: boolean): boolean {
+  const { plan } = planServiceCall(policy, caller, service);
+  if (!plan) return false;
+  return targeted ? plan.grants.some((i) => (policy.grants[i]!.targets?.length ?? 0) > 0) : plan.denies.length === 0;
+}
+
 /** What HA expanded: the call target, the Grant selectors and the Deny selectors. */
 export interface Expansion {
   targeted: boolean;

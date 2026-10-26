@@ -2,7 +2,7 @@ import { ProtocolError, ProtocolErrorCode, Server, type CallToolResult, type Too
 import * as z from 'zod';
 import pkg from '../package.json' with { type: 'json' };
 import type { Authenticated } from './auth.ts';
-import { decideRead, decideServiceCall, grantsFor, planServiceCall, type Allowed, type Operation } from './evaluator.ts';
+import { callable, decideRead, decideServiceCall, grantsFor, planServiceCall, type Allowed, type Operation } from './evaluator.ts';
 import { HaError, HaUnavailable, OutcomeUnknown, type Command, type Gate } from './gate.ts';
 import type { Audit } from './log.ts';
 import type { Policy } from './policy.ts';
@@ -12,6 +12,7 @@ import { expandAll, extract, mergeTarget } from './resolver.ts';
 export const TOOL_KIND = {
   ha_get_states: 'plain_read',
   ha_call_service: 'service_call',
+  ha_list_services: 'plain_read',
 } as const satisfies Record<string, Operation>;
 export type ToolName = keyof typeof TOOL_KIND;
 
@@ -92,20 +93,29 @@ const getStates = defineTool({
   description: [
     'Lists the current state of Home Assistant entities, sorted by entity_id, with each entity_id, friendly name and state.',
     'Filter by `domain` (such as `light`) and by `query`, a case-insensitive substring of the entity_id or friendly name.',
+    "Filter by `area` or `label` id: these match what a Home Assistant service call targeting that area or label acts on.",
     'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
     'Example: {"domain": "light", "query": "kitchen"} lists the kitchen lights.',
   ].join(' '),
   input: z.strictObject({
     query: z.string().min(1).optional().describe('Case-insensitive substring of the entity_id or friendly name.'),
     domain: z.string().regex(/^[a-z0-9_]+$/).optional().describe('Entity domain, such as light or sensor.'),
+    area: z.string().min(1).optional().describe('Area id, such as living_room.'),
+    label: z.string().min(1).optional().describe('Label id.'),
     ...page,
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run(args, ctx) {
-    const states = await read<HaState[]>(ctx, decideRead(ctx.policy, ctx.caller.caller, 'plain_read').allowed, { type: 'get_states' });
+    const allowed = decideRead(ctx.policy, ctx.caller.caller, 'plain_read').allowed;
+    const states = await read<HaState[]>(ctx, allowed, { type: 'get_states' });
+    const lookup = (command: Command) => read(ctx, allowed, command);
+    const within = async (key: 'area_id' | 'label_id', id: string | undefined) => (id === undefined ? undefined : new Set(await extract(lookup, { [key]: [id] })));
+    const inArea = await within('area_id', args.area);
+    const labelled = await within('label_id', args.label);
     const query = args.query?.toLowerCase();
     const matches = states
       .filter((s) => args.domain === undefined || s.entity_id.startsWith(`${args.domain}.`))
+      .filter((s) => (inArea?.has(s.entity_id) ?? true) && (labelled?.has(s.entity_id) ?? true))
       .filter((s) => query === undefined || [s.entity_id, s.attributes.friendly_name ?? ''].some((v) => v.toLowerCase().includes(query)))
       .sort((a, b) => a.entity_id.localeCompare(b.entity_id));
     return text({
@@ -122,9 +132,49 @@ const getStates = defineTool({
 const targetIds = z.union([z.string(), z.array(z.string())]).optional();
 
 interface HaService {
+  name?: string;
+  description?: string;
+  fields?: Record<string, unknown>;
   target?: unknown;
   response?: unknown;
 }
+
+const listServices = defineTool({
+  title: 'List services',
+  description: [
+    'Lists every service Home Assistant offers, sorted by name, each with its fields, whether it takes a target, whether it returns a response, and whether this Caller may call it (`callable`).',
+    'A service marked callable may still be refused for a particular target that this Caller may not act on.',
+    'Filter by `domain` (such as `light`).',
+    'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    'Example: {"domain": "light"} lists the light services.',
+  ].join(' '),
+  input: z.strictObject({
+    domain: z.string().regex(/^[a-z0-9_]+$/).optional().describe('Service domain, such as light.'),
+    ...page,
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  async run(args, ctx) {
+    const all = await read<Record<string, Record<string, HaService>>>(ctx, decideRead(ctx.policy, ctx.caller.caller, 'plain_read').allowed, { type: 'get_services' });
+    const services = Object.entries(all)
+      .filter(([domain]) => args.domain === undefined || domain === args.domain)
+      .flatMap(([domain, byName]) => Object.entries(byName).map(([name, d]) => ({ service: `${domain}.${name}`, d })))
+      .sort((a, b) => a.service.localeCompare(b.service));
+    return text({
+      total: services.length,
+      offset: args.offset,
+      has_more: args.offset + args.limit < services.length,
+      services: services.slice(args.offset, args.offset + args.limit).map(({ service, d }) => ({
+        service,
+        ...(d.name === undefined ? {} : { name: d.name }),
+        ...(d.description === undefined ? {} : { description: d.description }),
+        fields: d.fields ?? {},
+        target: d.target !== undefined,
+        response: d.response !== undefined,
+        callable: callable(ctx.policy, ctx.caller.caller, service, d.target !== undefined),
+      })),
+    });
+  },
+});
 
 const callService = defineTool({
   title: 'Call a service',
@@ -185,7 +235,7 @@ const callService = defineTool({
   },
 });
 
-const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = { ha_get_states: getStates, ha_call_service: callService };
+const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = { ha_get_states: getStates, ha_call_service: callService, ha_list_services: listServices };
 
 /** Built once, so each tool's definition is identical for every Caller. */
 const DEFINITIONS = Object.fromEntries(
