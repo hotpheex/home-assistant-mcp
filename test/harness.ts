@@ -1,7 +1,9 @@
+import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 import type { TestContext } from 'node:test';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { run } from '../src/main.ts';
@@ -155,4 +157,24 @@ export async function connect(t: TestContext, url: string, key: string, era: (ty
 export function body(result: unknown): unknown {
   const { content } = result as { content: { type: string; text: string }[] };
   return JSON.parse(content[0]?.text ?? 'null');
+}
+
+/**
+ * Runs the built image as a deployer would, read-only and on the host network so it reaches HA on loopback.
+ * Each stdout line is a log record, and `cleanup` registers the container's removal.
+ */
+export function runImage(image: string, policy: string, env: Record<string, string>, cleanup: (fn: () => void) => void) {
+  const name = `hamcp-image-test-${randomBytes(4).toString('hex')}`;
+  const settings = { HAMCP_POLICY: '/policy.yaml', HAMCP_LISTEN: '127.0.0.1:0', ...env };
+  const args = Object.entries(settings).flatMap(([k, v]) => ['--env', `${k}=${v}`]);
+  const container = spawn('docker', ['run', '--rm', '--name', name, '--read-only', '--network', 'host', '--volume', `${policy}:/policy.yaml:ro`, ...args, image], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  cleanup(() => spawnSync('docker', ['rm', '--force', name], { stdio: 'ignore' }));
+  const records: Record<string, unknown>[] = [];
+  createInterface({ input: container.stdout }).on('line', (line) => records.push(JSON.parse(line) as Record<string, unknown>));
+  // 'close' rather than 'exit', so every stdout line is in by then.
+  const exited = new Promise<number | null>((resolve) => container.on('close', resolve));
+  const logged = (msg: string, ms = 60_000) => until(() => records.some((r) => r.msg === msg), msg, ms);
+  return { name, records, exited, logged, url: () => `http://${String(records.find((r) => r.msg === 'listening')?.address)}/mcp` };
 }
