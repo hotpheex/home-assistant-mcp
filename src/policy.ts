@@ -16,12 +16,15 @@ const target = z
   .strictObject({ domain: z.union([z.literal('*'), name]).optional(), area: name.optional(), label: name.optional() })
   .refine((t) => Object.keys(t).length === 1, 'each target holds exactly one of domain, area or label');
 
+/** An empty list would read as "no Targets", which on a Deny errs open; omit `targets` to mean that instead. */
+const targets = z.array(target).min(1, 'list at least one target, or omit targets').optional();
+
 const grant = z
   .strictObject({
     caller: z.string(),
     read: z.enum(['plain', 'config']).optional(),
     services: z.array(service).min(1).optional(),
-    targets: z.array(target).optional(),
+    targets,
     config_write: z.enum(['automation', 'script', 'scene', 'helper']).optional(),
   })
   .refine(
@@ -30,7 +33,7 @@ const grant = z
   )
   .refine((g) => g.targets === undefined || g.services !== undefined, 'targets belong only to a services grant');
 
-const deny = z.strictObject({ caller: z.string(), services: z.array(service).min(1), targets: z.array(target).optional() });
+const deny = z.strictObject({ caller: z.string(), services: z.array(service).min(1), targets });
 
 const schema = z
   .strictObject({

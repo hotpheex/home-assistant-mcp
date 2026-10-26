@@ -34,6 +34,8 @@ const refusals = [
   },
   { name: 'a homeassistant.* service', policy: `${callers}grants:\n  - caller: reader\n    services: [homeassistant.*]\n`, error: /homeassistant/ },
   { name: 'a bare * service', policy: `${callers}denies:\n  - caller: reader\n    services: ['*']\n`, error: /bare \*/ },
+  { name: 'a Deny with an empty targets list', policy: `${callers}denies:\n  - caller: reader\n    services: [light.*]\n    targets: []\n`, error: /denies\.0\.targets/ },
+  { name: 'a Grant with an empty targets list', policy: `${callers}grants:\n  - caller: reader\n    services: [light.*]\n    targets: []\n`, error: /grants\.0\.targets/ },
   {
     name: 'an HAMCP_AUDIT_READS that is not a boolean',
     policy: `${callers}grants:\n  - caller: reader\n    read: plain\n`,

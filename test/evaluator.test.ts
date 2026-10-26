@@ -116,7 +116,7 @@ const target = fc.oneof(
   fc.record({ label: fc.constantFrom('l1', 'l2') }),
 );
 const rule = fc.record(
-  { caller: fc.constantFrom('agent', 'other'), services: fc.uniqueArray(fc.constantFrom(...PATTERNS), { minLength: 1, maxLength: 3 }), targets: fc.array(target, { maxLength: 3 }) },
+  { caller: fc.constantFrom('agent', 'other'), services: fc.uniqueArray(fc.constantFrom(...PATTERNS), { minLength: 1, maxLength: 3 }), targets: fc.array(target, { minLength: 1, maxLength: 3 }) },
   { requiredKeys: ['caller', 'services'] },
 );
 const world = fc.record(Object.fromEntries(SELECTORS.map((s) => [s, fc.subarray(ENTITIES)])));
