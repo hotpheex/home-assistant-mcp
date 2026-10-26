@@ -1,0 +1,147 @@
+import { ProtocolError, ProtocolErrorCode, Server, type CallToolResult, type Tool } from '@modelcontextprotocol/server';
+import * as z from 'zod';
+import pkg from '../package.json' with { type: 'json' };
+import type { Authenticated } from './auth.ts';
+import { decideRead, grantsFor, type Allowed, type Operation } from './evaluator.ts';
+import { HaUnavailable, type Gate } from './gate.ts';
+import type { Audit } from './log.ts';
+import type { Policy } from './policy.ts';
+
+/** The Operation kind a Caller must hold to see and call each tool. */
+export const TOOL_KIND = {
+  ha_get_states: 'plain_read',
+} as const satisfies Record<string, Operation>;
+export type ToolName = keyof typeof TOOL_KIND;
+
+const OPERATION_NAME: Record<Operation, string> = {
+  plain_read: 'plain read',
+  config_read: 'config read',
+  service_call: 'service calls',
+  config_write: 'config writes',
+};
+
+interface Context {
+  policy: Policy;
+  caller: Authenticated;
+  gate: Gate;
+}
+
+interface ToolSpec<Input extends z.ZodType> {
+  title: string;
+  description: string;
+  input: Input;
+  annotations: { readOnlyHint: boolean; destructiveHint: boolean };
+  run(args: z.output<Input>, ctx: Context): Promise<CallToolResult>;
+}
+
+const page = {
+  limit: z.number().int().min(1).max(500).default(50).describe('Page size, at most 500.'),
+  offset: z.number().int().min(0).default(0).describe('Entries to skip.'),
+};
+
+const text = (value: unknown): CallToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
+const failure = (message: string): CallToolResult => ({ isError: true, content: [{ type: 'text', text: message }] });
+
+/** A failure the Caller can act on, returned as an isError result. */
+class ToolFailure extends Error {}
+
+/** Sends a read the evaluator allowed. */
+async function read<T>(ctx: Context, allowed: Allowed | undefined, command: { type: string }): Promise<T> {
+  if (!allowed) throw new Error('read sent without an Allowed');
+  try {
+    return (await ctx.gate.send(allowed, command)) as T;
+  } catch (e) {
+    if (e instanceof HaUnavailable) throw new ToolFailure('HA unavailable: nothing was sent to Home Assistant. Try again later.');
+    throw e;
+  }
+}
+
+interface HaState {
+  entity_id: string;
+  state: string;
+  attributes: { friendly_name?: string };
+}
+
+/** Infers each tool's arguments from its input schema, then erases them for the shared table. */
+const defineTool = <Input extends z.ZodType>(spec: ToolSpec<Input>) => spec as unknown as ToolSpec<z.ZodType>;
+
+const getStates = defineTool({
+  title: 'Get entity states',
+  description: [
+    'Lists the current state of Home Assistant entities, sorted by entity_id, with each entity_id, friendly name and state.',
+    'Filter by `domain` (such as `light`) and by `query`, a case-insensitive substring of the entity_id or friendly name.',
+    'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    'Example: {"domain": "light", "query": "kitchen"} lists the kitchen lights.',
+  ].join(' '),
+  input: z.strictObject({
+    query: z.string().min(1).optional().describe('Case-insensitive substring of the entity_id or friendly name.'),
+    domain: z.string().regex(/^[a-z0-9_]+$/).optional().describe('Entity domain, such as light or sensor.'),
+    ...page,
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  async run(args, ctx) {
+    const states = await read<HaState[]>(ctx, decideRead(ctx.policy, ctx.caller.caller, 'plain_read').allowed, { type: 'get_states' });
+    const query = args.query?.toLowerCase();
+    const matches = states
+      .filter((s) => args.domain === undefined || s.entity_id.startsWith(`${args.domain}.`))
+      .filter((s) => query === undefined || [s.entity_id, s.attributes.friendly_name ?? ''].some((v) => v.toLowerCase().includes(query)))
+      .sort((a, b) => a.entity_id.localeCompare(b.entity_id));
+    return text({
+      total: matches.length,
+      offset: args.offset,
+      has_more: args.offset + args.limit < matches.length,
+      states: matches
+        .slice(args.offset, args.offset + args.limit)
+        .map((s) => ({ entity_id: s.entity_id, name: s.attributes.friendly_name, state: s.state })),
+    });
+  },
+});
+
+const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = { ha_get_states: getStates };
+
+/** Built once, so each tool's definition is identical for every Caller. */
+const DEFINITIONS = Object.fromEntries(
+  Object.entries(TOOLS).map(([name, t]) => [
+    name,
+    { name, title: t.title, description: t.description, inputSchema: z.toJSONSchema(t.input, { io: 'input' }), annotations: t.annotations } as Tool,
+  ]),
+) as Record<ToolName, Tool>;
+
+const isTool = (name: string): name is ToolName => Object.hasOwn(TOOLS, name);
+
+/**
+ * One server per request, listing only the tools whose kind the Caller holds. A hidden tool called
+ * directly is refused and audited before its input is read, so nothing reaches HA.
+ */
+export function buildServer(policy: Policy, gate: Gate, audit: Audit, caller: Authenticated): Server {
+  const ctx: Context = { policy, caller, gate };
+  const holds = (name: ToolName) => grantsFor(policy, caller.caller, TOOL_KIND[name]).length > 0;
+  const server = new Server(
+    { name: pkg.name, version: pkg.version },
+    { capabilities: { tools: {} }, cacheHints: { 'tools/list': { cacheScope: 'private', ttlMs: 0 } } },
+  );
+  server.setRequestHandler('tools/list', () => ({
+    tools: Object.values(DEFINITIONS).filter((d) => holds(d.name as ToolName)),
+  }));
+  server.setRequestHandler('tools/call', async ({ params }) => {
+    const { name } = params;
+    if (!isTool(name)) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Tool ${name} not found`);
+    const operation = TOOL_KIND[name];
+    if (!holds(name)) {
+      audit({ caller: caller.caller, key_hash_prefix: caller.keyHashPrefix, operation, tool: name, decision: 'deny', grants: [] });
+      return failure(`Denied: this Caller holds no Grant for ${OPERATION_NAME[operation]}. Do not retry this call.`);
+    }
+    const tool = TOOLS[name];
+    const args = tool.input.safeParse(params.arguments ?? {});
+    if (!args.success) {
+      return failure(`Input validation error: ${args.error.issues.map((i) => `${i.path.join('.') || '(arguments)'}: ${i.message}`).join('; ')}`);
+    }
+    try {
+      return server.projectCallToolResult(await tool.run(args.data, ctx), undefined);
+    } catch (e) {
+      if (e instanceof ToolFailure) return failure(e.message);
+      throw e;
+    }
+  });
+  return server;
+}
