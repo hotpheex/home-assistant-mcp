@@ -550,8 +550,10 @@ const callService = defineTool({
       audit({ decision: 'deny', entities: expansion.entities, grants, denies: decision.denies, uncovered });
       return denial;
     }
+    // Recorded before sending, so a call that fails or ends "outcome unknown" still leaves a record.
+    if (ctx.options.auditWrites) audit({ decision: 'allow', entities: expansion.entities, grants });
     const result = await read<{ context: { id: string }; response?: unknown }>(ctx, decision.allowed, decision.allowed.write.command);
-    if (ctx.options.auditWrites) audit({ decision: 'allow', entities: expansion.entities, grants, context_id: result.context.id });
+    if (ctx.options.auditWrites) audit({ outcome: 'done', context_id: result.context.id });
     return writeResult({ entity_ids: expansion.entities, context_id: result.context.id, ...('response' in result ? { response: result.response } : {}) });
   },
 });

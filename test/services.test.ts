@@ -85,21 +85,16 @@ test('an allowed write is audited only with HAMCP_AUDIT_WRITES, by names only', 
 
   const audited = await serve(t, rules, { HAMCP_AUDIT_WRITES: 'true' });
   await audited.call(args);
-  const [{ time, ...record } = {}] = audited.server.audits();
-  assert.ok(time);
-  assert.deepEqual(record, {
-    audit: true,
-    caller: 'agent',
-    key_hash_prefix: agent.sha256.slice(0, 8),
-    operation: 'service_call',
-    tool: 'ha_call_service',
-    service: 'light.turn_on',
-    target: { area_id: ['kitchen'] },
-    decision: 'allow',
-    entities: ['light.kitchen'],
-    grants: [0],
-    context_id: 'ctx-1',
-  });
+  const [{ time, ...record } = {}, { time: done, ...outcome } = {}] = audited.server.audits();
+  assert.ok(time && done);
+  const who = { audit: true, caller: 'agent', key_hash_prefix: agent.sha256.slice(0, 8), operation: 'service_call', tool: 'ha_call_service', service: 'light.turn_on', target: { area_id: ['kitchen'] } };
+  assert.deepEqual(record, { ...who, decision: 'allow', entities: ['light.kitchen'], grants: [0] });
+  assert.deepEqual(outcome, { ...who, outcome: 'done', context_id: 'ctx-1' });
+
+  // Recorded before sending, so a call whose outcome is unknown still leaves its allow line.
+  audited.ha.drop.add('call_service');
+  assert.equal((await audited.call(args)).isError, true);
+  assert.deepEqual(audited.server.audits().slice(2).map((a) => [a.decision, a.outcome]), [['allow', undefined]]);
 });
 
 const grantLights = 'grants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ domain: light }]\n';
