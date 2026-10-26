@@ -509,6 +509,10 @@ const callService = defineTool({
     const name = `${domain}.${service}`;
     const requested = mergeTarget(target, data);
     const audit = (record: Record<string, unknown>) => ctx.audit({ service: name, target: requested, ...record });
+    const refuse = (reason: string, message: string, record: Record<string, unknown> = {}) => {
+      audit({ decision: 'deny', reason, ...record });
+      return new ToolFailure(message);
+    };
     const denial = failure(`Denied: this Caller holds no Grant to call ${name} over ${Object.keys(requested).length ? JSON.stringify(requested) : 'no target'}. Do not retry this call.`);
 
     const planned = planServiceCall(ctx.policy, ctx.auth.caller, name);
@@ -522,8 +526,8 @@ const callService = defineTool({
     if (!description) throw new ToolFailure(`Service ${name} not found.`);
     const targeted = description.target !== undefined;
     const hasTarget = Object.keys(requested).length > 0;
-    if (targeted && !hasTarget) throw new ToolFailure(`${name}: this service needs a target.`);
-    if (!targeted && hasTarget) throw new ToolFailure(`${name}: this service takes no target.`);
+    if (targeted && !hasTarget) throw refuse('this service needs a target', `${name}: this service needs a target.`);
+    if (!targeted && hasTarget) throw refuse('this service takes no target', `${name}: this service takes no target.`);
 
     const expansion = { targeted, entities: [] as string[], grantEntities: [] as string[], denyEntities: [] as string[] };
     if (targeted) {
@@ -532,9 +536,11 @@ const callService = defineTool({
       const admitted = (e: string) => domains?.has(e.split('.')[0]!) ?? true;
       // An entity_id the Caller named is never left out silently.
       const named = (requested.entity_id ?? []).filter((e) => e !== 'all' && !admitted(e));
-      if (named.length > 0) throw new ToolFailure(`${name} acts only on ${[...domains!].join(', ')} entities; remove ${named.join(', ')} from the target.`);
+      if (named.length > 0) {
+        throw refuse('entity outside the service domains', `${name} acts only on ${[...domains!].join(', ')} entities; remove ${named.join(', ')} from the target.`, { entities: named });
+      }
       expansion.entities = reached.filter(admitted);
-      if (expansion.entities.length === 0) throw new ToolFailure(`${name}: target matches no entity.`);
+      if (expansion.entities.length === 0) throw refuse('target matches no entity', `${name}: target matches no entity.`);
       expansion.grantEntities = await extract(lookup, plan.grantSelectors);
       expansion.denyEntities = await extract(lookup, plan.denySelectors, false);
     }
@@ -583,6 +589,7 @@ const writeConfig = defineTool({
     let { allowed } = decided;
     const marked = redactedPath(change.config);
     if (marked !== undefined) {
+      ctx.audit({ kind, action, id, decision: 'deny', reason: 'config carries a redacted value' });
       throw new ToolFailure(`config carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
     }
     if (kind !== 'helper' && action !== 'delete') {

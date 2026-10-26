@@ -163,8 +163,8 @@ test('helper writes go through the helper domain WebSocket commands, which merge
   assert.deepEqual(person.sent, []);
 });
 
-test('a config carrying the Redaction marker is refused with its path, and nothing is sent', async (t) => {
-  const { as } = await house(t);
+test('a config carrying the Redaction marker is refused with its path, audited by name, and nothing is sent', async (t) => {
+  const { server, as } = await house(t);
   const automator = await as('automator');
   const masked = { actions: [{ action: 'rest_command.notify', data: { api_key: M } }] };
   const update = await automator.call('ha_write_config', { kind: 'automation', action: 'update', id: 'porch_light_1', config: masked });
@@ -180,6 +180,13 @@ test('a config carrying the Redaction marker is refused with its path, and nothi
   });
   assert.match(JSON.stringify(helper.result.content), /config carries a redacted value at initial/);
   assert.deepEqual(helper.sent, []);
+  assert.deepEqual(
+    server.audits().map((a) => ({ ...a, time: undefined })),
+    [
+      { time: undefined, audit: true, caller: 'automator', key_hash_prefix: keys.automator!.sha256.slice(0, 8), operation: 'config_write', tool: 'ha_write_config', kind: 'automation', action: 'update', id: 'porch_light_1', decision: 'deny', reason: 'config carries a redacted value' },
+      { time: undefined, audit: true, caller: 'helperer', key_hash_prefix: keys.helperer!.sha256.slice(0, 8), operation: 'config_write', tool: 'ha_write_config', kind: 'helper', action: 'create', id: 'input_text.nas', decision: 'deny', reason: 'config carries a redacted value' },
+    ],
+  );
 });
 
 test('ha_get_config serves scene and helper config, masked, only to a Caller that writes that kind', async (t) => {
