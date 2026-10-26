@@ -133,8 +133,8 @@ async function rest(ctx: Context, allowed: Allowed | undefined, request: RestReq
   }
   if (answer.status === 404 && request.method === 'GET') return undefined;
   if (answer.status !== 200) {
-    const message = (answer.body as { message?: unknown } | null)?.message ?? `HTTP ${answer.status}`;
-    throw new ToolFailure(`Home Assistant refused the ${request.method === 'GET' ? 'read' : 'write'}: ${String(message)}`);
+    const message = (answer.body as { message?: string } | null)?.message ?? `HTTP ${answer.status}`;
+    throw new ToolFailure(`Home Assistant refused the ${request.method === 'GET' ? 'read' : 'write'}: ${message}`);
   }
   return answer.body;
 }
@@ -455,7 +455,8 @@ const writeConfig = defineTool({
     if (!allowed?.command) throw new Error('config write sent without an Allowed');
     ctx.audit({ caller: ctx.caller.caller, key_hash_prefix: ctx.caller.keyHashPrefix, operation: 'config_write', tool: 'ha_write_config', kind, action, id, decision: 'allow', grants });
     const result = 'type' in allowed.command ? await read(ctx, allowed, allowed.command) : await rest(ctx, allowed, allowed.command);
-    return text({ kind, action, id, result });
+    // A helper write echoes the whole stored item, keys the Caller did not send included.
+    return text({ kind, action, id, result: maskSecrets(result) });
   },
 });
 
