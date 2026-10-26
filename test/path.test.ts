@@ -9,7 +9,10 @@ import { connect, fakeHa, newKey, startServer, USERS_TOKEN } from './harness.ts'
 const AREAS = ['a1', 'a2'];
 const LABELS = ['l1', 'l2'];
 const ENTITY_IDS = ['light.one', 'light.two', 'lock.three', 'lock.four', 'switch.five'];
-const SERVICES = ['light.turn_on', 'lock.unlock', 'homeassistant.turn_on'];
+/** Each service's declared `target.entity` domain filter; HA acts on nothing outside it, and null declares none. */
+const FILTERS: Record<string, string[] | null> = { 'light.turn_on': ['light'], 'lock.unlock': ['lock'], 'homeassistant.turn_on': null };
+const SERVICES = Object.keys(FILTERS);
+const admits = (service: string, entityId: string) => FILTERS[service]?.includes(entityId.split('.')[0]!) ?? true;
 const PATTERNS = [...SERVICES, 'light.*', 'lock.*'];
 
 const maybe = <T>(values: T[]) => fc.constantFrom<T | null>(null, ...values);
@@ -94,7 +97,12 @@ test('property: every service call HA receives acts only on entities a Grant cov
   await fc.assert(
     fc.asyncProperty(scenario, async ({ house, grants, denies, calls }) => {
       const registry: House = { ...house, areas: [...house.areas], devices: [...house.devices], entities: [...house.entities], floors: [], labels: LABELS.map((label_id) => ({ label_id })) };
-      const services = Object.fromEntries(['light', 'lock', 'homeassistant'].map((d) => [d, { [d === 'lock' ? 'unlock' : 'turn_on']: { target: { entity: [{}] } } }]));
+      const services = Object.fromEntries(
+        Object.entries(FILTERS).map(([s, domain]) => {
+          const [d = '', n = ''] = s.split('.');
+          return [d, { [n]: { target: { entity: [domain ? { domain } : {}] } } }] as const;
+        }),
+      );
       const ha = await fakeHa(t, { ...registry, services, states: registry.entities.map((e) => ({ entity_id: e.entity_id, state: 'on', attributes: {} })) });
       const policy = JSON.stringify({ version: 1, callers: { agent: { keys: [{ sha256: agent.sha256 }] } }, grants, denies });
       const server = await startServer(t, policy, ha);
@@ -107,10 +115,14 @@ test('property: every service call HA receives acts only on entities a Grant cov
         const sent = ha.received.slice(before);
         const refusedAtPlan = !grants.some((g) => names(g, service, false)) || denies.some((d) => names(d, service, true) && d.targets === undefined);
         if (refusedAtPlan) assert.deepEqual(sent, []);
-        for (const { message } of sent.filter((r) => r.message.type === 'call_service')) {
+        const forwardedCalls = sent.filter((r) => r.message.type === 'call_service');
+        const named = 'entity_id' in target && Array.isArray(target.entity_id) ? target.entity_id : [];
+        if (named.some((e) => !admits(service, e))) assert.deepEqual(forwardedCalls, [], 'an entity_id named outside the service domains was left out');
+        for (const { message } of forwardedCalls) {
           assert.equal(`${String(message.domain)}.${String(message.service)}`, service);
           forwarded++;
           for (const e of (message.target as { entity_id: string[] }).entity_id) {
+            assert.ok(admits(service, e), `${e} is outside the domains ${service} acts on`);
             assert.ok(grants.some((g) => names(g, service, false) && reaches(registry, g, e, true)), `${e} is not covered by a Grant`);
             assert.ok(!denies.some((d) => names(d, service, true) && reaches(registry, d, e, false)), `${e} is under a Deny`);
           }

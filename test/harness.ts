@@ -46,7 +46,7 @@ export const REGISTRIES: Partial<FakeHaOptions> = {
   floors: [{ floor_id: 'ground', name: 'Ground Floor' }],
 };
 
-/** Admin-only content: configs with inline secrets, and runs whose trace holds a camera state and a password. */
+/** Admin-only content: configs and a helper with inline secrets, and runs whose trace holds a camera state and a password. */
 export const CONFIGS: Partial<FakeHaOptions> = {
   configs: {
     'automation.porch_light': {
@@ -56,7 +56,9 @@ export const CONFIGS: Partial<FakeHaOptions> = {
       actions: [{ action: 'rest_command.notify', data: { api_key: 'CFGSECRET', url: 'https://bob:CFGSECRET@nas.local/hook' } }],
     },
     'script.morning': { alias: 'Morning', sequence: [{ action: 'rest_command.ping', data: { header: 'Bearer CFGSECRET1' } }] },
+    'scene.movie_night': { id: 'movie_night_1', name: 'Movie night', entities: { 'media_player.den': { state: 'playing', password: 'SCENESECRET' } } },
   },
+  helpers: { input_text: [{ id: 'wifi_password', name: 'Wifi password', initial: 'x', api_key: 'HELPERSECRET' }] },
   traces: ['run_1', 'run_2', 'run_3'].map((run_id, i) => ({
     domain: 'automation' as const,
     item_id: 'porch_light_1',

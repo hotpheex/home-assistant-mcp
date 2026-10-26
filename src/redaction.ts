@@ -32,6 +32,21 @@ export function maskSecrets(value: unknown): unknown {
   return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, SECRET_KEY.test(k) ? REDACTED : maskSecrets(v)]));
 }
 
+/** The path of the first string carrying the marker, such as `actions[0].data.api_key`, so a masked value is never written back. */
+export function redactedPath(value: unknown, path = ''): string | undefined {
+  if (typeof value === 'string') return value.includes(REDACTED) ? path : undefined;
+  const entries = Array.isArray(value)
+    ? value.map((v, i) => [`${path}[${i}]`, v] as const)
+    : isRecord(value)
+      ? Object.entries(value).map(([k, v]) => [path ? `${path}.${k}` : k, v] as const)
+      : [];
+  for (const [at, v] of entries) {
+    const found = redactedPath(v, at);
+    if (found !== undefined) return found;
+  }
+  return undefined;
+}
+
 /**
  * Strips `access_token` and `token=` URL parameters from every camera, image and media_player state
  * found anywhere in `value`, so states and the states inside traces both pass through it. Best-effort.
