@@ -265,7 +265,7 @@ test('a heartbeat finds a half-open connection: the call waiting on it fails wit
   await until(() => ha.received.some((r) => r.message.type === 'ping'), 'a heartbeat ping');
   t.mock.timers.tick(30_000);
   const result = (await pending) as { content: { text: string }[] };
-  assert.equal(result.content[0]?.text, 'HA unavailable: nothing was sent to Home Assistant. Try again later.');
+  assert.equal(result.content[0]?.text, 'HA unavailable: Home Assistant did not answer. Try again later.');
   assert.deepEqual(await probe(server.handle!.address, '/readyz'), { status: 503, body: '' });
 });
 

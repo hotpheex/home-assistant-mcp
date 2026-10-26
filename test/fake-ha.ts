@@ -313,6 +313,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     const type = `${req.method} ${req.url}`;
     received.push({ token, message: { type, ...(body !== undefined && { body }) } });
     if (drop.has(type)) return void req.socket.destroy();
+    if (hung) return;
     const [, kind, key] = match as unknown as [string, string, string];
     const id = decodeURIComponent(key);
     const entity = entityOf(kind, id);
@@ -398,7 +399,7 @@ export async function startFakeHa(options: FakeHaOptions) {
       down = false;
       hung = false;
     },
-    /** Keeps every connection open but answers nothing, as a half-open TCP connection does. */
+    /** Keeps every connection and REST request open but answers nothing, as a half-open TCP connection does. */
     hang() {
       hung = true;
     },

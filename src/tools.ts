@@ -112,7 +112,9 @@ class ToolFailure extends Error {}
 
 /** The gate's outage errors as failures the Caller can act on; anything else unchanged. */
 function outage(e: unknown): unknown {
-  if (e instanceof HaUnavailable) return new ToolFailure('HA unavailable: nothing was sent to Home Assistant. Try again later.');
+  if (e instanceof HaUnavailable) {
+    return new ToolFailure(e.sent ? 'HA unavailable: Home Assistant did not answer. Try again later.' : 'HA unavailable: nothing was sent to Home Assistant. Try again later.');
+  }
   if (e instanceof OutcomeUnknown) {
     return new ToolFailure('Outcome unknown: the connection to Home Assistant dropped after the call was sent. Check state before retrying.');
   }

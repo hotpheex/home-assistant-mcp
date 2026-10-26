@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import { REDACTED as M } from '../src/redaction.ts';
-import { ADMIN_TOKEN, body, connect, fakeHa, newKey, startServer } from './harness.ts';
+import { ADMIN_TOKEN, body, connect, fakeHa, newKey, startServer, until } from './harness.ts';
 
 const keys = Object.fromEntries(['auditor', 'automator', 'scripter', 'scener', 'helperer'].map((name) => [name, newKey()]));
 const policy = `
@@ -222,11 +222,25 @@ test('ha_get_config serves scene and helper config, masked, only to a Caller tha
   );
 });
 
-test('a config write whose connection drops after it was sent reports outcome unknown', async (t) => {
+test('a config write dropped or left unanswered after it was sent reports outcome unknown; an unanswered read, HA unavailable', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
   const { ha, as } = await house(t);
-  const { call } = await as('automator');
+  const { call, client } = await as('automator');
   ha.drop.add('POST /api/config/automation/config/hall_light');
   const dropped = await call('ha_write_config', { kind: 'automation', action: 'create', id: 'hall_light', config: NEW_AUTOMATION });
   assert.equal(dropped.result.isError, true);
   assert.match(JSON.stringify(dropped.result.content), /Outcome unknown/);
+
+  // A REST request still unanswered a whole heartbeat beat after one saw it is abandoned.
+  const scripter = (await as('scripter')).client;
+  ha.hang();
+  const deleted = client.callTool({ name: 'ha_write_config', arguments: { kind: 'automation', action: 'delete', id: 'porch_light_1' } });
+  const updated = scripter.callTool({ name: 'ha_write_config', arguments: { kind: 'script', action: 'update', id: 'morning', config: { alias: 'Early' } } });
+  const types = () => ha.received.map((r) => r.message.type);
+  await until(() => types().includes('DELETE /api/config/automation/config/porch_light_1') && types().includes('GET /api/config/script/config/morning'), 'both requests to reach HA');
+  t.mock.timers.tick(30_000);
+  t.mock.timers.tick(30_000);
+  assert.match(JSON.stringify((await deleted).content), /Outcome unknown/);
+  assert.equal(((await updated).content as { text: string }[])[0]?.text, 'HA unavailable: Home Assistant did not answer. Try again later.');
+  assert.ok(!types().includes('POST /api/config/script/config/morning'));
 });

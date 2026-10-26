@@ -45,8 +45,14 @@ export interface RestRequest {
   body?: unknown;
 }
 
-/** Nothing left the process. */
-export class HaUnavailable extends Error {}
+/** HA did not answer; `sent` when the request may have left the process, which only a read may report. */
+export class HaUnavailable extends Error {
+  readonly sent: boolean;
+  constructor(sent = false) {
+    super();
+    this.sent = sent;
+  }
+}
 /** The connection dropped after a write was sent, so it may or may not have run. */
 export class OutcomeUnknown extends Error {}
 
@@ -54,7 +60,7 @@ export class OutcomeUnknown extends Error {}
 function failureOf(e: unknown, write: boolean): unknown {
   if (e === ERR_CONNECTION_LOST) return new HaUnavailable();
   const lost = typeof e === 'object' && e !== null && 'error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST;
-  if (lost) return write ? new OutcomeUnknown() : new HaUnavailable();
+  if (lost) return write ? new OutcomeUnknown() : new HaUnavailable(true);
   return e;
 }
 
@@ -71,6 +77,15 @@ export interface Gate {
 
 const releaseOf = (version: string) => version.split('.').slice(0, 2).map(Number);
 const compare = (a: number[], b: readonly number[]) => (a[0]! - b[0]!) || (a[1]! - b[1]!);
+
+/** A 401 from HA is text/plain. */
+function jsonOf(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
 
 function issuedOnly(allowed: Allowed) {
   if (!isIssued(allowed)) throw new Error('the gate sends only an Allowed the evaluator issued');
@@ -137,7 +152,13 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
   for (const [tier, token] of tokens) void connect(tier, token);
 
   const unanswered = new Set<Connection>();
+  /** REST in flight, marked once a beat has seen it, so one unanswered at the next beat is aborted: a 30–60 s timeout. */
+  const requests = new Map<AbortController, boolean>();
   const heartbeat = setInterval(() => {
+    for (const [request, seen] of requests) {
+      if (seen) request.abort();
+      else requests.set(request, true);
+    }
     for (const conn of opened) {
       if (!conn.connected) continue;
       // Dropping rejects the sends waiting on it, readiness falls, and the client reconnects.
@@ -173,19 +194,24 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       const lookup = allowed.operation === 'config_read' && request.method === 'GET' && CONFIG_PATH.test(request.path);
       if (!write && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
       if (!connections.get(allowed.tier)?.connected) throw new HaUnavailable();
-      let res: Response;
+      const abort = new AbortController();
+      requests.set(abort, false);
+      let res: Response, text: string;
       try {
         res = await fetch(`${url}${request.path}`, {
           method: request.method,
           headers: { authorization: `Bearer ${tokens.get(allowed.tier)}`, 'content-type': 'application/json' },
           ...(request.body !== undefined && { body: JSON.stringify(request.body) }),
+          signal: abort.signal,
         });
+        text = await res.text();
       } catch {
-        // fetch cannot tell a refused connection from one dropped mid-request, so a write errs towards unknown.
-        throw write ? new OutcomeUnknown() : new HaUnavailable();
+        // fetch cannot tell a refused connection from one dropped or abandoned mid-request, so a write errs towards unknown.
+        throw write ? new OutcomeUnknown() : new HaUnavailable(true);
+      } finally {
+        requests.delete(abort);
       }
-      // A 401 from HA is text/plain.
-      return { status: res.status, body: await res.json().catch(() => null) };
+      return { status: res.status, body: jsonOf(text) };
     },
     close() {
       closed = true;
