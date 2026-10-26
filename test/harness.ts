@@ -110,8 +110,8 @@ export function writePolicy(yaml: string) {
   return path;
 }
 
-export async function until(check: () => boolean, what: string) {
-  for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 10));
+export async function until(check: () => boolean, what: string, ms = 2000) {
+  for (let i = 0; i < ms / 10 && !check(); i++) await new Promise((r) => setTimeout(r, 10));
   if (!check()) throw new Error(`timed out waiting for ${what}`);
 }
 
