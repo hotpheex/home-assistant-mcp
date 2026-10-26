@@ -22,7 +22,29 @@ export const HOUSE: FakeState[] = [
   state('sensor.kitchen_temperature', 'Kitchen Temperature', '21.5'),
   state('light.living_room', 'Living Room Lamp', 'off'),
   state('lock.front_door', 'Front Door', 'locked'),
+  {
+    entity_id: 'camera.porch',
+    state: 'idle',
+    attributes: { friendly_name: 'Porch', access_token: 'CAMSECRET', entity_picture: '/api/camera_proxy/camera.porch?token=CAMSECRET' },
+  },
+  {
+    entity_id: 'media_player.den',
+    state: 'playing',
+    attributes: { friendly_name: 'Den Speaker', entity_picture: '/api/media_player_proxy/media_player.den?token=MEDIASECRET&cache=42' },
+  },
 ];
+/** The house's registries: the coffee maker is in an area through its device, and the lamp has an alias. */
+export const REGISTRIES: Partial<FakeHaOptions> = {
+  entities: [
+    { entity_id: 'switch.coffee_maker', device_id: 'dev_coffee' },
+    { entity_id: 'light.living_room', aliases: ['Sofa Light'] },
+    { entity_id: 'lock.front_door', labels: ['security'] },
+  ],
+  devices: [{ id: 'dev_coffee', name: 'Coffee Maker', area_id: 'utility_room', labels: [] }],
+  areas: [{ area_id: 'utility_room', name: 'Utility Room', floor_id: 'ground', aliases: [] }],
+  labels: [{ label_id: 'security', name: 'Security' }],
+  floors: [{ floor_id: 'ground', name: 'Ground Floor' }],
+};
 
 export function newKey() {
   const key = `hamcp_${randomBytes(32).toString('base64url')}`;
@@ -33,6 +55,7 @@ export async function fakeHa(t: TestContext, options: Partial<FakeHaOptions> = {
   const ha = await startFakeHa({
     users: { [USERS_TOKEN]: { is_admin: false }, [ADMIN_TOKEN]: { is_admin: true } },
     states: HOUSE,
+    ...REGISTRIES,
     ...options,
   });
   t.after(() => ha.close());

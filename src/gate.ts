@@ -15,7 +15,17 @@ const TESTED_HA = [2026, 10] as const;
 
 /** Read Operations may send only these read-only commands. */
 const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
-  plain_read: new Set(['get_states']),
+  plain_read: new Set([
+    'get_states',
+    'config/entity_registry/list',
+    'config/entity_registry/get_entries',
+    'config/device_registry/list',
+    'config/area_registry/list',
+    'config/label_registry/list',
+    'config/floor_registry/list',
+    'history/history_during_period',
+    'logbook/get_events',
+  ]),
   config_read: new Set(),
 };
 

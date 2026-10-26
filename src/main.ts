@@ -68,7 +68,7 @@ export async function run(argv: string[], env: Record<string, string | undefined
     log('error', reason);
     void close().then(() => io.exit(1));
   });
-  const server = createHttp(policy, settings.HAMCP_ALLOWED_ORIGINS, gate, log, audit);
+  const server = createHttp(policy, settings.HAMCP_ALLOWED_ORIGINS, gate, log, audit, { auditReads: settings.HAMCP_AUDIT_READS });
   const { host, port } = settings.HAMCP_LISTEN;
   try {
     await new Promise<void>((resolve, reject) => server.http.once('error', reject).listen(port, host, resolve));
