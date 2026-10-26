@@ -47,18 +47,22 @@ export function redactedPath(value: unknown, path = ''): string | undefined {
   return undefined;
 }
 
+const isTokenEntity = (id: unknown) => typeof id === 'string' && /^[a-z_]+\.\w+$/.test(id) && TOKEN_DOMAINS.has(id.split('.')[0]!);
+
+function stripAttributes(attributes: Record<string, unknown>): unknown {
+  const rest = { ...attributes };
+  delete rest.access_token;
+  return stripTokenParams(rest);
+}
+
 /**
- * Strips `access_token` and `token=` URL parameters from every camera, image and media_player state
- * found anywhere in `value`, so states and the states inside traces both pass through it. Best-effort.
+ * Strips `access_token` and `token=` URL parameters from every camera, image and media_player state found anywhere
+ * in `value`: a state's `attributes`, or the attributes a scene config keys by entity_id. Best-effort.
  */
 export function stripBearerTokens(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(stripBearerTokens);
   if (!isRecord(value)) return value;
-  const out = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, stripBearerTokens(v)]));
-  if (typeof out.entity_id === 'string' && TOKEN_DOMAINS.has(out.entity_id.split('.')[0]!) && isRecord(out.attributes)) {
-    const attributes = { ...out.attributes };
-    delete attributes.access_token;
-    out.attributes = stripTokenParams(attributes);
-  }
+  const out = Object.fromEntries(Object.entries(value).map(([k, v]) => [k, isTokenEntity(k) && isRecord(v) ? stripAttributes(v) : stripBearerTokens(v)]));
+  if (isTokenEntity(out.entity_id) && isRecord(out.attributes)) out.attributes = stripAttributes(out.attributes);
   return out;
 }

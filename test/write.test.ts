@@ -194,7 +194,8 @@ test('ha_get_config serves scene and helper config, masked, only to a Caller tha
   const scener = await as('scener');
   const scene = await scener.call('ha_get_config', { kind: 'scene', id: 'movie_night_1' });
   assert.deepEqual(scene.sent, [{ type: 'GET /api/config/scene/config/movie_night_1' }]);
-  assert.deepEqual(body(scene.result), { config: { id: 'movie_night_1', name: 'Movie night', entities: { 'media_player.den': { state: 'playing', password: M } } } });
+  const picture = '/api/media_player_proxy/media_player.den';
+  assert.deepEqual(body(scene.result), { config: { id: 'movie_night_1', name: 'Movie night', entities: { 'media_player.den': { state: 'playing', password: M, entity_picture: picture } } } });
   assert.match(JSON.stringify((await scener.call('ha_get_config', { kind: 'scene', id: 'nope' })).result.content), /Scene nope not found/);
 
   const helperer = await as('helperer');

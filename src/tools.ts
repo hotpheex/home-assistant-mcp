@@ -388,7 +388,7 @@ const getConfig = defineTool({
     if (kind === 'scene') {
       const config = await rest(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, { method: 'GET', path: configPath(kind, id!) });
       if (config === undefined) throw new ToolFailure(`Scene ${id} not found.`);
-      return text({ config: maskSecrets(config) });
+      return text({ config: maskSecrets(stripBearerTokens(config)) });
     }
     const [domain, item] = splitHelperId(id!);
     const config = (await configRead<{ id: string }[]>(ctx, { type: `${domain}/list` }, kind)).find((h) => h.id === item);
@@ -605,7 +605,7 @@ const writeConfig = defineTool({
     const { write } = allowed;
     const result = write.via === 'websocket' ? await read(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
     // A helper write echoes the whole stored item, keys the Caller did not send included.
-    return writeResult({ kind, action, id, result: maskSecrets(result) });
+    return writeResult({ kind, action, id, result: maskSecrets(stripBearerTokens(result)) });
   },
 });
 

@@ -58,7 +58,11 @@ export const CONFIGS: Partial<FakeHaOptions> = {
       actions: [{ action: 'rest_command.notify', data: { api_key: 'CFGSECRET', url: 'https://bob:CFGSECRET@nas.local/hook' } }],
     },
     'script.morning': { alias: 'Morning', sequence: [{ action: 'rest_command.ping', data: { header: 'Bearer CFGSECRET1' } }] },
-    'scene.movie_night': { id: 'movie_night_1', name: 'Movie night', entities: { 'media_player.den': { state: 'playing', password: 'SCENESECRET' } } },
+    'scene.movie_night': {
+      id: 'movie_night_1',
+      name: 'Movie night',
+      entities: { 'media_player.den': { state: 'playing', password: 'SCENESECRET', access_token: 'SCENESECRET', entity_picture: '/api/media_player_proxy/media_player.den?token=SCENESECRET' } },
+    },
   },
   helpers: { input_text: [{ id: 'wifi_password', name: 'Wifi password', initial: 'x', api_key: 'HELPERSECRET' }] },
   traces: ['run_1', 'run_2', 'run_3'].map((run_id, i) => ({

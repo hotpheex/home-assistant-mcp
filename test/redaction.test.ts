@@ -23,6 +23,9 @@ test('access_token goes, and states nested in other values are stripped too', ()
   assert.deepEqual(stripBearerTokens(trace), {
     trace: { path: [{ changed_variables: { trigger: { to_state: { entity_id: 'camera.porch', attributes: { friendly_name: 'Porch', urls: ['/a'] } } } } }] },
   });
+  // A scene config keys each entity's state and attributes by its entity_id.
+  const scene = { entities: { 'media_player.den': { state: 'on', access_token: 'T1', entity_picture: '/m?token=T1&c=1' }, 'light.den': { state: 'on', note: '/l?token=T1' } } };
+  assert.deepEqual(stripBearerTokens(scene), { entities: { 'media_player.den': { state: 'on', entity_picture: '/m?c=1' }, 'light.den': { state: 'on', note: '/l?token=T1' } } });
 });
 
 test('expected leak: tokens outside the attributes of camera, image and media_player states pass through', () => {
