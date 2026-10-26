@@ -52,6 +52,9 @@ export async function run(argv: string[], env: Record<string, string | undefined
     log('info', 'policy loaded', { policy_sha256: policy.sha256 });
     for (const warning of policyWarnings(policy, new Date())) log('warn', warning);
     tokens = readTokens(env, neededTiers(policy));
+    if (!tokens.has('admin') && (env.HAMCP_HA_ADMIN_TOKEN || env.HAMCP_HA_ADMIN_TOKEN_FILE)) {
+      log('warn', 'HAMCP_HA_ADMIN_TOKEN is set but no Grant needs config read or config write, so it is never read or used; remove it');
+    }
   } catch (e) {
     return fail((e as Error).message);
   }

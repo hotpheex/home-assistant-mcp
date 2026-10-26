@@ -45,13 +45,37 @@ export interface FakeHaOptions {
   floors?: FakeEntry[];
   history?: FakeChange[];
   logbook?: FakeLogEntry[];
+  /** Automation and script configs, keyed by entity_id. */
+  configs?: Record<string, Record<string, unknown>>;
+  traces?: FakeTrace[];
 }
+
+/** A stored run: summary fields plus the sections only trace/get returns. */
+export interface FakeTrace extends Record<string, unknown> {
+  domain: 'automation' | 'script';
+  item_id: string;
+  run_id: string;
+  timestamp: { start: string; finish: string };
+}
+const TRACE_SECTIONS = ['trace', 'config', 'blueprint_inputs', 'context'];
 
 /** A command the server sent after authenticating, with the token of the connection it came on. */
 export interface Received {
   token: string;
   message: { type: string; id?: number } & Record<string, unknown>;
 }
+
+/** Thrown by a handler to answer with an HA error result. */
+class HaError extends Error {
+  code: string;
+  constructor(code: string, message: string) {
+    super(message);
+    this.code = code;
+  }
+}
+const haError = (code: string, message: string): never => {
+  throw new HaError(code, message);
+};
 
 const isoNow = () => new Date().toISOString();
 const seconds = (iso: string) => Date.parse(iso) / 1000;
@@ -70,7 +94,15 @@ export async function startFakeHa(options: FakeHaOptions) {
     delete entry.aliases;
     return entry;
   };
-  const handlers: Record<string, (token: string, msg: Message) => unknown> = {
+  type Handler = (token: string, msg: Message) => unknown;
+  /** HA's require_admin. */
+  const adminOnly = (handler: Handler): Handler => (token, msg) =>
+    options.users[token]?.is_admin ? handler(token, msg) : haError('unauthorized', 'Unauthorized');
+  const configOf = adminOnly((_, msg) => {
+    const config = options.configs?.[msg.entity_id as string];
+    return config && (msg.entity_id as string).startsWith(`${msg.type.split('/')[0]}.`) ? { config } : haError('not_found', 'Entity not found');
+  });
+  const handlers: Record<string, Handler> = {
     supported_features: () => null,
     get_states: () =>
       (options.states ?? []).map((s) => ({
@@ -107,6 +139,18 @@ export async function startFakeHa(options: FakeHaOptions) {
       }
       return out;
     },
+    'automation/config': configOf,
+    'script/config': configOf,
+    'trace/list': adminOnly((_, msg) =>
+      (options.traces ?? [])
+        .filter((tr) => tr.domain === msg.domain && (msg.item_id === undefined || tr.item_id === msg.item_id))
+        .map((tr) => Object.fromEntries(Object.entries(tr).filter(([k]) => !TRACE_SECTIONS.includes(k)))),
+    ),
+    'trace/get': adminOnly(
+      (_, msg) =>
+        options.traces?.find((tr) => tr.domain === msg.domain && tr.item_id === msg.item_id && tr.run_id === msg.run_id) ??
+        haError('not_found', 'The trace could not be found'),
+    ),
     'logbook/get_events': (_, msg) =>
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
@@ -143,7 +187,12 @@ export async function startFakeHa(options: FakeHaOptions) {
       if (!handler) {
         return send({ id, type: 'result', success: false, error: { code: 'unknown_command', message: 'Unknown command.' } });
       }
-      send({ id, type: 'result', success: true, result: handler(token, msg) });
+      try {
+        send({ id, type: 'result', success: true, result: handler(token, msg) });
+      } catch (e) {
+        if (!(e instanceof HaError)) throw e;
+        send({ id, type: 'result', success: false, error: { code: e.code, message: e.message } });
+      }
     });
   });
   await new Promise<void>((resolve) => http.listen(0, '127.0.0.1', resolve));

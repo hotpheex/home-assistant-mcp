@@ -46,6 +46,36 @@ export const REGISTRIES: Partial<FakeHaOptions> = {
   floors: [{ floor_id: 'ground', name: 'Ground Floor' }],
 };
 
+/** Admin-only content: configs with inline secrets, and runs whose trace holds a camera state and a password. */
+export const CONFIGS: Partial<FakeHaOptions> = {
+  configs: {
+    'automation.porch_light': {
+      id: 'porch_light_1',
+      alias: 'Porch light at sunset',
+      triggers: [{ trigger: 'sun', event: 'sunset' }],
+      actions: [{ action: 'rest_command.notify', data: { api_key: 'CFGSECRET', url: 'https://bob:CFGSECRET@nas.local/hook' } }],
+    },
+    'script.morning': { alias: 'Morning', sequence: [{ action: 'rest_command.ping', data: { header: 'Bearer CFGSECRET1' } }] },
+  },
+  traces: ['run_1', 'run_2', 'run_3'].map((run_id, i) => ({
+    domain: 'automation' as const,
+    item_id: 'porch_light_1',
+    run_id,
+    state: 'stopped',
+    script_execution: 'finished',
+    last_step: 'action/0',
+    timestamp: { start: `2026-10-2${i}T18:00:00+00:00`, finish: `2026-10-2${i}T18:00:01+00:00` },
+    trigger: 'sunset',
+    trace: {
+      'trigger/0': [{ changed_variables: { trigger: { to_state: HOUSE.find((s) => s.entity_id === 'camera.porch') } } }],
+      'action/0': [{ result: { params: { service_data: { password: 'TRACESECRET' } } } }],
+    },
+    config: { id: 'porch_light_1', alias: 'Porch light at sunset' },
+    blueprint_inputs: null,
+    context: { id: `ctx_${run_id}`, parent_id: null, user_id: null },
+  })),
+};
+
 export function newKey() {
   const key = `hamcp_${randomBytes(32).toString('base64url')}`;
   return { key, sha256: createHash('sha256').update(key).digest('hex') };
@@ -56,6 +86,7 @@ export async function fakeHa(t: TestContext, options: Partial<FakeHaOptions> = {
     users: { [USERS_TOKEN]: { is_admin: false }, [ADMIN_TOKEN]: { is_admin: true } },
     states: HOUSE,
     ...REGISTRIES,
+    ...CONFIGS,
     ...options,
   });
   t.after(() => ha.close());

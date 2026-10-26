@@ -26,7 +26,7 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'history/history_during_period',
     'logbook/get_events',
   ]),
-  config_read: new Set(),
+  config_read: new Set(['automation/config', 'script/config', 'trace/list', 'trace/get']),
 };
 
 export type Command = { type: string } & Record<string, unknown>;

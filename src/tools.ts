@@ -6,7 +6,7 @@ import { decideRead, grantsFor, type Allowed, type Operation } from './evaluator
 import { HaUnavailable, type Command, type Gate } from './gate.ts';
 import type { Audit } from './log.ts';
 import type { Policy } from './policy.ts';
-import { stripBearerTokens } from './redaction.ts';
+import { maskSecrets, stripBearerTokens } from './redaction.ts';
 
 /** The Operation kind a Caller must hold to see and call each tool. */
 export const TOOL_KIND = {
@@ -14,6 +14,9 @@ export const TOOL_KIND = {
   ha_get_history: 'plain_read',
   ha_get_logbook: 'plain_read',
   ha_get_registry: 'plain_read',
+  ha_get_config: 'config_read',
+  ha_list_traces: 'config_read',
+  ha_get_trace: 'config_read',
 } as const satisfies Record<string, Operation>;
 export type ToolName = keyof typeof TOOL_KIND;
 
@@ -80,6 +83,11 @@ async function read<T>(ctx: Context, allowed: Allowed | undefined, command: Comm
     return stripBearerTokens(await ctx.gate.send(allowed, command)) as T;
   } catch (e) {
     if (e instanceof HaUnavailable) throw new ToolFailure('HA unavailable: nothing was sent to Home Assistant. Try again later.');
+    const refusal = e as { code?: unknown; message?: unknown } | null;
+    // HA's error results arrive as plain {code, message} objects, never as Errors.
+    if (!(e instanceof Error) && typeof refusal?.code === 'string' && typeof refusal.message === 'string') {
+      throw new ToolFailure(`Home Assistant refused the read: ${refusal.message}`);
+    }
     throw e;
   }
 }
@@ -87,6 +95,10 @@ async function read<T>(ctx: Context, allowed: Allowed | undefined, command: Comm
 /** Sends a plain read, which the evaluator decides by the Caller alone. */
 const plainRead = <T>(ctx: Context, command: Command) =>
   read<T>(ctx, decideRead(ctx.policy, ctx.caller.caller, 'plain_read').allowed, command);
+
+/** Sends a config read at the admin tier and masks what comes back. */
+const configRead = async <T>(ctx: Context, command: Command) =>
+  maskSecrets(await read(ctx, decideRead(ctx.policy, ctx.caller.caller, 'config_read').allowed, command)) as T;
 
 interface HaState {
   entity_id: string;
@@ -267,11 +279,82 @@ const getRegistry = defineTool({
   },
 });
 
+const scriptKind = z.enum(['automation', 'script']);
+const itemId = z.string().min(1).describe("The automation's config `id`, or the script's object id (the part after `script.`).");
+
+const getConfig = defineTool({
+  title: 'Get automation or script config',
+  description: [
+    'Returns the stored configuration of one automation or script: its triggers, conditions and actions, or its sequence and fields.',
+    'Name it by `kind` (automation or script) and `entity_id`, such as automation.porch_light.',
+    'Values that look like secrets, such as passwords, tokens, API keys, URL credentials and Bearer tokens, come back as **REDACTED**; this is best-effort, so other secrets in the config may still show.',
+    'An automation config carries its `id`, which names its traces.',
+    'Example: {"kind": "automation", "entity_id": "automation.porch_light"}.',
+  ].join(' '),
+  input: z.strictObject({
+    kind: scriptKind.describe('automation or script.'),
+    entity_id: entityId.describe('The automation or script entity, such as automation.porch_light.'),
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  async run({ kind, entity_id }, ctx) {
+    return text(await configRead(ctx, { type: `${kind}/config`, entity_id }));
+  },
+});
+
+type TraceSummary = { timestamp: { start: string } };
+
+const listTraces = defineTool({
+  title: 'List traces',
+  description: [
+    'Lists the stored runs of one automation or script, newest first, as summaries: run_id, start and finish time, state, last step, what triggered it and any error.',
+    'Name the item by `kind` (automation or script) and `id`: an automation\'s config `id` from its config, or a script\'s object id, the part of its entity_id after `script.`.',
+    'Secret-looking values come back as **REDACTED**, best-effort.',
+    'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    'Example: {"kind": "script", "id": "morning"} lists the runs of script.morning.',
+  ].join(' '),
+  // HA's trace/list without item_id returns every item's traces, so both are required.
+  input: z.strictObject({ kind: scriptKind.describe('automation or script.'), id: itemId, ...page }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  async run({ kind, id, ...paging }, ctx) {
+    const traces = await configRead<TraceSummary[]>(ctx, { type: 'trace/list', domain: kind, item_id: id });
+    return text(pageOf('traces', traces.sort((a, b) => Date.parse(b.timestamp.start) - Date.parse(a.timestamp.start)), paging));
+  },
+});
+
+/** The parts of a trace beyond its summary, returned only when asked for. */
+const TRACE_SECTIONS = ['trace', 'config', 'blueprint_inputs', 'context'] as const;
+
+const getTrace = defineTool({
+  title: 'Get trace',
+  description: [
+    'Returns one run of an automation or script: its summary, plus the `sections` asked for.',
+    'The sections are `trace` (each step with its variables and result), `config` (the config the run used), `blueprint_inputs` and `context` (what caused the run).',
+    'Name the run by `kind`, `id` (an automation\'s config `id` or a script\'s object id) and `run_id` from its trace list.',
+    'Secret-looking values come back as **REDACTED**, best-effort, and camera, image and media_player bearer tokens are removed.',
+    'Example: {"kind": "automation", "id": "porch_light_1", "run_id": "1a2b3c", "sections": ["trace"]}.',
+  ].join(' '),
+  input: z.strictObject({
+    kind: scriptKind.describe('automation or script.'),
+    id: itemId,
+    run_id: z.string().min(1).describe('The run, from its trace list.'),
+    sections: z.array(z.enum(TRACE_SECTIONS)).min(1).describe('The parts to return beyond the summary.'),
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  async run({ kind, id, run_id, sections }, ctx) {
+    const trace = await configRead<Record<string, unknown>>(ctx, { type: 'trace/get', domain: kind, item_id: id, run_id });
+    const left = TRACE_SECTIONS.filter((s) => !sections.includes(s)) as string[];
+    return text(Object.fromEntries(Object.entries(trace).filter(([key]) => !left.includes(key))));
+  },
+});
+
 const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_states: getStates,
   ha_get_history: getHistory,
   ha_get_logbook: getLogbook,
   ha_get_registry: getRegistry,
+  ha_get_config: getConfig,
+  ha_list_traces: listTraces,
+  ha_get_trace: getTrace,
 };
 
 /** Built once, so each tool's definition is identical for every Caller. */

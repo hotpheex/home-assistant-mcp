@@ -142,6 +142,9 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_get_history: { entity_ids: ['light.kitchen'] },
   ha_get_logbook: {},
   ha_get_registry: { registry: 'entity' },
+  ha_get_config: { kind: 'automation', entity_id: 'automation.porch_light' },
+  ha_list_traces: { kind: 'automation', id: 'porch_light_1' },
+  ha_get_trace: { kind: 'automation', id: 'porch_light_1', run_id: 'run_1', sections: ['trace'] },
 };
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
@@ -154,8 +157,16 @@ const PURE_READS = new Set([
   'config/floor_registry/list',
   'history/history_during_period',
   'logbook/get_events',
+  'automation/config',
+  'script/config',
+  'trace/list',
+  'trace/get',
 ]);
 const TIER_TOKEN = { users: USERS_TOKEN, admin: ADMIN_TOKEN };
+
+test('the admin pin: the admin tier serves exactly config read and config write', () => {
+  assert.deepEqual(Object.keys(OPERATION_TIER).filter((op) => OPERATION_TIER[op as Operation] === 'admin'), ['config_read', 'config_write']);
+});
 
 // The coverage matrix: every tool, from the code's own maps, against holding or lacking its kind.
 for (const era of ERAS) {
@@ -190,7 +201,7 @@ grants:
       assert.ok(sentences >= 3 && sentences <= 6, `${tool} has ${sentences} sentences`);
       assert.doesNotMatch(definition.description ?? '', /\bha_/, 'a description points to no other tool');
       // Nothing is refreshed, subscribed or flowed at startup.
-      assert.deepEqual(new Set(ha.received.map((r) => r.message.type)), new Set(['supported_features', 'auth/current_user']));
+      assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !['supported_features', 'auth/current_user'].includes(type)), []);
       const before = ha.received.length;
       const allowed = await holding.callTool({ name: tool, arguments: SAMPLE_ARGS[tool] });
       assert.equal(allowed.isError, undefined);

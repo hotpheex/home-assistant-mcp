@@ -12,6 +12,26 @@ function stripTokenParams(value: unknown): unknown {
   return value;
 }
 
+/** The visible marker that replaces a masked value, the one HA's own diagnostics use. */
+export const REDACTED = '**REDACTED**';
+
+/** `auth` only as a whole word, so `author` and `automation` pass; the rest anywhere in the key. */
+const SECRET_KEY = /password|passwd|secret|token|api_?key|authorization|bearer|credential|private_key|cookie|webhook_id|(^|[^a-z])auth([^a-z]|$)/i;
+const USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@]+@/gi;
+/** A token holding a digit or symbol, so prose such as "the bearer of" is left alone. */
+const BEARER = /\b(bearer\s+)(?=[\w.~+/-]*[\d.~+/-])[\w.~+/-]+=*/gi;
+
+/**
+ * Masks values under secret-looking keys, URL userinfo and `Bearer <token>`, for config and trace reads.
+ * Best-effort: secrets under other keys or in other shapes pass through, as the expected-leak tests list.
+ */
+export function maskSecrets(value: unknown): unknown {
+  if (typeof value === 'string') return value.replace(USERINFO, `$1${REDACTED}@`).replace(BEARER, `$1${REDACTED}`);
+  if (Array.isArray(value)) return value.map(maskSecrets);
+  if (!isRecord(value)) return value;
+  return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, SECRET_KEY.test(k) ? REDACTED : maskSecrets(v)]));
+}
+
 /**
  * Strips `access_token` and `token=` URL parameters from every camera, image and media_player state
  * found anywhere in `value`, so states and the states inside traces both pass through it. Best-effort.
