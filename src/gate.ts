@@ -16,8 +16,20 @@ const TESTED_HA = [2026, 10] as const;
 
 /** Read Operations, and a service call's lookups, may send only these read-only commands. */
 const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
-  plain_read: new Set(['get_states', 'get_services', 'extract_from_target']),
-  config_read: new Set(),
+  plain_read: new Set([
+    'get_states',
+    'get_services',
+    'extract_from_target',
+    'config/entity_registry/list',
+    'config/entity_registry/get_entries',
+    'config/device_registry/list',
+    'config/area_registry/list',
+    'config/label_registry/list',
+    'config/floor_registry/list',
+    'history/history_during_period',
+    'logbook/get_events',
+  ]),
+  config_read: new Set(['automation/config', 'script/config', 'trace/list', 'trace/get']),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
 
@@ -27,15 +39,12 @@ export type Command = { type: string } & Record<string, unknown>;
 export class HaUnavailable extends Error {}
 /** The connection dropped after a write was sent, so it may or may not have run. */
 export class OutcomeUnknown extends Error {}
-/** HA answered with an error result; the message is HA's. */
-export class HaError extends Error {}
 
 /** The client rejects with a bare 3 when nothing was sent, and with a whole envelope coded 3 when the result never came. */
 function failureOf(e: unknown, write: boolean): unknown {
   if (e === ERR_CONNECTION_LOST) return new HaUnavailable();
-  if (typeof e !== 'object' || e === null) return e;
-  if ('error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST) return write ? new OutcomeUnknown() : new HaUnavailable();
-  if ('code' in e && typeof e.code === 'string' && 'message' in e) return new HaError(String(e.message));
+  const lost = typeof e === 'object' && e !== null && 'error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST;
+  if (lost) return write ? new OutcomeUnknown() : new HaUnavailable();
   return e;
 }
 

@@ -25,7 +25,7 @@ for (const era of ERAS) {
     const listed = await client.listTools();
     assert.deepEqual(
       listed.tools.map((tool) => tool.name),
-      ['ha_get_states', 'ha_list_services'],
+      ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services'],
     );
     if (era === 'modern') assert.equal(listed.cacheScope, 'private');
 
@@ -138,11 +138,39 @@ const GRANT_FOR: Record<Operation, string> = {
   config_write: 'config_write: automation',
 };
 const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
-  ha_get_states: {},
-  ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
+  ha_get_states: { query: 'kitchen', area: 'utility_room' },
+  ha_get_history: { entity_ids: ['light.kitchen'] },
+  ha_get_logbook: {},
+  ha_get_registry: { registry: 'entity' },
+  ha_get_config: { kind: 'automation', entity_id: 'automation.porch_light' },
+  ha_list_traces: { kind: 'automation', id: 'porch_light_1' },
+  ha_get_trace: { kind: 'automation', id: 'porch_light_1', run_id: 'run_1', sections: ['trace'] },
   ha_list_services: {},
+  ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
 };
+/** The read-only commands a read tool may send, written out here rather than taken from the gate. */
+const PURE_READS = new Set([
+  'get_states',
+  'get_services',
+  'extract_from_target',
+  'config/entity_registry/list',
+  'config/entity_registry/get_entries',
+  'config/device_registry/list',
+  'config/area_registry/list',
+  'config/label_registry/list',
+  'config/floor_registry/list',
+  'history/history_during_period',
+  'logbook/get_events',
+  'automation/config',
+  'script/config',
+  'trace/list',
+  'trace/get',
+]);
 const TIER_TOKEN = { users: USERS_TOKEN, admin: ADMIN_TOKEN };
+
+test('the admin pin: the admin tier serves exactly config read and config write', () => {
+  assert.deepEqual(Object.keys(OPERATION_TIER).filter((op) => OPERATION_TIER[op as Operation] === 'admin'), ['config_read', 'config_write']);
+});
 
 // The coverage matrix: every tool, from the code's own maps, against holding or lacking its kind.
 for (const era of ERAS) {
@@ -169,13 +197,24 @@ grants:
       );
 
       const holding = await connect(t, server.url, holder.key, era);
-      assert.ok((await holding.listTools()).tools.some((d) => d.name === tool));
+      const definition = (await holding.listTools()).tools.find((d) => d.name === tool);
+      assert.ok(definition?.title);
+      assert.equal(typeof definition.annotations?.destructiveHint, 'boolean');
+      assert.equal(definition.annotations?.readOnlyHint, kind === 'plain_read' || kind === 'config_read');
+      const sentences = definition.description?.match(/[.!?](?=\s|$)/g)?.length ?? 0;
+      assert.ok(sentences >= 3 && sentences <= 6, `${tool} has ${sentences} sentences`);
+      assert.doesNotMatch(definition.description ?? '', /\bha_/, 'a description points to no other tool');
+      // Nothing is refreshed, subscribed or flowed at startup.
+      assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !['supported_features', 'auth/current_user'].includes(type)), []);
       const before = ha.received.length;
       const allowed = await holding.callTool({ name: tool, arguments: SAMPLE_ARGS[tool] });
       assert.equal(allowed.isError, undefined);
       const sent = ha.received.slice(before);
       assert.ok(sent.length > 0);
       assert.deepEqual(new Set(sent.map((r) => r.token)), new Set([TIER_TOKEN[OPERATION_TIER[kind]]]));
+      if (definition.annotations?.readOnlyHint) {
+        assert.deepEqual(sent.map((r) => r.message.type).filter((type) => !PURE_READS.has(type)), [], 'a read tool sends only read-only commands');
+      }
 
       const lacking = await connect(t, server.url, idle.key, era);
       assert.deepEqual((await lacking.listTools()).tools, []);

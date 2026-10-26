@@ -22,7 +22,59 @@ export const HOUSE: FakeState[] = [
   state('sensor.kitchen_temperature', 'Kitchen Temperature', '21.5'),
   state('light.living_room', 'Living Room Lamp', 'off'),
   state('lock.front_door', 'Front Door', 'locked'),
+  {
+    entity_id: 'camera.porch',
+    state: 'idle',
+    attributes: { friendly_name: 'Porch', access_token: 'CAMSECRET', entity_picture: '/api/camera_proxy/camera.porch?token=CAMSECRET' },
+  },
+  {
+    entity_id: 'media_player.den',
+    state: 'playing',
+    attributes: { friendly_name: 'Den Speaker', entity_picture: '/api/media_player_proxy/media_player.den?token=MEDIASECRET&cache=42' },
+  },
 ];
+/** The house's registries: the coffee maker is in an area through its device, and the lamp has an alias. */
+export const REGISTRIES: Partial<FakeHaOptions> = {
+  entities: [
+    { entity_id: 'switch.coffee_maker', device_id: 'dev_coffee' },
+    { entity_id: 'light.living_room', aliases: ['Sofa Light'] },
+    { entity_id: 'lock.front_door', labels: ['security'] },
+  ],
+  devices: [{ id: 'dev_coffee', name: 'Coffee Maker', area_id: 'utility_room', labels: [] }],
+  areas: [{ area_id: 'utility_room', name: 'Utility Room', floor_id: 'ground', aliases: [] }],
+  labels: [{ label_id: 'security', name: 'Security' }],
+  floors: [{ floor_id: 'ground', name: 'Ground Floor' }],
+};
+
+/** Admin-only content: configs with inline secrets, and runs whose trace holds a camera state and a password. */
+export const CONFIGS: Partial<FakeHaOptions> = {
+  configs: {
+    'automation.porch_light': {
+      id: 'porch_light_1',
+      alias: 'Porch light at sunset',
+      triggers: [{ trigger: 'sun', event: 'sunset' }],
+      actions: [{ action: 'rest_command.notify', data: { api_key: 'CFGSECRET', url: 'https://bob:CFGSECRET@nas.local/hook' } }],
+    },
+    'script.morning': { alias: 'Morning', sequence: [{ action: 'rest_command.ping', data: { header: 'Bearer CFGSECRET1' } }] },
+  },
+  traces: ['run_1', 'run_2', 'run_3'].map((run_id, i) => ({
+    domain: 'automation' as const,
+    item_id: 'porch_light_1',
+    run_id,
+    state: 'stopped',
+    script_execution: 'finished',
+    last_step: 'action/0',
+    timestamp: { start: `2026-10-2${i}T18:00:00+00:00`, finish: `2026-10-2${i}T18:00:01+00:00` },
+    trigger: 'sunset',
+    trace: {
+      'trigger/0': [{ changed_variables: { trigger: { to_state: HOUSE.find((s) => s.entity_id === 'camera.porch') } } }],
+      'action/0': [{ result: { params: { service_data: { password: 'TRACESECRET' } } } }],
+    },
+    config: { id: 'porch_light_1', alias: 'Porch light at sunset' },
+    blueprint_inputs: null,
+    context: { id: `ctx_${run_id}`, parent_id: null, user_id: null },
+  })),
+};
 
 export function newKey() {
   const key = `hamcp_${randomBytes(32).toString('base64url')}`;
@@ -34,6 +86,8 @@ export async function fakeHa(t: TestContext, options: Partial<FakeHaOptions> = {
     users: { [USERS_TOKEN]: { is_admin: false }, [ADMIN_TOKEN]: { is_admin: true } },
     states: HOUSE,
     services: { light: { turn_on: { target: { entity: [{ domain: ['light'] }] } } } },
+    ...REGISTRIES,
+    ...CONFIGS,
     ...options,
   });
   t.after(() => ha.close());
@@ -57,8 +111,8 @@ export function writePolicy(yaml: string) {
   return path;
 }
 
-export async function until(check: () => boolean, what: string) {
-  for (let i = 0; i < 200 && !check(); i++) await new Promise((r) => setTimeout(r, 10));
+export async function until(check: () => boolean, what: string, ms = 2000) {
+  for (let i = 0; i < ms / 10 && !check(); i++) await new Promise((r) => setTimeout(r, 10));
   if (!check()) throw new Error(`timed out waiting for ${what}`);
 }
 

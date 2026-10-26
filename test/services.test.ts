@@ -51,7 +51,7 @@ const SERVICES: FakeHaOptions['services'] = {
 
 const agent = newKey();
 async function serve(t: TestContext, rules: string, env: Record<string, string> = {}, options: Partial<FakeHaOptions> = {}) {
-  const ha = await fakeHa(t, { states: STATES, registry: REGISTRY, services: SERVICES, ...options });
+  const ha = await fakeHa(t, { states: STATES, ...REGISTRY, services: SERVICES, ...options });
   const server = await startServer(t, `version: 1\ncallers:\n  agent:\n    keys: [{ sha256: ${agent.sha256} }]\n${rules}`, ha, env);
   const client = await connect(t, server.url, agent.key, 'modern');
   const before = ha.received.length;
@@ -107,7 +107,7 @@ const textOf = (result: unknown) => (result as { content: { text: string }[] }).
 
 test('a service-call Grant lists ha_call_service with the plain-read tools', async (t) => {
   const { client } = await serve(t, grantLights);
-  assert.deepEqual((await client.listTools()).tools.map((d) => d.name).sort(), ['ha_call_service', 'ha_get_states', 'ha_list_services']);
+  assert.deepEqual((await client.listTools()).tools.map((d) => d.name).sort(), ['ha_call_service', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_get_states', 'ha_list_services']);
 });
 
 test('a service no Grant names is refused before any outbound message', async (t) => {
@@ -206,7 +206,7 @@ test('a target that resolves to nothing, or that HA cannot expand, is refused', 
   assert.equal(result.isError, true);
   assert.equal(textOf(result), 'light.turn_on: target matches no entity.');
   const uuid = await call({ domain: 'light', service: 'turn_on', data: { entity_id: '0f3c2a9e8b7d4c1e' } });
-  assert.equal(textOf(uuid), 'Home Assistant error: Entity ID 0f3c2a9e8b7d4c1e is an invalid entity ID');
+  assert.equal(textOf(uuid), 'Home Assistant refused the request: Entity ID 0f3c2a9e8b7d4c1e is an invalid entity ID');
   assert.ok(!sent().some((m) => m.type === 'call_service'));
 });
 

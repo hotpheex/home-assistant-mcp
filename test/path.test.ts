@@ -95,7 +95,7 @@ test('property: every service call HA receives acts only on entities a Grant cov
     fc.asyncProperty(scenario, async ({ house, grants, denies, calls }) => {
       const registry: House = { ...house, areas: [...house.areas], devices: [...house.devices], entities: [...house.entities], floors: [], labels: LABELS.map((label_id) => ({ label_id })) };
       const services = Object.fromEntries(['light', 'lock', 'homeassistant'].map((d) => [d, { [d === 'lock' ? 'unlock' : 'turn_on']: { target: { entity: [{}] } } }]));
-      const ha = await fakeHa(t, { registry, services, states: registry.entities.map((e) => ({ entity_id: e.entity_id, state: 'on', attributes: {} })) });
+      const ha = await fakeHa(t, { ...registry, services, states: registry.entities.map((e) => ({ entity_id: e.entity_id, state: 'on', attributes: {} })) });
       const policy = JSON.stringify({ version: 1, callers: { agent: { keys: [{ sha256: agent.sha256 }] } }, grants, denies });
       const server = await startServer(t, policy, ha);
       const client = await connect(t, server.url, agent.key, 'modern');

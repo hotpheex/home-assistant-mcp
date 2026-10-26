@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { test } from 'node:test';
-import { ADMIN_TOKEN, fakeHa, newKey, runCli, startServer, until, USERS_TOKEN, writePolicy } from './harness.ts';
+import { ADMIN_TOKEN, connect, fakeHa, newKey, runCli, startServer, until, USERS_TOKEN, writePolicy } from './harness.ts';
 
 const key = newKey();
 const callers = `
@@ -31,11 +31,18 @@ const refusals = [
   { name: 'a homeassistant.* service', policy: `${callers}grants:\n  - caller: reader\n    services: [homeassistant.*]\n`, error: /homeassistant/ },
   { name: 'a bare * service', policy: `${callers}denies:\n  - caller: reader\n    services: ['*']\n`, error: /bare \*/ },
   {
+    name: 'an HAMCP_AUDIT_READS that is not a boolean',
+    policy: `${callers}grants:\n  - caller: reader\n    read: plain\n`,
+    env: { HAMCP_AUDIT_READS: 'maybe' },
+    error: /HAMCP_AUDIT_READS/,
+  },
+  {
     name: 'a missing token for a needed tier',
     policy: `${callers}grants:\n  - caller: reader\n    read: plain\n`,
     env: { HAMCP_HA_USERS_TOKEN: undefined },
     error: /HAMCP_HA_USERS_TOKEN/,
   },
+  { name: 'config read without an admin token', policy: `${callers}grants:\n  - caller: reader\n    read: config\n`, error: /HAMCP_HA_ADMIN_TOKEN/ },
 ];
 
 for (const { name, policy, error, env: extra } of refusals) {
@@ -106,4 +113,13 @@ test('the server warns but serves when HA is newer than the tested release', asy
   const ha = await fakeHa(t, { version: '2026.11.0' });
   const server = await startServer(t, grantsPlainRead, ha);
   await until(() => server.records().some((r) => r.level === 'warn' && r.ha_version === '2026.11.0'), 'newer-HA warning');
+});
+
+test('an admin token no Grant needs is warned about and never used', async (t) => {
+  const ha = await fakeHa(t);
+  const server = await startServer(t, grantsPlainRead, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
+  const client = await connect(t, server.url, key.key, 'modern');
+  await client.callTool({ name: 'ha_get_states', arguments: {} });
+  assert.ok(server.records().some((r) => r.level === 'warn' && /HAMCP_HA_ADMIN_TOKEN/.test(String(r.msg))));
+  assert.deepEqual(new Set(ha.received.map((r) => r.token)), new Set([USERS_TOKEN]));
 });

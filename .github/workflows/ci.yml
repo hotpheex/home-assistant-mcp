@@ -24,3 +24,19 @@ jobs:
       - run: npm run typecheck
       # The suite includes the runtime-dependency allowlist check.
       - run: npm test
+
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: docker build --tag hamcp:ci .
+      - run: node --test test/image.test.ts
+        env:
+          HAMCP_IMAGE: hamcp:ci

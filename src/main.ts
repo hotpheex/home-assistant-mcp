@@ -6,7 +6,7 @@ import { hashKey } from './auth.ts';
 import { neededTiers } from './evaluator.ts';
 import { openGate } from './gate.ts';
 import { createHttp } from './http.ts';
-import { logger, optedIn, type Write } from './log.ts';
+import { logger, type Write } from './log.ts';
 import { parsePolicy, policyWarnings } from './policy.ts';
 import { readSettings, readTokens } from './settings.ts';
 
@@ -52,6 +52,9 @@ export async function run(argv: string[], env: Record<string, string | undefined
     log('info', 'policy loaded', { policy_sha256: policy.sha256 });
     for (const warning of policyWarnings(policy, new Date())) log('warn', warning);
     tokens = readTokens(env, neededTiers(policy));
+    if (!tokens.has('admin') && (env.HAMCP_HA_ADMIN_TOKEN || env.HAMCP_HA_ADMIN_TOKEN_FILE)) {
+      log('warn', 'HAMCP_HA_ADMIN_TOKEN is set but no Grant needs config read or config write, so it is never read or used; remove it');
+    }
   } catch (e) {
     return fail((e as Error).message);
   }
@@ -68,7 +71,10 @@ export async function run(argv: string[], env: Record<string, string | undefined
     log('error', reason);
     void close().then(() => io.exit(1));
   });
-  const server = createHttp(policy, settings.HAMCP_ALLOWED_ORIGINS, gate, log, optedIn(audit, settings.HAMCP_AUDIT_WRITES));
+  const server = createHttp(policy, settings.HAMCP_ALLOWED_ORIGINS, gate, log, audit, {
+    auditReads: settings.HAMCP_AUDIT_READS,
+    auditWrites: settings.HAMCP_AUDIT_WRITES,
+  });
   const { host, port } = settings.HAMCP_LISTEN;
   try {
     await new Promise<void>((resolve, reject) => server.http.once('error', reject).listen(port, host, resolve));

@@ -8,27 +8,38 @@ export interface FakeState {
   attributes: Record<string, unknown>;
 }
 
-export interface Registry {
-  entities: {
-    entity_id: string;
-    device_id: string | null;
-    area_id: string | null;
-    labels: string[];
-    hidden_by: string | null;
-    disabled_by: string | null;
-    entity_category: 'config' | 'diagnostic' | null;
-  }[];
-  devices: { id: string; area_id: string | null; labels: string[]; parent_device_id: string | null }[];
-  areas: { area_id: string; floor_id: string | null; labels: string[] }[];
-  floors: { floor_id: string }[];
-  labels: { label_id: string }[];
+export interface FakeEntity {
+  entity_id: string;
+  name?: string | null;
+  device_id?: string | null;
+  area_id?: string | null;
+  labels?: string[];
+  hidden_by?: string | null;
+  disabled_by?: string | null;
+  entity_category?: 'config' | 'diagnostic' | null;
+  /** Served only by get_entries, as in HA. */
+  aliases?: string[];
 }
-
 export interface ServiceDescription {
   name?: string;
   fields?: Record<string, unknown>;
   target?: Record<string, unknown>;
   response?: { optional: boolean };
+}
+/** A device, area, label or floor registry entry, served as given. */
+export type FakeEntry = Record<string, unknown>;
+/** A recorded state change, served by history. */
+export interface FakeChange {
+  entity_id: string;
+  state: string;
+  when: string;
+}
+export interface FakeLogEntry {
+  when: string;
+  entity_id?: string;
+  name?: string;
+  state?: string;
+  message?: string;
 }
 
 export interface FakeHaOptions {
@@ -36,11 +47,29 @@ export interface FakeHaOptions {
   /** Accepted tokens, each mapped to its HA user. */
   users: Record<string, { is_admin: boolean }>;
   states?: FakeState[];
-  registry?: Registry;
   services?: Record<string, Record<string, ServiceDescription>>;
   /** What a responding service returns, by `domain.service`. */
   responses?: Record<string, unknown>;
+  entities?: FakeEntity[];
+  devices?: FakeEntry[];
+  areas?: FakeEntry[];
+  labels?: FakeEntry[];
+  floors?: FakeEntry[];
+  history?: FakeChange[];
+  logbook?: FakeLogEntry[];
+  /** Automation and script configs, keyed by entity_id. */
+  configs?: Record<string, Record<string, unknown>>;
+  traces?: FakeTrace[];
 }
+
+/** A stored run: summary fields plus the sections only trace/get returns. */
+export interface FakeTrace extends Record<string, unknown> {
+  domain: 'automation' | 'script';
+  item_id: string;
+  run_id: string;
+  timestamp: { start: string; finish: string };
+}
+const TRACE_SECTIONS = ['trace', 'config', 'blueprint_inputs', 'context'];
 
 /** A command the server sent after authenticating, with the token of the connection it came on. */
 export interface Received {
@@ -48,9 +77,7 @@ export interface Received {
   message: { type: string; id?: number } & Record<string, unknown>;
 }
 
-type Target = Partial<Record<'entity_id' | 'device_id' | 'area_id' | 'floor_id' | 'label_id', string | string[]>>;
-
-/** An HA error result: a handler throws it and the fake answers `success: false`. */
+/** Thrown by a handler to answer with an HA error result. */
 class HaError extends Error {
   code: string;
   constructor(code: string, message: string) {
@@ -58,13 +85,38 @@ class HaError extends Error {
     this.code = code;
   }
 }
+const haError = (code: string, message: string): never => {
+  throw new HaError(code, message);
+};
+
+type Target = Partial<Record<'entity_id' | 'device_id' | 'area_id' | 'floor_id' | 'label_id', string | string[]>>;
+type Entity = Required<Omit<FakeEntity, 'name' | 'aliases'>>;
+type Device = { id: string; area_id: string | null; labels: string[]; parent_device_id: string | null };
+/** The registry fields `extract_from_target` reads, with HA's defaults filled in. */
+export type Registry = {
+  entities: Entity[];
+  devices: Device[];
+  areas: { area_id: string; floor_id: string | null; labels: string[] }[];
+  floors: { floor_id: string }[];
+  labels: { label_id: string }[];
+};
+
+function registryOf(o: Pick<FakeHaOptions, 'entities' | 'devices' | 'areas' | 'floors' | 'labels'>): Registry {
+  return {
+    entities: (o.entities ?? []).map((e) => ({ device_id: null, area_id: null, labels: [], hidden_by: null, disabled_by: null, entity_category: null, ...e })),
+    devices: (o.devices ?? []).map((d) => ({ area_id: null, labels: [], parent_device_id: null, ...d }) as unknown as Device),
+    areas: (o.areas ?? []).map((a) => ({ floor_id: null, labels: [], ...a }) as unknown as Registry['areas'][number]),
+    floors: (o.floors ?? []) as Registry['floors'],
+    labels: (o.labels ?? []) as Registry['labels'],
+  };
+}
 
 const ids = (v: string | string[] | undefined): Set<string> => (v === undefined || v === 'none' ? new Set() : new Set(Array.isArray(v) ? v : [v]));
 
 /** A port of HA 2026.10's `helpers/target.py` expansion, rule for rule. */
-export function extractFromTarget(h: Registry, target: Target, primaryEntitiesOnly = true) {
-  const t = { e: ids(target.entity_id), d: ids(target.device_id), a: ids(target.area_id), f: ids(target.floor_id), l: ids(target.label_id) };
-  for (const e of t.e) if (!/^[a-z0-9_]+\.[a-z0-9_]+$/.test(e)) throw new HaError('invalid_format', `Entity ID ${e} is an invalid entity ID`);
+function extractFromTarget(h: Registry, target: Target, primaryEntitiesOnly = true) {
+  const t ={ e: ids(target.entity_id), d: ids(target.device_id), a: ids(target.area_id), f: ids(target.floor_id), l: ids(target.label_id) };
+  for (const e of t.e) if (!/^[a-z0-9_]+\.[a-z0-9_]+$/.test(e)) haError('invalid_format', `Entity ID ${e} is an invalid entity ID`);
   const referenced = new Set(t.e);
   const refDevices = new Set<string>();
   const refAreas = new Set<string>();
@@ -102,9 +154,9 @@ export function extractFromTarget(h: Registry, target: Target, primaryEntitiesOn
   for (const a of h.areas) if (a.floor_id !== null && t.f.has(a.floor_id)) refAreas.add(a.area_id);
   for (const a of t.a) refAreas.add(a);
   if (!refAreas.size && !refDevices.size) return out();
-  const include = (e: Registry['entities'][number]) => e.hidden_by === null && (!primaryEntitiesOnly || e.entity_category === null);
+  const include = (e: Entity) => e.hidden_by === null && (!primaryEntitiesOnly || e.entity_category === null);
   for (const d of refDevices) for (const e of h.entities) if (e.device_id === d && e.disabled_by === null && include(e)) referenced.add(e.entity_id);
-  const effectiveArea = (d: Registry['devices'][number]) => d.area_id ?? (d.parent_device_id ? (dev.get(d.parent_device_id)?.area_id ?? null) : null);
+  const effectiveArea = (d: Device) => d.area_id ?? (d.parent_device_id ? (dev.get(d.parent_device_id)?.area_id ?? null) : null);
   const areaDevices = new Set(
     h.devices
       .filter((d) => {
@@ -122,17 +174,35 @@ export function extractFromTarget(h: Registry, target: Target, primaryEntitiesOn
 }
 
 const isoNow = () => new Date().toISOString();
+const seconds = (iso: string) => Date.parse(iso) / 1000;
+type Message = Received['message'];
+const inWindow = (when: string, msg: Message) =>
+  Date.parse(when) >= Date.parse(msg.start_time as string) &&
+  Date.parse(when) <= (msg.end_time === undefined ? Date.now() : Date.parse(msg.end_time as string));
 
 /** Hand-written HA 2026.10: speaks the WebSocket protocol to the real client and records every command. */
 export async function startFakeHa(options: FakeHaOptions) {
   const version = options.version ?? '2026.10.4';
   const received: Received[] = [];
-  const registry = options.registry ?? { entities: [], devices: [], areas: [], floors: [], labels: [] };
   let contexts = 0;
   const drop = new Set<string>();
   let down = false;
   let refused = 0;
-  const handlers: Record<string, (token: string, msg: Received['message']) => unknown> = {
+  const entities = options.entities ?? [];
+  const entityEntry = (e: FakeEntity) => {
+    const entry: Partial<FakeEntity> = { name: null, device_id: null, area_id: null, labels: [], hidden_by: null, disabled_by: null, entity_category: null, ...e };
+    delete entry.aliases;
+    return entry;
+  };
+  type Handler = (token: string, msg: Message) => unknown;
+  /** HA's require_admin. */
+  const adminOnly = (handler: Handler): Handler => (token, msg) =>
+    options.users[token]?.is_admin ? handler(token, msg) : haError('unauthorized', 'Unauthorized');
+  const configOf = adminOnly((_, msg) => {
+    const config = options.configs?.[msg.entity_id as string];
+    return config && (msg.entity_id as string).startsWith(`${msg.type.split('/')[0]}.`) ? { config } : haError('not_found', 'Entity not found');
+  });
+  const handlers: Record<string, Handler> = {
     supported_features: () => null,
     get_states: () =>
       (options.states ?? []).map((s) => ({
@@ -151,20 +221,55 @@ export async function startFakeHa(options: FakeHaOptions) {
       mfa_modules: [],
     }),
     get_services: () => options.services ?? {},
-    extract_from_target: (_token, msg) => extractFromTarget(registry, msg.target as Target, (msg.primary_entities_only as boolean | undefined) ?? true),
+    extract_from_target: (_token, msg) => extractFromTarget(registryOf(options), msg.target as Target, (msg.primary_entities_only as boolean | undefined) ?? true),
     call_service: (token, msg) => {
       const name = `${String(msg.domain)}.${String(msg.service)}`;
       const description = options.services?.[String(msg.domain)]?.[String(msg.service)];
-      if (!description) throw new HaError('not_found', `Service ${name} not found.`);
+      if (!description) return haError('not_found', `Service ${name} not found.`);
       if (msg.return_response === true && !description.response) {
-        throw new HaError('service_validation_error', "Validation error: An action which does not return responses can't be called with return_response=True");
+        haError('service_validation_error', "Validation error: An action which does not return responses can't be called with return_response=True");
       }
       if (msg.return_response !== true && description.response?.optional === false) {
-        throw new HaError('service_validation_error', 'Validation error: The action requires responses and must be called with return_response=True');
+        haError('service_validation_error', 'Validation error: The action requires responses and must be called with return_response=True');
       }
       const context = { id: `ctx-${++contexts}`, parent_id: null, user_id: token };
       return msg.return_response === true ? { context, response: options.responses?.[name] ?? {} } : { context };
     },
+    'config/entity_registry/list': () => entities.map(entityEntry),
+    'config/entity_registry/get_entries': (_, msg) =>
+      Object.fromEntries(
+        (msg.entity_ids as string[]).map((id) => {
+          const e = entities.find((x) => x.entity_id === id);
+          return [id, e ? { ...entityEntry(e), aliases: e.aliases ?? [] } : null];
+        }),
+      ),
+    'config/device_registry/list': () => options.devices ?? [],
+    'config/area_registry/list': () => options.areas ?? [],
+    'config/label_registry/list': () => options.labels ?? [],
+    'config/floor_registry/list': () => options.floors ?? [],
+    'history/history_during_period': (_, msg) => {
+      const out: Record<string, { s: string; lu: number }[]> = {};
+      for (const c of options.history ?? []) {
+        if ((msg.entity_ids as string[]).includes(c.entity_id) && inWindow(c.when, msg)) (out[c.entity_id] ??= []).push({ s: c.state, lu: seconds(c.when) });
+      }
+      return out;
+    },
+    'automation/config': configOf,
+    'script/config': configOf,
+    'trace/list': adminOnly((_, msg) =>
+      (options.traces ?? [])
+        .filter((tr) => tr.domain === msg.domain && (msg.item_id === undefined || tr.item_id === msg.item_id))
+        .map((tr) => Object.fromEntries(Object.entries(tr).filter(([k]) => !TRACE_SECTIONS.includes(k)))),
+    ),
+    'trace/get': adminOnly(
+      (_, msg) =>
+        options.traces?.find((tr) => tr.domain === msg.domain && tr.item_id === msg.item_id && tr.run_id === msg.run_id) ??
+        haError('not_found', 'The trace could not be found'),
+    ),
+    'logbook/get_events': (_, msg) =>
+      (options.logbook ?? [])
+        .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
+        .map((e) => ({ ...e, when: seconds(e.when) })),
   };
 
   const http = createServer((_req, res) => res.writeHead(404).end());
