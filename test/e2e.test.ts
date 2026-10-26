@@ -284,12 +284,8 @@ denies:
       return { result, audit, acted: result.isError ? { refused: result.content, audit } : (body(result) as { entity_ids: string[] }).entity_ids.sort() };
     };
 
-    t.diagnostic(JSON.stringify(await owner.sendMessagePromise({ type: 'config/device_registry/list' })));
-    t.diagnostic(JSON.stringify(await owner.sendMessagePromise({ type: 'config/entity_registry/list' })));
-    t.diagnostic(JSON.stringify(await owner.sendMessagePromise({ type: 'config/label_registry/list' })));
-    t.diagnostic(JSON.stringify(await owner.sendMessagePromise({ type: 'extract_from_target', target: { label_id: ['e2e_hub'] }, expand_group: false })));
     // A labelled hub's child devices are covered by the label.
-    assert.deepEqual((await call('switch.turn_on', { entity_id: ['switch.outlet_a', 'switch.outlet_b'] })).acted, ['switch.outlet_a', 'switch.outlet_b']);
+    assert.deepEqual((await call('switch.turn_on', { entity_id: ['switch.e2e_hub_outlet_a', 'switch.e2e_hub_outlet_b'] })).acted, ['switch.e2e_hub_outlet_a', 'switch.e2e_hub_outlet_b']);
     // The area holds the plug's primary switch, but neither its hidden nor its config entity...
     assert.deepEqual((await call('switch.turn_on', { area_id: areaId })).acted, ['switch.e2e_plug']);
     // ...so the area Grant covers neither.
