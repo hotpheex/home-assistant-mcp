@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { parseArgs } from 'node:util';
 import { hashKey } from './auth.ts';
+import { check } from './check.ts';
 import { neededTiers } from './evaluator.ts';
 import { openGate } from './gate.ts';
 import { createHttp } from './http.ts';
@@ -20,7 +21,7 @@ export interface Running {
   close(): Promise<void>;
 }
 
-/** The CLI: `serve` (the default) and `keygen`. Errors log one line and exit non-zero. */
+/** The CLI: `serve` (the default), `check` and `keygen`. Errors log one line and exit non-zero. */
 export async function run(argv: string[], env: Record<string, string | undefined>, io: Io): Promise<Running | undefined> {
   const { log, audit } = logger(io.write);
   const fail = (message: string) => {
@@ -43,7 +44,17 @@ export async function run(argv: string[], env: Record<string, string | undefined
     io.write(`sha256: ${hashKey(key).toString('hex')}`);
     return undefined;
   }
-  if (command !== 'serve') return fail(`unknown command "${command}"; use serve or keygen`);
+  if (command === 'check') {
+    const path = args.positionals[1] ?? args.values.policy ?? env.HAMCP_POLICY;
+    if (!path) return fail('usage: check <policy>');
+    try {
+      io.exit((await check(path, env, log)) ? 0 : 1);
+    } catch (e) {
+      return fail((e as Error).message);
+    }
+    return undefined;
+  }
+  if (command !== 'serve') return fail(`unknown command "${command}"; use serve, check or keygen`);
 
   let settings, policy, tokens;
   try {

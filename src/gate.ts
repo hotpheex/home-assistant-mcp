@@ -7,7 +7,7 @@ import {
   ERR_INVALID_AUTH,
   type Connection,
 } from 'home-assistant-js-websocket';
-import type { Allowed, Operation, Tier } from './evaluator.ts';
+import { HELPER_DOMAINS, type Allowed, type Operation, type Tier } from './evaluator.ts';
 import type { Log } from './log.ts';
 
 const MINIMUM_HA = [2026, 10] as const;
@@ -29,11 +29,19 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'history/history_during_period',
     'logbook/get_events',
   ]),
-  config_read: new Set(['automation/config', 'script/config', 'trace/list', 'trace/get']),
+  config_read: new Set(['automation/config', 'script/config', 'trace/list', 'trace/get', ...HELPER_DOMAINS.map((d) => `${d}/list`)]),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
+/** Config read may GET a stored config; any other REST request must be the exact write an Allowed names. */
+const CONFIG_PATH = /^\/api\/config\/(automation|script|scene)\/config\/[^/]+$/;
 
 export type Command = { type: string } & Record<string, unknown>;
+/** A request to HA's config REST API, the only REST the server makes. */
+export interface RestRequest {
+  method: 'GET' | 'POST' | 'DELETE';
+  path: string;
+  body?: unknown;
+}
 
 /** Nothing left the process. */
 export class HaUnavailable extends Error {}
@@ -50,6 +58,8 @@ function failureOf(e: unknown, write: boolean): unknown {
 
 export interface Gate {
   send(allowed: Allowed, command: Command): Promise<unknown>;
+  /** Answers with HA's status and JSON body, leaving their meaning to the caller. */
+  rest(allowed: Allowed, request: RestRequest): Promise<{ status: number; body: unknown }>;
   close(): void;
 }
 
@@ -57,7 +67,7 @@ const releaseOf = (version: string) => version.split('.').slice(0, 2).map(Number
 const compare = (a: number[], b: readonly number[]) => (a[0]! - b[0]!) || (a[1]! - b[1]!);
 
 /**
- * The only code that reaches HA. It holds one connection per needed tier and exits the server
+ * The only code that reaches HA. It holds one connection per needed tier, plus REST for config, and exits the server
  * (through `fatal`) on a rejected token, an HA below the minimum, or an admin behind the users tier.
  */
 export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Log, fatal: (reason: string) => void): Gate {
@@ -119,6 +129,24 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       } catch (e) {
         throw failureOf(e, command === allowed.command);
       }
+    },
+    async rest(allowed, request) {
+      const lookup = allowed.operation === 'config_read' && request.method === 'GET' && CONFIG_PATH.test(request.path);
+      if (request !== allowed.command && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
+      if (!connections.get(allowed.tier)?.connected) throw new HaUnavailable();
+      let res: Response;
+      try {
+        res = await fetch(`${url}${request.path}`, {
+          method: request.method,
+          headers: { authorization: `Bearer ${tokens.get(allowed.tier)}`, 'content-type': 'application/json' },
+          ...(request.body !== undefined && { body: JSON.stringify(request.body) }),
+        });
+      } catch {
+        // fetch cannot tell a refused connection from one dropped mid-request, so a write errs towards unknown.
+        throw request === allowed.command ? new OutcomeUnknown() : new HaUnavailable();
+      }
+      // A 401 from HA is text/plain.
+      return { status: res.status, body: await res.json().catch(() => null) };
     },
     close() {
       closed = true;

@@ -1,5 +1,6 @@
 import { isDelegating, TARGET_KEYS } from './evaluator.ts';
 import type { Command } from './gate.ts';
+import type { Policy } from './policy.ts';
 
 /** HA's target forms, each key normalised to a list. */
 export type Target = Partial<Record<(typeof TARGET_KEYS)[number], string[]>>;
@@ -48,4 +49,39 @@ export async function extract(send: Send, target: Target, primaryEntitiesOnly = 
     ...(primaryEntitiesOnly ? {} : { primary_entities_only: false }),
   })) as { referenced_entities: string[] };
   return [...result.referenced_entities].sort();
+}
+
+/**
+ * Every area, label, domain and service the Policy names that HA does not know, as `<path>: <problem>`.
+ * `check` refuses these and startup warns. A target domain is known if HA offers a service or holds an entity in it.
+ */
+export async function unknownNames(policy: Policy, send: Send): Promise<string[]> {
+  const rules = [...policy.grants.map((r, i) => [`grants.${i}`, r] as const), ...policy.denies.map((r, i) => [`denies.${i}`, r] as const)];
+  const targets = rules.flatMap(([, r]) => r.targets ?? []);
+  const areas = [...new Set(targets.flatMap((t) => t.area ?? []))];
+  const labels = [...new Set(targets.flatMap((t) => t.label ?? []))];
+  const services = (await send({ type: 'get_services' })) as Record<string, Record<string, unknown>>;
+  const domains = new Set(Object.keys(services));
+  if (targets.some((t) => t.domain !== undefined && t.domain !== '*' && !domains.has(t.domain))) {
+    for (const { entity_id } of (await send({ type: 'get_states' })) as { entity_id: string }[]) domains.add(entity_id.split('.')[0]!);
+  }
+  type Missing = Record<'missing_areas' | 'missing_labels', string[]>;
+  const missing: Missing =
+    areas.length + labels.length === 0
+      ? { missing_areas: [], missing_labels: [] }
+      : ((await send({ type: 'extract_from_target', target: { area_id: areas, label_id: labels }, expand_group: false })) as Missing);
+
+  return rules.flatMap(([path, rule]) => [
+    ...(rule.services ?? []).flatMap((s, j) => {
+      const [domain, name] = s.split('.') as [string, string];
+      if (name === '*') return services[domain] ? [] : [`${path}.services.${j}: Home Assistant has no domain "${domain}"`];
+      return services[domain]?.[name] ? [] : [`${path}.services.${j}: Home Assistant has no service "${s}"`];
+    }),
+    ...(rule.targets ?? []).flatMap((t, j) => {
+      const at = `${path}.targets.${j}`;
+      if (t.area !== undefined) return missing.missing_areas.includes(t.area) ? [`${at}.area: Home Assistant has no area "${t.area}"`] : [];
+      if (t.label !== undefined) return missing.missing_labels.includes(t.label) ? [`${at}.label: Home Assistant has no label "${t.label}"`] : [];
+      return t.domain === '*' || domains.has(t.domain!) ? [] : [`${at}.domain: Home Assistant has no domain "${t.domain}"`];
+    }),
+  ]);
 }
