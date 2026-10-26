@@ -31,6 +31,12 @@ const refusals = [
   { name: 'a homeassistant.* service', policy: `${callers}grants:\n  - caller: reader\n    services: [homeassistant.*]\n`, error: /homeassistant/ },
   { name: 'a bare * service', policy: `${callers}denies:\n  - caller: reader\n    services: ['*']\n`, error: /bare \*/ },
   {
+    name: 'an HAMCP_AUDIT_READS that is not a boolean',
+    policy: `${callers}grants:\n  - caller: reader\n    read: plain\n`,
+    env: { HAMCP_AUDIT_READS: 'maybe' },
+    error: /HAMCP_AUDIT_READS/,
+  },
+  {
     name: 'a missing token for a needed tier',
     policy: `${callers}grants:\n  - caller: reader\n    read: plain\n`,
     env: { HAMCP_HA_USERS_TOKEN: undefined },

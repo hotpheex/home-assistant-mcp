@@ -5,14 +5,14 @@ import { authenticator, type Authenticated } from './auth.ts';
 import type { Gate } from './gate.ts';
 import type { Audit, Log } from './log.ts';
 import type { Policy } from './policy.ts';
-import { buildServer } from './tools.ts';
+import { buildServer, type AuditOptions } from './tools.ts';
 
 const deny = (res: ServerResponse, status: number, headers: Record<string, string> = {}) => void res.writeHead(status, headers).end();
 
 /** Streamable HTTP at /mcp for both protocol eras, statelessly. Each request is checked in order: Origin, key, then the SDK. */
-export function createHttp(policy: Policy, allowedOrigins: ReadonlySet<string>, gate: Gate, log: Log, audit: Audit) {
+export function createHttp(policy: Policy, allowedOrigins: ReadonlySet<string>, gate: Gate, log: Log, audit: Audit, options: AuditOptions) {
   const authenticate = authenticator(policy);
-  const mcp = createMcpHandler(({ authInfo }) => buildServer(policy, gate, audit, authInfo?.extra?.caller as Authenticated), {
+  const mcp = createMcpHandler(({ authInfo }) => buildServer(policy, gate, audit, authInfo?.extra?.caller as Authenticated, options), {
     onerror: (e) => log('error', 'MCP request failed', { error: e.message }),
   });
   const handle = toNodeHandler(mcp);
