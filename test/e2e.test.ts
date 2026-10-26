@@ -24,6 +24,17 @@ const CONFIG = {
   'configuration.yaml': `homeassistant:
   name: hamcp e2e
 automation: !include automations.yaml
+# Apart from automations.yaml, whose config REST refuses to load a !secret.
+automation canary:
+  - id: canary
+    alias: Canary
+    triggers:
+      - trigger: event
+        event_type: hamcp_e2e_never
+    actions:
+      - event: hamcp_e2e_canary
+        event_data:
+          api_key: !secret canary_api_key
 script: !include scripts.yaml
 scene: !include scenes.yaml
 history:
@@ -36,16 +47,7 @@ rest_command:
       authorization: Bearer ${HEADER_CANARY}
 `,
   'secrets.yaml': `canary_api_key: ${SECRET_CANARY}\n`,
-  'automations.yaml': `- id: canary
-  alias: Canary
-  triggers:
-    - trigger: event
-      event_type: hamcp_e2e_never
-  actions:
-    - event: hamcp_e2e_canary
-      event_data:
-        api_key: !secret canary_api_key
-`,
+  'automations.yaml': '[]\n',
   'scripts.yaml': '{}\n',
   'scenes.yaml': '[]\n',
 };
@@ -277,7 +279,9 @@ denies:
       const [domain, service] = name.split('.');
       const result = await client.callTool({ name: 'ha_call_service', arguments: { domain, service, target } });
       if (result.isError) await until(() => audits().length > seen, 'the denial audit line', 5000);
-      return { result, audit: audits().at(-1), acted: result.isError ? [] : (body(result) as { entity_ids: string[] }).entity_ids.sort() };
+      const audit = audits().at(-1);
+      // A refusal shows up whole in a failed assertion on `acted`.
+      return { result, audit, acted: result.isError ? { refused: result.content, audit } : (body(result) as { entity_ids: string[] }).entity_ids.sort() };
     };
 
     // A labelled hub's child devices are covered by the label.
