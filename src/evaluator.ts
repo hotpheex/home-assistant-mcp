@@ -49,6 +49,9 @@ export function decideRead(policy: Policy, caller: string, kind: ReadKind): Read
   return { allowed: { operation: kind, tier: OPERATION_TIER[kind] } as Allowed, grants };
 }
 
+/** Resolving Policy names, for `check` and startup warnings, may send only plain read's read-only commands, at its tier. */
+export const NAME_LOOKUP = { operation: 'plain_read', tier: OPERATION_TIER.plain_read } as Allowed;
+
 /** Delegating services act on whatever their data names, so only an exact name grants one. */
 export const isDelegating = (service: string) => service.startsWith('homeassistant.') || service === 'scene.apply';
 
