@@ -17,7 +17,6 @@ const allowedCasts = ['TSAsExpression', 'TSTypeAssertion'].map((node) => ({
 }));
 // globalThis and global are restricted whole, since an alias of either reaches fetch unseen.
 const gateRules = {
-  'no-restricted-imports': 'off',
   '@typescript-eslint/no-restricted-imports': [
     'error',
     {

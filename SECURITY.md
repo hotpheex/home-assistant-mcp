@@ -15,8 +15,9 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/evaluator.test.ts`: the property that a Caller with no Grant is refused every service.
 - `test/services.test.ts`: a service no Grant names, and a Deny without targets, refused before any outbound message.
 
-**The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`. Read tools may send only an allowlist of read-only commands.
-- `test/repo.test.ts`: lint fails on any import of the HA client or any `fetch` outside the gate, and on building an `Allowed` outside the evaluator.
+**The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands.
+- `test/repo.test.ts`: lint fails on any import of the HA client or another network client, or any `fetch` or `WebSocket`, outside the gate, and on casting to `Allowed` outside the evaluator.
+- `test/serve.test.ts`: a forged, spread or altered decision handed to the gate sends nothing.
 - `test/serve.test.ts`: in the coverage matrix, a read tool sends only read-only commands, and startup sends nothing beyond name lookups.
 
 **Tiers and the admin pin.** Only config read and config write run with the admin token. Plain read and service calls run with the users-tier token, so HA refuses admin-only services. The server exits if the users-tier token belongs to an HA admin, and never reads a token no Grant needs.
