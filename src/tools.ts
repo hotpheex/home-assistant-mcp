@@ -7,7 +7,7 @@ import { HaUnavailable, OutcomeUnknown, type Command, type Gate } from './gate.t
 import type { Audit } from './log.ts';
 import type { Policy } from './policy.ts';
 import { maskSecrets, stripBearerTokens } from './redaction.ts';
-import { expandAll, extract, mergeTarget } from './resolver.ts';
+import { domainsOf, expandAll, extract, mergeTarget } from './resolver.ts';
 
 /** The Operation kind a Caller must hold to see and call each tool. */
 export const TOOL_KIND = {
@@ -422,8 +422,8 @@ const callService = defineTool({
   title: 'Call a service',
   description: [
     'Calls a Home Assistant service, such as light.turn_on, with a `target` in any HA form (entity_id, device_id, area_id, floor_id, label_id, or entity_id "all") and service `data`.',
-    'The server expands the target as Home Assistant would, and runs the call only if this Caller may act on every entity it reaches; otherwise it refuses the whole call rather than narrowing it.',
-    'Target keys inside `data` count as part of the target. A service that takes no target must be called without one.',
+    'The server expands the target as Home Assistant would, leaves out entities of domains the service does not act on (a switch in an area for light.turn_on), and runs the call only if this Caller may act on every remaining entity; otherwise it refuses the whole call rather than narrowing it.',
+    "Target keys inside `data` count as part of the target, and an entity_id named outside the service's domains is refused. A service that takes no target must be called without one.",
     'The result lists the entity_ids acted on, the HA context id and, for a service that responds, its response.',
     'Example: {"domain": "light", "service": "turn_on", "target": {"area_id": "kitchen"}, "data": {"brightness_pct": 40}}.',
   ].join(' '),
@@ -460,7 +460,13 @@ const callService = defineTool({
 
     const expansion = { targeted, entities: [] as string[], grantEntities: [] as string[], denyEntities: [] as string[] };
     if (targeted) {
-      expansion.entities = await extract(lookup, await expandAll(lookup, requested, name));
+      const reached = await extract(lookup, await expandAll(lookup, requested, name));
+      const domains = domainsOf(description.target);
+      const admitted = (e: string) => domains?.has(e.split('.')[0]!) ?? true;
+      // An entity_id the Caller named is never left out silently.
+      const named = (requested.entity_id ?? []).filter((e) => e !== 'all' && !admitted(e));
+      if (named.length > 0) throw new ToolFailure(`${name} acts only on ${[...domains!].join(', ')} entities; remove ${named.join(', ')} from the target.`);
+      expansion.entities = reached.filter(admitted);
       if (expansion.entities.length === 0) throw new ToolFailure(`${name}: target matches no entity.`);
       expansion.grantEntities = await extract(lookup, plan.grantSelectors);
       expansion.denyEntities = await extract(lookup, plan.denySelectors, false);

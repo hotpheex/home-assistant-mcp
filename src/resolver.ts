@@ -17,6 +17,17 @@ export function mergeTarget(target: Record<string, unknown> = {}, data: Record<s
   return merged;
 }
 
+/**
+ * The domains a service's declared `target.entity` filter admits, or undefined when it admits any (ADR 0008 amendment).
+ * HA acts only on these, so the resolver leaves the rest of an expansion out; a filter entry without a domain admits any.
+ */
+export function domainsOf(target: unknown): Set<string> | undefined {
+  const entity = (target as { entity?: unknown } | null | undefined)?.entity;
+  const filters = (entity === undefined || entity === null ? [] : Array.isArray(entity) ? entity : [entity]) as { domain?: unknown }[];
+  if (filters.length === 0 || filters.some((f) => f?.domain === undefined)) return undefined;
+  return new Set(filters.flatMap((f) => listOf(f.domain)));
+}
+
 /** `entity_id: all` becomes the entities of the service's domain, or every entity for a delegating service. */
 export async function expandAll(send: Send, target: Target, service: string): Promise<Target> {
   if (!target.entity_id?.includes('all')) return target;

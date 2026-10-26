@@ -37,13 +37,14 @@ const REGISTRY: Registry = {
   ],
 };
 const STATES = REGISTRY.entities.map((e) => ({ entity_id: e.entity_id, state: 'off', attributes: {} }));
-const targeted = { target: { entity: [{}] } };
+/** A service's declared `target.entity` domain filter, as get_services serves it; no domain declares none. */
+const targeted = (...domain: string[]) => ({ target: { entity: [domain.length ? { domain } : {}] } });
 const SERVICES: FakeHaOptions['services'] = {
-  light: { turn_on: { name: 'Turn on', fields: { brightness: { selector: { number: {} } } }, ...targeted }, turn_off: targeted },
-  lock: { unlock: targeted },
-  button: { press: targeted },
-  switch: { turn_on: targeted },
-  homeassistant: { turn_on: targeted },
+  light: { turn_on: { name: 'Turn on', fields: { brightness: { selector: { number: {} } } }, ...targeted('light') }, turn_off: targeted('light') },
+  lock: { unlock: targeted('lock') },
+  button: { press: targeted('button') },
+  switch: { turn_on: targeted('switch') },
+  homeassistant: { turn_on: targeted() },
   scene: { apply: { fields: { entities: {} } } },
   shell_command: { backup: { fields: {} } },
   rest_command: { ping: { fields: {}, response: { optional: false } } },
@@ -61,16 +62,16 @@ async function serve(t: TestContext, rules: string, env: Record<string, string> 
   return { ha, server, client, sent, call };
 }
 
-test('an area Grant forwards exactly the entities HA expands the call target to', async (t) => {
+test("an area Grant forwards exactly the entities HA expands the call target to, within the service's own domains", async (t) => {
   const { sent, call, ha } = await serve(t, 'grants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ area: kitchen }]\n');
   const result = await call({ domain: 'light', service: 'turn_on', target: { area_id: 'kitchen' }, data: { brightness: 40 } });
   assert.equal(result.isError, undefined);
-  assert.deepEqual(body(result), { entity_ids: ['light.kitchen', 'switch.coffee_maker'], context_id: 'ctx-1' });
+  assert.deepEqual(body(result), { entity_ids: ['light.kitchen'], context_id: 'ctx-1' });
   assert.deepEqual(sent(), [
     { type: 'get_services' },
     { type: 'extract_from_target', target: { area_id: ['kitchen'] }, expand_group: false },
     { type: 'extract_from_target', target: { area_id: ['kitchen'] }, expand_group: false },
-    { type: 'call_service', domain: 'light', service: 'turn_on', target: { entity_id: ['light.kitchen', 'switch.coffee_maker'] }, service_data: { brightness: 40 } },
+    { type: 'call_service', domain: 'light', service: 'turn_on', target: { entity_id: ['light.kitchen'] }, service_data: { brightness: 40 } },
   ]);
   assert.ok(ha.received.every((r) => r.token === USERS_TOKEN));
 });
@@ -95,7 +96,7 @@ test('an allowed write is audited only with HAMCP_AUDIT_WRITES, by names only', 
     service: 'light.turn_on',
     target: { area_id: ['kitchen'] },
     decision: 'allow',
-    entities: ['light.kitchen', 'switch.coffee_maker'],
+    entities: ['light.kitchen'],
     grants: [0],
     context_id: 'ctx-1',
   });
@@ -133,12 +134,22 @@ test('a service no Grant names is refused before any outbound message', async (t
 });
 
 test('one uncovered entity refuses the whole call, and only the audit line names it', async (t) => {
-  const { call, sent, server } = await serve(t, grantLights);
-  const result = await call({ domain: 'light', service: 'turn_on', target: { entity_id: ['light.kitchen'] }, data: { entity_id: 'lock.front_door' } });
-  assert.equal(textOf(result), denied('light.turn_on', '{"entity_id":["light.kitchen","lock.front_door"]}'));
+  const { call, sent, server } = await serve(t, 'grants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ area: kitchen }]\n');
+  const result = await call({ domain: 'light', service: 'turn_on', target: { entity_id: ['light.kitchen'] }, data: { entity_id: 'light.living_room' } });
+  assert.equal(textOf(result), denied('light.turn_on', '{"entity_id":["light.kitchen","light.living_room"]}'));
   assert.ok(!sent().some((m) => m.type === 'call_service'));
   const [record] = server.audits();
-  assert.deepEqual([record?.decision, record?.entities, record?.uncovered, record?.denies], ['deny', ['light.kitchen', 'lock.front_door'], ['lock.front_door'], []]);
+  assert.deepEqual([record?.decision, record?.entities, record?.uncovered, record?.denies], ['deny', ['light.kitchen', 'light.living_room'], ['light.living_room'], []]);
+});
+
+test("a domain Grant serves an area call: entities outside the service's domains are left out, but one named outright is refused", async (t) => {
+  const { call, sent } = await serve(t, grantLights);
+  assert.deepEqual(body(await call({ domain: 'light', service: 'turn_on', target: { area_id: 'kitchen' } })), { entity_ids: ['light.kitchen'], context_id: 'ctx-1' });
+  assert.deepEqual(sent().at(-1), { type: 'call_service', domain: 'light', service: 'turn_on', target: { entity_id: ['light.kitchen'] }, service_data: {} });
+  const named = await call({ domain: 'light', service: 'turn_on', target: { area_id: 'kitchen', entity_id: ['switch.coffee_maker'] } });
+  assert.equal(textOf(named), 'light.turn_on acts only on light entities; remove switch.coffee_maker from the target.');
+  assert.equal(textOf(await call({ domain: 'light', service: 'turn_on', target: { area_id: 'garage' } })), 'light.turn_on: target matches no entity.');
+  assert.equal(sent().filter((m) => m.type === 'call_service').length, 1);
 });
 
 test('target keys in data are merged into the target, and only the checked entity_id list reaches HA', async (t) => {
