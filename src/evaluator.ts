@@ -166,6 +166,8 @@ export type ConfigKind = NonNullable<Grant['config_write']>;
 export const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'] as const;
 
 export const configPath = (kind: ConfigKind, id: string) => `/api/config/${kind}/config/${encodeURIComponent(id)}`;
+/** A helper's config id is unique only within its domain, so the server names it `<domain>.<id>`. */
+export const splitHelperId = (id: string) => [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)] as const;
 
 const writersOf = (policy: Policy, caller: string, kind: ConfigKind) =>
   policy.grants.flatMap((g, i) => (g.caller === caller && g.config_write === kind ? [i] : []));
@@ -189,7 +191,7 @@ export interface ConfigWrite {
 /** HA's config REST for automations, scripts and scenes; the helper domain's own WebSocket commands for a helper. */
 function requestOf({ kind, action, id, config = {} }: ConfigWrite): Command | RestRequest {
   if (kind !== 'helper') return action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config };
-  const [domain, item] = [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)];
+  const [domain, item] = splitHelperId(id);
   if (action === 'create') return { ...config, type: `${domain}/create` };
   return { ...(action === 'update' && config), type: `${domain}/${action}`, [`${domain}_id`]: item };
 }

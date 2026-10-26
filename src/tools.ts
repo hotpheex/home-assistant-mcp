@@ -12,6 +12,7 @@ import {
   grantsFor,
   HELPER_DOMAINS,
   planServiceCall,
+  splitHelperId,
   type Allowed,
   type ConfigKind,
   type ConfigWrite,
@@ -356,7 +357,6 @@ const itemId = z.string().min(1).describe("The automation's config `id`, or the 
 const configKind = z.enum(['automation', 'script', 'scene', 'helper']);
 const helperId = new RegExp(`^(${HELPER_DOMAINS.join('|')})\\.[a-z0-9_]+$`);
 const HELPER_ID_RULE = 'must be <helper domain>.<id>, such as input_boolean.guest_mode';
-const splitHelperId = (id: string) => [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)] as const;
 
 const getConfig = defineTool({
   title: 'Get config',
