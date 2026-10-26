@@ -134,10 +134,13 @@ test('a request with an Origin outside HAMCP_ALLOWED_ORIGINS gets 403', async (t
 const GRANT_FOR: Record<Operation, string> = {
   plain_read: 'read: plain',
   config_read: 'read: config',
-  service_call: 'services: [light.turn_on]',
+  service_call: 'services: [light.turn_on]\n    targets: [{ domain: light }]',
   config_write: 'config_write: automation',
 };
-const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = { ha_get_states: {} };
+const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
+  ha_get_states: {},
+  ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
+};
 const TIER_TOKEN = { users: USERS_TOKEN, admin: ADMIN_TOKEN };
 
 // The coverage matrix: every tool, from the code's own maps, against holding or lacking its kind.

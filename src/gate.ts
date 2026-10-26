@@ -13,10 +13,11 @@ const MINIMUM_HA = [2026, 10] as const;
 /** The pinned-stable HA the suite runs against; a newer release warns but serves. */
 const TESTED_HA = [2026, 10] as const;
 
-/** Read Operations may send only these read-only commands. */
+/** Read Operations, and a service call's lookups, may send only these read-only commands. */
 const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
   plain_read: new Set(['get_states']),
   config_read: new Set(),
+  service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
 
 export type Command = { type: string } & Record<string, unknown>;
@@ -85,7 +86,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
 
   return {
     async send(allowed, command) {
-      if (!READ_COMMANDS[allowed.operation]?.has(command.type)) {
+      if (command !== allowed.command && !READ_COMMANDS[allowed.operation]?.has(command.type)) {
         throw new Error(`${allowed.operation} may not send ${command.type}`);
       }
       const conn = connections.get(allowed.tier);
