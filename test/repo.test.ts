@@ -36,14 +36,25 @@ const reachesHa = [
   "export const ha = await import('home-assistant-js-websocket');\n",
   "export const r = await fetch('http://ha:8123/api/');\n",
   "export const r = await globalThis.fetch('http://ha:8123/api/');\n",
+  "const g = globalThis;\nexport const r = await g.fetch('http://ha:8123/api/');\n",
+  "export const r = await global.fetch('http://ha:8123/api/');\n",
+  "export const ws = new WebSocket('ws://ha:8123/api/websocket');\n",
+  "export const https = process.getBuiltinModule('node:https');\n",
+  ...['node:net', 'tls', 'node:https', 'node:http2', 'undici', 'node:module'].map((m) => `import * as client from '${m}';\nexport { client };\n`),
+  "import { request } from 'node:http';\nexport { request };\n",
+  "import http from 'node:http';\nexport const get = http.get;\n",
+  "export const tls = await import('node:tls');\n",
 ];
 
 test('lint fails on any import of the HA client or any fetch outside the gate', async () => {
   for (const code of reachesHa) {
     const outside = await ruleIds(code, 'src/tools.ts');
-    assert.ok(outside.length > 0 && outside.every((id) => id?.startsWith('no-restricted-')), code);
+    assert.ok(outside.length > 0 && outside.every((id) => /^(@typescript-eslint\/)?no-restricted-/.test(id ?? '')), code);
     assert.deepEqual(await ruleIds(code, 'src/gate.ts'), [], code);
   }
+  // The listener needs node:http's server side, and a type import carries no code.
+  const server = "import { createServer, type IncomingMessage } from 'node:http';\nimport type { AddressInfo } from 'node:net';\nexport type T = [IncomingMessage, AddressInfo];\nexport { createServer };\n";
+  assert.deepEqual(await ruleIds(server, 'src/tools.ts'), []);
 });
 
 test('lint fails on minting an Allowed outside the evaluator', async () => {
