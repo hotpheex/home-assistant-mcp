@@ -204,8 +204,9 @@ grants:
       const sentences = definition.description?.match(/[.!?](?=\s|$)/g)?.length ?? 0;
       assert.ok(sentences >= 3 && sentences <= 6, `${tool} has ${sentences} sentences`);
       assert.doesNotMatch(definition.description ?? '', /\bha_/, 'a description points to no other tool');
-      // Nothing is refreshed, subscribed or flowed at startup.
-      assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !['supported_features', 'auth/current_user'].includes(type)), []);
+      // Nothing is refreshed, subscribed or flowed at startup: beyond the handshake and admin check, only name lookups.
+      const startup = ['supported_features', 'auth/current_user', 'get_services', 'get_states', 'extract_from_target'];
+      assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !startup.includes(type)), []);
       const before = ha.received.length;
       const allowed = await holding.callTool({ name: tool, arguments: SAMPLE_ARGS[tool] });
       assert.equal(allowed.isError, undefined);

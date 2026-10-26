@@ -2,13 +2,14 @@ import { randomBytes } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { parseArgs } from 'node:util';
-import { hashKey } from './auth.ts';
+import { expiryWarnings, hashKey } from './auth.ts';
 import { check } from './check.ts';
-import { neededTiers } from './evaluator.ts';
+import { NAME_LOOKUP, neededTiers } from './evaluator.ts';
 import { openGate } from './gate.ts';
 import { createHttp } from './http.ts';
 import { logger, type Write } from './log.ts';
 import { parsePolicy, policyWarnings } from './policy.ts';
+import { unknownNames } from './resolver.ts';
 import { readSettings, readTokens } from './settings.ts';
 
 export interface Io {
@@ -61,7 +62,7 @@ export async function run(argv: string[], env: Record<string, string | undefined
     settings = readSettings(env, args.values.policy);
     policy = parsePolicy(readFileSync(settings.HAMCP_POLICY, 'utf8'));
     log('info', 'policy loaded', { policy_sha256: policy.sha256 });
-    for (const warning of policyWarnings(policy, new Date())) log('warn', warning);
+    for (const warning of expiryWarnings(policy, new Date())) log('warn', warning);
     tokens = readTokens(env, neededTiers(policy));
     if (!tokens.has('admin') && (env.HAMCP_HA_ADMIN_TOKEN || env.HAMCP_HA_ADMIN_TOKEN_FILE)) {
       log('warn', 'HAMCP_HA_ADMIN_TOKEN is set but no Grant needs config read or config write, so it is never read or used; remove it');
@@ -70,9 +71,14 @@ export async function run(argv: string[], env: Record<string, string | undefined
     return fail((e as Error).message);
   }
 
+  const expiryCheck = setInterval(() => {
+    for (const warning of expiryWarnings(policy, new Date())) log('warn', warning);
+  }, 86_400_000);
+  expiryCheck.unref();
   let stopping: Promise<void> | undefined;
   const close = () =>
     (stopping ??= (async () => {
+      clearInterval(expiryCheck);
       gate.close();
       await server.close();
       server.http.closeAllConnections();
@@ -82,6 +88,15 @@ export async function run(argv: string[], env: Record<string, string | undefined
     log('error', reason);
     void close().then(() => io.exit(1));
   });
+  // Startup's warnings wait for HA, so a name about to be created never blocks startup.
+  void gate.connected
+    .then(async () => {
+      for (const warning of policyWarnings(policy, new Date())) log('warn', warning);
+      const unknown = tokens.has('users') ? await unknownNames(policy, (command) => gate.send(NAME_LOOKUP, command)) : [];
+      for (const warning of unknown) log('warn', warning);
+      log('info', 'startup warnings logged');
+    })
+    .catch((e: unknown) => log('warn', 'cannot resolve Policy names against Home Assistant', { error: String(e) }));
   const server = createHttp(policy, settings.HAMCP_ALLOWED_ORIGINS, gate, log, audit, {
     auditReads: settings.HAMCP_AUDIT_READS,
     auditWrites: settings.HAMCP_AUDIT_WRITES,

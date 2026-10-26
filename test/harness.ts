@@ -116,7 +116,7 @@ export async function until(check: () => boolean, what: string, ms = 2000) {
   if (!check()) throw new Error(`timed out waiting for ${what}`);
 }
 
-/** Starts the server against `ha` and waits until every needed tier is connected. */
+/** Starts the server against `ha` and waits until every needed tier is connected and startup's warnings are logged. */
 export async function startServer(
   t: TestContext,
   policy: string,
@@ -131,7 +131,7 @@ export async function startServer(
     ...env,
   });
   if (!cli.handle) throw new Error(`server did not start: ${cli.lines.join('\n')}`);
-  await until(() => cli.records().some((r) => r.msg === 'connected to Home Assistant'), 'HA connection');
+  await until(() => cli.records().some((r) => r.msg === 'startup warnings logged'), 'HA connection and startup warnings');
   return { ...cli, url: `http://${cli.handle.address}/mcp` };
 }
 

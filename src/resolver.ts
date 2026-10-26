@@ -46,6 +46,7 @@ export async function extract(send: Send, target: Target, primaryEntitiesOnly = 
  */
 export async function unknownNames(policy: Policy, send: Send): Promise<string[]> {
   const rules = [...policy.grants.map((r, i) => [`grants.${i}`, r] as const), ...policy.denies.map((r, i) => [`denies.${i}`, r] as const)];
+  if (!rules.some(([, r]) => r.services)) return [];
   const targets = rules.flatMap(([, r]) => r.targets ?? []);
   const areas = [...new Set(targets.flatMap((t) => t.area ?? []))];
   const labels = [...new Set(targets.flatMap((t) => t.label ?? []))];

@@ -32,3 +32,15 @@ export function authenticator(policy: Policy) {
     return { ok: true, ...found };
   };
 }
+
+const EXPIRY_WARNING_MS = 14 * 86_400_000;
+
+/** Keys that still work but stop within 14 days, so the deployer rotates them in time. */
+export function expiryWarnings(policy: Policy, now: Date): string[] {
+  return Object.entries(policy.callers).flatMap(([caller, { keys }]) =>
+    keys.flatMap(({ sha256, expires }) => {
+      const left = expires === undefined ? Infinity : Date.parse(expires) - now.getTime();
+      return left > 0 && left <= EXPIRY_WARNING_MS ? [`Caller "${caller}" key ${sha256.slice(0, 8)} expires on ${expires}; add a new key and move the Caller to it`] : [];
+    }),
+  );
+}

@@ -61,7 +61,7 @@ for (const { name, policy, error, env: extra } of refusals) {
   });
 }
 
-test('a valid Policy logs its SHA-256 digest, and warns about Policy that does nothing', async (t) => {
+test('a valid Policy logs its SHA-256 digest; once HA is reachable it warns about Policy that does nothing and names HA lacks', async (t) => {
   const lapsed = newKey();
   const policy = `${callers}  lapsed:
     keys:
@@ -69,31 +69,67 @@ test('a valid Policy logs its SHA-256 digest, and warns about Policy that does n
         expires: 2020-01-01
 grants:
   - caller: reader
-    services: [light.*]
+    services: [light.*, vacuum.start]
+    targets:
+      - area: utility_room
+      - area: attic
+      - label: security
+      - domain: sprinkler
 denies:
   - caller: reader
-    services: [lock.unlock]
+    services: [switch.turn_on]
   - caller: reader
     services: [light.turn_on]
+    targets:
+      - label: garden
 `;
-  const cli = await runCli(t, ['serve'], env(policy));
-  assert.ok(cli.handle);
-  const loaded = cli.records().find((r) => r.msg === 'policy loaded');
-  assert.equal(loaded?.policy_sha256, createHash('sha256').update(policy).digest('hex'));
-  assert.deepEqual(
-    cli
-      .records()
-      .filter((r) => r.level === 'warn')
-      .map((r) => r.msg),
-    ['Caller "lapsed" has no unexpired key and can never authenticate', 'denies.0 overlaps no grant of Caller "reader" and does nothing'],
-  );
+  const ha = await fakeHa(t);
+  const down = ha.outage();
+  const cli = await runCli(t, ['serve'], env(policy, { HAMCP_HA_URL: ha.url }));
+  await down;
+  const digest = createHash('sha256').update(policy).digest('hex');
+  assert.equal(cli.records().find((r) => r.msg === 'policy loaded')?.policy_sha256, digest);
+  const warnings = () => cli.records().filter((r) => r.level === 'warn').map((r) => r.msg);
+  assert.deepEqual(warnings(), []);
+
+  ha.restore();
+  const doesNothing = ['Caller "lapsed" has no unexpired key and can never authenticate', 'denies.0 overlaps no grant of Caller "reader" and does nothing'];
+  await until(() => warnings().length >= 7, 'startup warnings', 5000);
+  assert.deepEqual(warnings(), [
+    ...doesNothing,
+    'grants.0.services.1: Home Assistant has no service "vacuum.start"',
+    'grants.0.targets.1.area: Home Assistant has no area "attic"',
+    'grants.0.targets.3.domain: Home Assistant has no domain "sprinkler"',
+    'denies.0.services.0: Home Assistant has no service "switch.turn_on"',
+    'denies.1.targets.0.label: Home Assistant has no label "garden"',
+  ]);
 
   const check = await runCli(t, ['check', writePolicy(policy)], {});
   assert.equal(await check.exited, 0);
   assert.deepEqual(
     check.records().map(({ level, msg, policy_sha256 }) => ({ level, msg, policy_sha256 })),
-    cli.records().filter((r) => r.msg !== 'listening').map(({ level, msg, policy_sha256 }) => ({ level, msg, policy_sha256 })),
+    [{ level: 'info', msg: 'policy loaded', policy_sha256: digest }, ...doesNothing.map((msg) => ({ level: 'warn', msg, policy_sha256: undefined }))],
   );
+});
+
+test('a key within 14 days of expiry is warned about at startup and daily', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const inDays = (n: number) => new Date(Date.now() + n * 86_400_000).toISOString().slice(0, 10);
+  const soon = newKey();
+  const later = newKey();
+  const policy = `${callers}  rotating:
+    keys:
+      - sha256: ${soon.sha256}
+        expires: ${inDays(10)}
+      - sha256: ${later.sha256}
+        expires: ${inDays(20)}
+`;
+  const cli = await runCli(t, ['serve'], env(policy));
+  const warnings = () => cli.records().filter((r) => r.level === 'warn').map((r) => r.msg);
+  const expiring = `Caller "rotating" key ${soon.sha256.slice(0, 8)} expires on ${inDays(10)}; add a new key and move the Caller to it`;
+  assert.deepEqual(warnings(), [expiring]);
+  t.mock.timers.tick(86_400_000);
+  assert.deepEqual(warnings(), [expiring, expiring]);
 });
 
 test('keygen prints a 256-bit hamcp_ key and its SHA-256 hash', async (t) => {

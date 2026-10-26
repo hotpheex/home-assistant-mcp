@@ -54,6 +54,8 @@ export interface Gate {
   send(allowed: Allowed, command: Command): Promise<unknown>;
   /** Every needed tier is connected and checked. */
   ready(): boolean;
+  /** Resolves the first time the gate is ready. */
+  connected: Promise<void>;
   close(): void;
 }
 
@@ -68,6 +70,8 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
   const connections = new Map<Tier, Connection>();
   const opened = new Set<Connection>();
   let closed = false;
+  const ready = () => [...tokens.keys()].every((tier) => connections.get(tier)?.connected);
+  const { promise: connected, resolve: resolveConnected } = Promise.withResolvers<void>();
 
   async function check(tier: Tier, conn: Connection) {
     const release = releaseOf(conn.haVersion);
@@ -83,6 +87,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
     }
     connections.set(tier, conn);
     log('info', 'connected to Home Assistant', { tier, ha_version: conn.haVersion });
+    if (ready()) resolveConnected();
   }
 
   /** A connection lost during the checks only delays them: the client reconnects, and `ready` runs them again. */
@@ -144,7 +149,8 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
         throw failureOf(e, command === allowed.command);
       }
     },
-    ready: () => [...tokens.keys()].every((tier) => connections.get(tier)?.connected),
+    ready,
+    connected,
     close() {
       closed = true;
       clearInterval(heartbeat);
