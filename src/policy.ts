@@ -64,6 +64,9 @@ export type Grant = Policy['grants'][number];
 
 export class PolicyError extends Error {}
 
+/** The Policy's shape for editors, published with each release; rules JSON Schema cannot carry, such as one kind per Grant, are left to `check`. */
+export const policyJsonSchema = () => z.toJSONSchema(schema, { io: 'input' });
+
 /** Parses a Policy file as YAML 1.2, so `on` and `off` stay strings. Throws PolicyError listing every problem. */
 export function parsePolicy(text: string): Policy {
   let doc: unknown;

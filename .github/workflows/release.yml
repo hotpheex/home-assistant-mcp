@@ -69,7 +69,18 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - run: npm ci --omit=dev --ignore-scripts
+      - name: Generate the Policy JSON Schema
+        run: >-
+          node --input-type=module -e "import { policyJsonSchema } from './src/policy.ts';
+          process.stdout.write(JSON.stringify(policyJsonSchema(), null, 2) + '\n')" > policy.schema.json
       - name: Create the GitHub Release
-        run: gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" policy.schema.json --repo "$GITHUB_REPOSITORY" --verify-tag --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

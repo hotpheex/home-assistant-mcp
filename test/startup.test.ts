@@ -2,6 +2,9 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { parse } from 'yaml';
+import * as z from 'zod';
+import { policyJsonSchema } from '../src/policy.ts';
 import { ADMIN_TOKEN, connect, fakeHa, newKey, runCli, startServer, until, USERS_TOKEN, writePolicy } from './harness.ts';
 
 const key = newKey();
@@ -61,6 +64,29 @@ for (const { name, policy, error, env: extra } of refusals) {
     assert.deepEqual(errorsOf(check.records()), errors);
   });
 }
+
+test('the published JSON Schema accepts a valid Policy and rejects an unknown field', () => {
+  const schema = z.fromJSONSchema(policyJsonSchema());
+  const valid = `${callers}        expires: 2030-01-01
+grants:
+  - caller: reader
+    read: config
+  - caller: reader
+    services: [light.turn_on, switch.*]
+    targets:
+      - area: kitchen
+      - domain: '*'
+  - caller: reader
+    config_write: helper
+denies:
+  - caller: reader
+    services: [switch.turn_off]
+    targets:
+      - label: critical
+`;
+  assert.equal(schema.safeParse(parse(valid)).success, true);
+  assert.equal(schema.safeParse(parse(refusals[0]!.policy)).success, false);
+});
 
 test('a valid Policy logs its SHA-256 digest; once HA is reachable it warns about Policy that does nothing and names HA lacks', async (t) => {
   const lapsed = newKey();
