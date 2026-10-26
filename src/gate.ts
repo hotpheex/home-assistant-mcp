@@ -13,7 +13,7 @@ import type { Log } from './log.ts';
 const MINIMUM_HA = [2026, 10] as const;
 /** The client has no timeout, so a half-open connection would hang every send; a ping unanswered for a whole beat drops it. */
 const HEARTBEAT_MS = 30_000;
-/** The pinned-stable HA the suite runs against; a newer release warns but serves. */
+/** The release of the pinned-stable HA in ci.yml, kept in step by a startup test; a newer release warns but serves. */
 const TESTED_HA = [2026, 10] as const;
 
 /** Read Operations, and a service call's lookups, may send only these read-only commands. */

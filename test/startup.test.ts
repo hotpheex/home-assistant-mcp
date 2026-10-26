@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { ADMIN_TOKEN, connect, fakeHa, newKey, runCli, startServer, until, USERS_TOKEN, writePolicy } from './harness.ts';
 
@@ -172,10 +173,20 @@ test('the server exits when the users-tier token belongs to an HA admin', async 
   assert.ok(!ha.received.some((r) => r.message.type === 'get_states'));
 });
 
-test('the server warns but serves when HA is newer than the tested release', async (t) => {
-  const ha = await fakeHa(t, { version: '2026.11.0' });
-  const server = await startServer(t, grantsPlainRead, ha);
-  await until(() => server.records().some((r) => r.level === 'warn' && r.ha_version === '2026.11.0'), 'newer-HA warning');
+/** The pinned-stable HA the PR workflow's e2e runs against, which Renovate bumps. */
+const pinnedStable = /# renovate: pinned-stable HA\n\s*[\w-]+:\s*(\d+)\.(\d+)\.\d+/.exec(
+  readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'),
+);
+
+test('the server serves the pinned-stable HA without a warning, and warns but serves when HA is newer', async (t) => {
+  assert.ok(pinnedStable, 'ci.yml pins a stable HA');
+  const [, year, month] = pinnedStable.map(Number);
+  const newer = `${year! + 1}.1.0`;
+  for (const version of [`${year}.${month}.0`, newer]) {
+    const ha = await fakeHa(t, { version });
+    const server = await startServer(t, grantsPlainRead, ha);
+    assert.equal(server.records().some((r) => r.level === 'warn' && r.ha_version === version), version === newer, version);
+  }
 });
 
 test('an admin token no Grant needs is warned about and never used', async (t) => {

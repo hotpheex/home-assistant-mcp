@@ -1,0 +1,33 @@
+name: e2e
+
+# The built image, first against the in-process fake HA, then against a real HA container of the given tag.
+on:
+  workflow_call:
+    inputs:
+      ha:
+        description: The ghcr.io/home-assistant/home-assistant tag to run against.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      HAMCP_IMAGE: hamcp:ci
+      HAMCP_HA_IMAGE: ghcr.io/home-assistant/home-assistant:${{ inputs.ha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: docker build --tag "$HAMCP_IMAGE" .
+      - run: docker pull "$HAMCP_HA_IMAGE"
+      - run: node --test test/image.test.ts test/e2e.test.ts
