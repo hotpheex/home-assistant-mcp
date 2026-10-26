@@ -3,6 +3,7 @@ import {
   createConnection,
   createLongLivedTokenAuth,
   ERR_CANNOT_CONNECT,
+  ERR_CONNECTION_LOST,
   ERR_INVALID_AUTH,
   type Connection,
 } from 'home-assistant-js-websocket';
@@ -13,10 +14,12 @@ const MINIMUM_HA = [2026, 10] as const;
 /** The pinned-stable HA the suite runs against; a newer release warns but serves. */
 const TESTED_HA = [2026, 10] as const;
 
-/** Read Operations may send only these read-only commands. */
+/** Read Operations, and a service call's lookups, may send only these read-only commands. */
 const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
   plain_read: new Set([
     'get_states',
+    'get_services',
+    'extract_from_target',
     'config/entity_registry/list',
     'config/entity_registry/get_entries',
     'config/device_registry/list',
@@ -27,6 +30,7 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'logbook/get_events',
   ]),
   config_read: new Set(['automation/config', 'script/config', 'trace/list', 'trace/get', ...HELPER_DOMAINS.map((d) => `${d}/list`)]),
+  service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
 /** Config read may GET a stored config; any other REST request must be the exact write an Allowed names. */
 const CONFIG_PATH = /^\/api\/config\/(automation|script|scene)\/config\/[^/]+$/;
@@ -41,6 +45,16 @@ export interface RestRequest {
 
 /** Nothing left the process. */
 export class HaUnavailable extends Error {}
+/** The connection dropped after a write was sent, so it may or may not have run. */
+export class OutcomeUnknown extends Error {}
+
+/** The client rejects with a bare 3 when nothing was sent, and with a whole envelope coded 3 when the result never came. */
+function failureOf(e: unknown, write: boolean): unknown {
+  if (e === ERR_CONNECTION_LOST) return new HaUnavailable();
+  const lost = typeof e === 'object' && e !== null && 'error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST;
+  if (lost) return write ? new OutcomeUnknown() : new HaUnavailable();
+  return e;
+}
 
 export interface Gate {
   send(allowed: Allowed, command: Command): Promise<unknown>;
@@ -110,17 +124,27 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       }
       const conn = connections.get(allowed.tier);
       if (!conn?.connected) throw new HaUnavailable();
-      return conn.sendMessagePromise({ ...command });
+      try {
+        return await conn.sendMessagePromise({ ...command });
+      } catch (e) {
+        throw failureOf(e, command === allowed.command);
+      }
     },
     async rest(allowed, request) {
       const lookup = allowed.operation === 'config_read' && request.method === 'GET' && CONFIG_PATH.test(request.path);
       if (request !== allowed.command && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
       if (!connections.get(allowed.tier)?.connected) throw new HaUnavailable();
-      const res = await fetch(`${url}${request.path}`, {
-        method: request.method,
-        headers: { authorization: `Bearer ${tokens.get(allowed.tier)}`, 'content-type': 'application/json' },
-        ...(request.body !== undefined && { body: JSON.stringify(request.body) }),
-      });
+      let res: Response;
+      try {
+        res = await fetch(`${url}${request.path}`, {
+          method: request.method,
+          headers: { authorization: `Bearer ${tokens.get(allowed.tier)}`, 'content-type': 'application/json' },
+          ...(request.body !== undefined && { body: JSON.stringify(request.body) }),
+        });
+      } catch {
+        // fetch cannot tell a refused connection from one dropped mid-request, so a write errs towards unknown.
+        throw request === allowed.command ? new OutcomeUnknown() : new HaUnavailable();
+      }
       // A 401 from HA is text/plain.
       return { status: res.status, body: await res.json().catch(() => null) };
     },

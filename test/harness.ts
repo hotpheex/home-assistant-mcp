@@ -87,6 +87,7 @@ export async function fakeHa(t: TestContext, options: Partial<FakeHaOptions> = {
   const ha = await startFakeHa({
     users: { [USERS_TOKEN]: { is_admin: false }, [ADMIN_TOKEN]: { is_admin: true } },
     states: HOUSE,
+    services: { light: { turn_on: { target: { entity: [{ domain: ['light'] }] } } } },
     ...REGISTRIES,
     ...CONFIGS,
     ...options,

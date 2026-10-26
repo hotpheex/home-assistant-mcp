@@ -109,7 +109,7 @@ test('an update merges its top-level keys into the stored config, since HA repla
 
   const invalid = await call('ha_write_config', { kind: 'automation', action: 'create', id: 'bare', config: { alias: 'No triggers' } });
   assert.equal(invalid.result.isError, true);
-  assert.match(JSON.stringify(invalid.result.content), /Home Assistant refused the write: Message malformed: required key not provided/);
+  assert.match(JSON.stringify(invalid.result.content), /Home Assistant refused the request: Message malformed: required key not provided/);
 });
 
 test('deletes, and script and scene writes, go to their own config endpoints', async (t) => {
@@ -156,7 +156,7 @@ test('helper writes go through the helper domain WebSocket commands, which merge
   const deleted = await call('ha_write_config', { kind: 'helper', action: 'delete', id: 'input_boolean.guest_mode' });
   assert.deepEqual(deleted.sent, [{ type: 'input_boolean/delete', input_boolean_id: 'guest_mode' }]);
   const unknown = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'timer.nope', config: { duration: '00:01:00' } });
-  assert.match(JSON.stringify(unknown.result.content), /Home Assistant refused the write: Unable to find timer_id nope/);
+  assert.match(JSON.stringify(unknown.result.content), /Home Assistant refused the request: Unable to find timer_id nope/);
 
   const person = await call('ha_write_config', { kind: 'helper', action: 'delete', id: 'person.bob' });
   assert.match(JSON.stringify(person.result.content), /id: must be <helper domain>\.<id>/);
@@ -212,4 +212,13 @@ test('ha_get_config serves scene and helper config, masked, only to a Caller tha
     server.audits().filter((a) => a.decision === 'deny').map((a) => [a.caller, a.operation, a.kind]),
     [['auditor', 'config_read', 'scene'], ['auditor', 'config_read', 'helper'], ['automator', 'config_read', 'scene']],
   );
+});
+
+test('a config write whose connection drops after it was sent reports outcome unknown', async (t) => {
+  const { ha, as } = await house(t);
+  const { call } = await as('automator');
+  ha.drop.add('POST /api/config/automation/config/hall_light');
+  const dropped = await call('ha_write_config', { kind: 'automation', action: 'create', id: 'hall_light', config: NEW_AUTOMATION });
+  assert.equal(dropped.result.isError, true);
+  assert.match(JSON.stringify(dropped.result.content), /Outcome unknown/);
 });

@@ -4,14 +4,6 @@ export type Log = (level: 'info' | 'warn' | 'error', msg: string, fields?: Recor
 /** An Audit record: names only, never service data, bodies or responses. */
 export type Audit = (record: Record<string, unknown>) => void;
 
-const WRITES = new Set(['service_call', 'config_write']);
-
-/** Refusals are always recorded; an allowed write only when the deployer sets HAMCP_AUDIT_WRITES. */
-export const optedIn = (audit: Audit, writes: boolean): Audit => (record) => {
-  if (record.decision === 'allow' && WRITES.has(String(record.operation)) && !writes) return;
-  audit(record);
-};
-
 export function logger(write: Write): { log: Log; audit: Audit } {
   const time = () => new Date().toISOString();
   return {

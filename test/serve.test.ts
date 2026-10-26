@@ -25,7 +25,7 @@ for (const era of ERAS) {
     const listed = await client.listTools();
     assert.deepEqual(
       listed.tools.map((tool) => tool.name),
-      ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry'],
+      ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services'],
     );
     if (era === 'modern') assert.equal(listed.cacheScope, 'private');
 
@@ -134,11 +134,11 @@ test('a request with an Origin outside HAMCP_ALLOWED_ORIGINS gets 403', async (t
 const GRANT_FOR: Record<Operation, string> = {
   plain_read: 'read: plain',
   config_read: 'read: config',
-  service_call: 'services: [light.turn_on]',
+  service_call: 'services: [light.turn_on]\n    targets: [{ domain: light }]',
   config_write: 'config_write: automation',
 };
 const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
-  ha_get_states: { query: 'kitchen' },
+  ha_get_states: { query: 'kitchen', area: 'utility_room' },
   ha_get_history: { entity_ids: ['light.kitchen'] },
   ha_get_logbook: {},
   ha_get_registry: { registry: 'entity' },
@@ -146,10 +146,14 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_list_traces: { kind: 'automation', id: 'porch_light_1' },
   ha_get_trace: { kind: 'automation', id: 'porch_light_1', run_id: 'run_1', sections: ['trace'] },
   ha_write_config: { kind: 'automation', action: 'update', id: 'porch_light_1', config: { alias: 'Porch light at dusk' } },
+  ha_list_services: {},
+  ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
 };
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
   'get_states',
+  'get_services',
+  'extract_from_target',
   'config/entity_registry/list',
   'config/entity_registry/get_entries',
   'config/device_registry/list',

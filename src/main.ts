@@ -6,7 +6,7 @@ import { hashKey } from './auth.ts';
 import { neededTiers } from './evaluator.ts';
 import { openGate } from './gate.ts';
 import { createHttp } from './http.ts';
-import { logger, optedIn, type Write } from './log.ts';
+import { logger, type Write } from './log.ts';
 import { parsePolicy, policyWarnings } from './policy.ts';
 import { readSettings, readTokens } from './settings.ts';
 
@@ -71,7 +71,10 @@ export async function run(argv: string[], env: Record<string, string | undefined
     log('error', reason);
     void close().then(() => io.exit(1));
   });
-  const server = createHttp(policy, settings.HAMCP_ALLOWED_ORIGINS, gate, log, optedIn(audit, settings.HAMCP_AUDIT_WRITES), { auditReads: settings.HAMCP_AUDIT_READS });
+  const server = createHttp(policy, settings.HAMCP_ALLOWED_ORIGINS, gate, log, audit, {
+    auditReads: settings.HAMCP_AUDIT_READS,
+    auditWrites: settings.HAMCP_AUDIT_WRITES,
+  });
   const { host, port } = settings.HAMCP_LISTEN;
   try {
     await new Promise<void>((resolve, reject) => server.http.once('error', reject).listen(port, host, resolve));
