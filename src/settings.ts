@@ -25,6 +25,7 @@ const schema = z.object({
     .default('')
     .transform((v) => new Set(v.split(',').map((o) => o.trim()).filter(Boolean))),
   HAMCP_AUDIT_READS: z.stringbool().default(false),
+  HAMCP_AUDIT_WRITES: z.stringbool().default(false),
 });
 
 export type Settings = z.output<typeof schema>;

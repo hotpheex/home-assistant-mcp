@@ -145,6 +145,7 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_get_config: { kind: 'automation', entity_id: 'automation.porch_light' },
   ha_list_traces: { kind: 'automation', id: 'porch_light_1' },
   ha_get_trace: { kind: 'automation', id: 'porch_light_1', run_id: 'run_1', sections: ['trace'] },
+  ha_write_config: { kind: 'automation', action: 'update', id: 'porch_light_1', config: { alias: 'Porch light at dusk' } },
 };
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
@@ -161,6 +162,7 @@ const PURE_READS = new Set([
   'script/config',
   'trace/list',
   'trace/get',
+  ...['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'].map((d) => `${d}/list`),
 ]);
 const TIER_TOKEN = { users: USERS_TOKEN, admin: ADMIN_TOKEN };
 
@@ -222,6 +224,7 @@ grants:
         assert.match(JSON.stringify(denied.content), /Do not retry/);
       }
       assert.equal(ha.received.length, quiet);
+      assert.deepEqual(server.audits().filter((a) => a.caller === 'holder'), [], 'allowed calls are audited only on opt-in');
       const audits = server.audits().filter((a) => a.caller === 'idle');
       assert.equal(audits.length, 2);
       for (const a of audits) {

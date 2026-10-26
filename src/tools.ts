@@ -2,11 +2,22 @@ import { ProtocolError, ProtocolErrorCode, Server, type CallToolResult, type Too
 import * as z from 'zod';
 import pkg from '../package.json' with { type: 'json' };
 import type { Authenticated } from './auth.ts';
-import { decideRead, grantsFor, type Allowed, type Operation } from './evaluator.ts';
-import { HaUnavailable, type Command, type Gate } from './gate.ts';
+import {
+  configPath,
+  decideConfigRead,
+  decideConfigWrite,
+  decideRead,
+  grantsFor,
+  HELPER_DOMAINS,
+  type Allowed,
+  type ConfigKind,
+  type ConfigWrite,
+  type Operation,
+} from './evaluator.ts';
+import { HaUnavailable, type Command, type Gate, type RestRequest } from './gate.ts';
 import type { Audit } from './log.ts';
 import type { Policy } from './policy.ts';
-import { maskSecrets, stripBearerTokens } from './redaction.ts';
+import { maskSecrets, redactedPath, stripBearerTokens } from './redaction.ts';
 
 /** The Operation kind a Caller must hold to see and call each tool. */
 export const TOOL_KIND = {
@@ -17,6 +28,7 @@ export const TOOL_KIND = {
   ha_get_config: 'config_read',
   ha_list_traces: 'config_read',
   ha_get_trace: 'config_read',
+  ha_write_config: 'config_write',
 } as const satisfies Record<string, Operation>;
 export type ToolName = keyof typeof TOOL_KIND;
 
@@ -31,6 +43,14 @@ interface Context {
   policy: Policy;
   caller: Authenticated;
   gate: Gate;
+  audit: Audit;
+}
+
+/** A decision that needs the arguments, not just the tool's kind: the allowing Grants, what a denial names, and the names to audit. */
+interface Decided {
+  grants: number[];
+  lacking: string;
+  request: Record<string, unknown>;
 }
 
 interface ToolSpec<Input extends z.ZodType> {
@@ -38,6 +58,7 @@ interface ToolSpec<Input extends z.ZodType> {
   description: string;
   input: Input;
   annotations: { readOnlyHint: boolean; destructiveHint: boolean };
+  decide?(args: z.output<Input>, ctx: Context): Decided;
   run(args: z.output<Input>, ctx: Context): Promise<CallToolResult>;
 }
 
@@ -86,7 +107,7 @@ async function read<T>(ctx: Context, allowed: Allowed | undefined, command: Comm
     const refusal = e as { code?: unknown; message?: unknown } | null;
     // HA's error results arrive as plain {code, message} objects, never as Errors.
     if (!(e instanceof Error) && typeof refusal?.code === 'string' && typeof refusal.message === 'string') {
-      throw new ToolFailure(`Home Assistant refused the read: ${refusal.message}`);
+      throw new ToolFailure(`Home Assistant refused the ${allowed.operation === 'config_write' ? 'write' : 'read'}: ${refusal.message}`);
     }
     throw e;
   }
@@ -97,8 +118,26 @@ const plainRead = <T>(ctx: Context, command: Command) =>
   read<T>(ctx, decideRead(ctx.policy, ctx.caller.caller, 'plain_read').allowed, command);
 
 /** Sends a config read at the admin tier and masks what comes back. */
-const configRead = async <T>(ctx: Context, command: Command) =>
-  maskSecrets(await read(ctx, decideRead(ctx.policy, ctx.caller.caller, 'config_read').allowed, command)) as T;
+const configRead = async <T>(ctx: Context, command: Command, kind: ConfigKind = 'automation') =>
+  maskSecrets(await read(ctx, decideConfigRead(ctx.policy, ctx.caller.caller, kind).allowed, command)) as T;
+
+/** Sends a config REST request; HA's error statuses become failures, except a 404 on GET, which means no such item. */
+async function rest(ctx: Context, allowed: Allowed | undefined, request: RestRequest): Promise<unknown> {
+  if (!allowed) throw new Error('REST sent without an Allowed');
+  let answer;
+  try {
+    answer = await ctx.gate.rest(allowed, request);
+  } catch (e) {
+    if (e instanceof HaUnavailable) throw new ToolFailure('HA unavailable: nothing was sent to Home Assistant. Try again later.');
+    throw e;
+  }
+  if (answer.status === 404 && request.method === 'GET') return undefined;
+  if (answer.status !== 200) {
+    const message = (answer.body as { message?: unknown } | null)?.message ?? `HTTP ${answer.status}`;
+    throw new ToolFailure(`Home Assistant refused the ${request.method === 'GET' ? 'read' : 'write'}: ${String(message)}`);
+  }
+  return answer.body;
+}
 
 interface HaState {
   entity_id: string;
@@ -282,22 +321,45 @@ const getRegistry = defineTool({
 const scriptKind = z.enum(['automation', 'script']);
 const itemId = z.string().min(1).describe("The automation's config `id`, or the script's object id (the part after `script.`).");
 
+const configKind = z.enum(['automation', 'script', 'scene', 'helper']);
+const helperId = new RegExp(`^(${HELPER_DOMAINS.join('|')})\\.[a-z0-9_]+$`);
+const HELPER_ID_RULE = 'must be <helper domain>.<id>, such as input_boolean.guest_mode';
+const splitHelperId = (id: string) => [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)] as const;
+
 const getConfig = defineTool({
-  title: 'Get automation or script config',
+  title: 'Get config',
   description: [
-    'Returns the stored configuration of one automation or script: its triggers, conditions and actions, or its sequence and fields.',
-    'Name it by `kind` (automation or script) and `entity_id`, such as automation.porch_light.',
+    'Returns the stored configuration of one automation, script, scene or helper (input_*, counter, timer or schedule).',
+    'Name an automation or script by `kind` and `entity_id`, such as automation.porch_light; a scene by its config `id`; and a helper by `id` as `<domain>.<id>`, such as input_boolean.guest_mode.',
+    'Scene and helper configs are served only to a Caller that may write that kind.',
     'Values that look like secrets, such as passwords, tokens, API keys, URL credentials and Bearer tokens, come back as **REDACTED**; this is best-effort, so other secrets in the config may still show.',
-    'An automation config carries its `id`, which names its traces.',
     'Example: {"kind": "automation", "entity_id": "automation.porch_light"}.',
   ].join(' '),
-  input: z.strictObject({
-    kind: scriptKind.describe('automation or script.'),
-    entity_id: entityId.describe('The automation or script entity, such as automation.porch_light.'),
-  }),
+  input: z
+    .strictObject({
+      kind: configKind.describe('automation, script, scene or helper.'),
+      entity_id: entityId.optional().describe('For an automation or script: its entity, such as automation.porch_light.'),
+      id: z.string().min(1).optional().describe('For a scene: its config id. For a helper: <domain>.<id>, such as input_boolean.guest_mode.'),
+    })
+    .superRefine(({ kind, entity_id, id }, ctx) => {
+      const byEntity = kind === 'automation' || kind === 'script';
+      if (byEntity && entity_id === undefined) ctx.addIssue({ code: 'custom', path: ['entity_id'], message: `is required for an ${kind}` });
+      if (!byEntity && id === undefined) ctx.addIssue({ code: 'custom', path: ['id'], message: `is required for a ${kind}` });
+      if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
+    }),
   annotations: { readOnlyHint: true, destructiveHint: false },
-  async run({ kind, entity_id }, ctx) {
-    return text(await configRead(ctx, { type: `${kind}/config`, entity_id }));
+  decide: ({ kind }, ctx) => ({ grants: decideConfigRead(ctx.policy, ctx.caller.caller, kind).grants, lacking: `${kind} config`, request: { kind } }),
+  async run({ kind, entity_id, id }, ctx) {
+    if (kind === 'automation' || kind === 'script') return text(await configRead(ctx, { type: `${kind}/config`, entity_id }));
+    if (kind === 'scene') {
+      const config = await rest(ctx, decideConfigRead(ctx.policy, ctx.caller.caller, kind).allowed, { method: 'GET', path: configPath(kind, id!) });
+      if (config === undefined) throw new ToolFailure(`Scene ${id} not found.`);
+      return text({ config: maskSecrets(config) });
+    }
+    const [domain, item] = splitHelperId(id!);
+    const config = (await configRead<{ id: string }[]>(ctx, { type: `${domain}/list` }, kind)).find((h) => h.id === item);
+    if (config === undefined) throw new ToolFailure(`Helper ${id} not found.`);
+    return text({ config });
   },
 });
 
@@ -347,6 +409,56 @@ const getTrace = defineTool({
   },
 });
 
+const writeConfig = defineTool({
+  title: 'Write config',
+  description: [
+    'Creates, updates or deletes one automation, script, scene or helper (input_*, counter, timer or schedule); this is admin-equivalent, because an automation or script can do anything in Home Assistant.',
+    "Name the item by `kind` and `id`: an automation's or scene's config `id`, a script's object id (the part after `script.`), or a helper's `<domain>.<id>`, such as input_boolean.guest_mode.",
+    'An update sends only the top-level keys it changes and keeps the rest; creating an automation, script or scene refuses an id that exists, and a new helper takes its id from its `name`, which the result returns.',
+    'A config that carries **REDACTED** from a config read is refused, so put the real value in its place first.',
+    'Example: {"kind": "automation", "action": "update", "id": "porch_light_1", "config": {"alias": "Porch light at dusk"}}.',
+  ].join(' '),
+  input: z
+    .strictObject({
+      kind: configKind.describe('automation, script, scene or helper.'),
+      action: z.enum(['create', 'update', 'delete']).describe('create, update or delete.'),
+      id: z.string().min(1).describe("An automation's or scene's config id, a script's object id, or a helper's <domain>.<id>."),
+      config: z.record(z.string(), z.unknown()).optional().describe('The config to create, or the top-level keys to change; omitted for delete.'),
+    })
+    .superRefine(({ kind, action, id, config }, ctx) => {
+      if (kind === 'helper' && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
+      if (action !== 'delete' && config === undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: `is required to ${action}` });
+      if (action === 'delete' && config !== undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: 'is not taken by delete' });
+    }),
+  annotations: { readOnlyHint: false, destructiveHint: true },
+  decide: (write: ConfigWrite, ctx) => ({
+    grants: decideConfigWrite(ctx.policy, ctx.caller.caller, write).grants,
+    lacking: `config writes of ${write.kind}`,
+    request: { kind: write.kind, action: write.action, id: write.id },
+  }),
+  async run(write: ConfigWrite, ctx) {
+    const { kind, action, id } = write;
+    const marked = redactedPath(write.config);
+    if (marked !== undefined) {
+      throw new ToolFailure(`config carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
+    }
+    let config = write.config;
+    // HA's config REST replaces the whole entry, so an update merges its top-level keys into the stored config.
+    if (kind !== 'helper' && action !== 'delete') {
+      const lookup = decideConfigRead(ctx.policy, ctx.caller.caller, kind).allowed;
+      const stored = (await rest(ctx, lookup, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
+      if (action === 'create' && stored) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
+      if (action === 'update' && !stored) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
+      config = { ...stored, ...config };
+    }
+    const { allowed, grants } = decideConfigWrite(ctx.policy, ctx.caller.caller, { ...write, config });
+    if (!allowed?.command) throw new Error('config write sent without an Allowed');
+    ctx.audit({ caller: ctx.caller.caller, key_hash_prefix: ctx.caller.keyHashPrefix, operation: 'config_write', tool: 'ha_write_config', kind, action, id, decision: 'allow', grants });
+    const result = 'type' in allowed.command ? await read(ctx, allowed, allowed.command) : await rest(ctx, allowed, allowed.command);
+    return text({ kind, action, id, result });
+  },
+});
+
 const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_states: getStates,
   ha_get_history: getHistory,
@@ -355,6 +467,7 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_config: getConfig,
   ha_list_traces: listTraces,
   ha_get_trace: getTrace,
+  ha_write_config: writeConfig,
 };
 
 /** Built once, so each tool's definition is identical for every Caller. */
@@ -387,7 +500,7 @@ export interface AuditOptions {
 }
 
 export function buildServer(policy: Policy, gate: Gate, audit: Audit, caller: Authenticated, options: AuditOptions): Server {
-  const ctx: Context = { policy, caller, gate };
+  const ctx: Context = { policy, caller, gate, audit };
   const holds = (name: ToolName) => grantsFor(policy, caller.caller, TOOL_KIND[name]).length > 0;
   const visible = (Object.keys(TOOLS) as ToolName[]).filter(holds);
   const server = new Server(
@@ -413,8 +526,13 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, caller: Au
     if (!args.success) {
       return failure(`Input validation error: ${args.error.issues.map((i) => `${i.path.join('.') || '(arguments)'}: ${i.message}`).join('; ')}`);
     }
+    const decided = tool.decide?.(args.data, ctx) ?? { grants: grantsFor(policy, caller.caller, operation), lacking: OPERATION_NAME[operation], request: {} };
+    if (decided.grants.length === 0) {
+      audit({ ...who, ...decided.request, decision: 'deny', grants: [] });
+      return failure(`Denied: this Caller holds no Grant for ${decided.lacking}. Do not retry this call.`);
+    }
     if (options.auditReads && READS.has(operation)) {
-      audit({ ...who, decision: 'allow', grants: grantsFor(policy, caller.caller, operation), request: args.data });
+      audit({ ...who, decision: 'allow', grants: decided.grants, request: args.data });
     }
     try {
       const result = await tool.run(args.data, ctx);

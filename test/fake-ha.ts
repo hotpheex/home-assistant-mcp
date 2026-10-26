@@ -1,4 +1,4 @@
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer } from 'ws';
 
@@ -45,10 +45,16 @@ export interface FakeHaOptions {
   floors?: FakeEntry[];
   history?: FakeChange[];
   logbook?: FakeLogEntry[];
-  /** Automation and script configs, keyed by entity_id. */
+  /** Automation, script and scene configs, keyed by entity_id; automation and scene entries carry their config `id`. */
   configs?: Record<string, Record<string, unknown>>;
   traces?: FakeTrace[];
+  /** Stored (UI) helpers, keyed by helper domain. */
+  helpers?: Record<string, Record<string, unknown>[]>;
 }
+
+const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
+/** HA validates the whole body of a config POST, so a partial one is refused. */
+const REQUIRED_KEYS: Record<string, string[]> = { automation: ['triggers', 'actions'], script: ['sequence'], scene: ['name', 'entities'] };
 
 /** A stored run: summary fields plus the sections only trace/get returns. */
 export interface FakeTrace extends Record<string, unknown> {
@@ -84,7 +90,7 @@ const inWindow = (when: string, msg: Message) =>
   Date.parse(when) >= Date.parse(msg.start_time as string) &&
   Date.parse(when) <= (msg.end_time === undefined ? Date.now() : Date.parse(msg.end_time as string));
 
-/** Hand-written HA 2026.10: speaks the WebSocket protocol to the real client and records every command. */
+/** Hand-written HA 2026.10: speaks the WebSocket protocol to the real client, answers config REST, and records every command and request. */
 export async function startFakeHa(options: FakeHaOptions) {
   const version = options.version ?? '2026.10.4';
   const received: Received[] = [];
@@ -98,8 +104,10 @@ export async function startFakeHa(options: FakeHaOptions) {
   /** HA's require_admin. */
   const adminOnly = (handler: Handler): Handler => (token, msg) =>
     options.users[token]?.is_admin ? handler(token, msg) : haError('unauthorized', 'Unauthorized');
+  const configs = structuredClone(options.configs ?? {});
+  const helpers = structuredClone(options.helpers ?? {});
   const configOf = adminOnly((_, msg) => {
-    const config = options.configs?.[msg.entity_id as string];
+    const config = configs[msg.entity_id as string];
     return config && (msg.entity_id as string).startsWith(`${msg.type.split('/')[0]}.`) ? { config } : haError('not_found', 'Entity not found');
   });
   const handlers: Record<string, Handler> = {
@@ -156,8 +164,57 @@ export async function startFakeHa(options: FakeHaOptions) {
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
   };
+  for (const domain of HELPER_DOMAINS) {
+    const items = () => (helpers[domain] ??= []);
+    const key = `${domain}_id`;
+    const find = (msg: Message) => items().find((i) => i.id === msg[key]) ?? haError('not_found', `Unable to find ${key} ${String(msg[key])}`);
+    const fieldsOf = (msg: Message) => Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', key].includes(k)));
+    handlers[`${domain}/list`] = () => items();
+    handlers[`${domain}/create`] = adminOnly((_, msg) => {
+      const item = { id: String(msg.name).toLowerCase().replace(/[^a-z0-9]+/g, '_'), ...fieldsOf(msg) };
+      items().push(item);
+      return item;
+    });
+    handlers[`${domain}/update`] = adminOnly((_, msg) => Object.assign(find(msg), fieldsOf(msg)));
+    handlers[`${domain}/delete`] = adminOnly((_, msg) => {
+      items().splice(items().indexOf(find(msg)), 1);
+      return null;
+    });
+  }
 
-  const http = createServer((_req, res) => res.writeHead(404).end());
+  /** HA's config REST API: automation and scene entries by config id, scripts by object key. */
+  const entityOf = (kind: string, id: string) =>
+    kind === 'script'
+      ? (`script.${id}` in configs ? `script.${id}` : undefined)
+      : Object.keys(configs).find((e) => e.startsWith(`${kind}.`) && configs[e]!.id === id);
+  function rest(req: IncomingMessage, res: ServerResponse, raw: string) {
+    const json = (status: number, value: unknown) => void res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
+    const match = /^\/api\/config\/(automation|script|scene)\/config\/([^/]+)$/.exec(req.url ?? '');
+    if (!match) return json(404, { message: 'Not found' });
+    const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
+    if (!options.users[token]?.is_admin) return void res.writeHead(401, { 'content-type': 'text/plain' }).end('401: Unauthorized');
+    const body = raw === '' ? undefined : (JSON.parse(raw) as Record<string, unknown>);
+    received.push({ token, message: { type: `${req.method} ${req.url}`, ...(body !== undefined && { body }) } });
+    const [, kind, key] = match as unknown as [string, string, string];
+    const id = decodeURIComponent(key);
+    const entity = entityOf(kind, id);
+    if (req.method === 'GET') return entity ? json(200, configs[entity]) : json(404, { message: 'Resource not found' });
+    if (req.method === 'DELETE') {
+      if (!entity) return json(400, { message: 'Resource not found' });
+      delete configs[entity];
+      return json(200, { result: 'ok' });
+    }
+    const missing = REQUIRED_KEYS[kind]!.find((k) => !(k in (body ?? {})));
+    if (missing) return json(400, { message: `Message malformed: required key not provided @ data['${missing}']` });
+    configs[entity ?? `${kind}.${id}`] = kind === 'script' ? body! : { id, ...body };
+    json(200, { result: 'ok' });
+  }
+
+  const http = createServer((req, res) => {
+    let raw = '';
+    req.on('data', (chunk: Buffer) => (raw += chunk.toString()));
+    req.on('end', () => rest(req, res, raw));
+  });
   const wss = new WebSocketServer({ server: http, path: '/api/websocket' });
   wss.on('connection', (ws) => {
     let token: string | undefined;
@@ -201,6 +258,8 @@ export async function startFakeHa(options: FakeHaOptions) {
   return {
     url: `http://127.0.0.1:${port}`,
     received,
+    configs,
+    helpers,
     async close() {
       for (const ws of wss.clients) ws.terminate();
       await new Promise((resolve) => wss.close(resolve));
