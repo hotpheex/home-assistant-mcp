@@ -17,12 +17,8 @@
       automerge: true,
     },
     {
-      description: 'Runtime deps and Node majors need a human.',
-      matchDepTypes: ['dependencies'],
-      automerge: false,
-    },
-    {
-      matchPackageNames: ['node', '@types/node', 'gcr.io/distroless/**'],
+      description: '@types/node follows the Node major, which needs a human.',
+      matchPackageNames: ['@types/node'],
       matchUpdateTypes: ['major'],
       automerge: false,
     },

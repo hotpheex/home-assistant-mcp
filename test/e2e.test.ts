@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { after, before, suite, test, type TestContext } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { createConnection, createLongLivedTokenAuth, type Connection } from 'home-assistant-js-websocket';
-import { body, connect, newKey, runImage, until, writePolicy } from './harness.ts';
+import { body, connect, newKey, policyOf, runImage, until, writePolicy } from './harness.ts';
 
 /** The built image and the HA container image it runs against; CI sets both, and without them there is nothing to run. */
 const image = process.env.HAMCP_IMAGE;
@@ -92,15 +92,7 @@ const longLived = (conn: Connection, client_name: string) =>
   conn.sendMessagePromise<string>({ type: 'auth/long_lived_access_token', client_name, lifespan: 30 });
 
 const reader = newKey();
-const readerPolicy = writePolicy(`version: 1
-callers:
-  reader:
-    keys:
-      - sha256: ${reader.sha256}
-grants:
-  - caller: reader
-    read: plain
-`);
+const readerPolicy = writePolicy(policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n'));
 
 suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP_IMAGE and HAMCP_HA_IMAGE are not set' }, () => {
   const cleanups: (() => void)[] = [];
@@ -164,15 +156,10 @@ suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP
       await owner.sendMessagePromise({ type: 'config/device_registry/update', device_id: device('E2E Plug'), area_id: areaId });
       await owner.sendMessagePromise({ type: 'config/device_registry/update', device_id: device('E2E Hub'), labels: [labelId] });
 
-      const policy = writePolicy(`version: 1
-callers:
-  operator:
-    keys:
-      - sha256: ${operator.sha256}
-  expander:
-    keys:
-      - sha256: ${expander.sha256}
-grants:
+      const policy = writePolicy(
+        policyOf(
+          { operator, expander },
+          `grants:
   - caller: operator
     read: config
   - caller: operator
@@ -197,7 +184,9 @@ denies:
     services: [button.press]
     targets:
       - area: ${areaId}
-`);
+`,
+        ),
+      );
       server = runImage(image!, policy, { HAMCP_HA_URL: HA, HAMCP_HA_USERS_TOKEN: usersToken, HAMCP_HA_ADMIN_TOKEN: adminToken }, cleanup);
       await server.logged('startup warnings logged');
     },

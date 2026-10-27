@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
@@ -7,11 +8,13 @@ import { createInterface } from 'node:readline';
 import type { TestContext } from 'node:test';
 import { Client, StreamableHTTPClientTransport } from '@modelcontextprotocol/client';
 import { run } from '../src/main.ts';
-import { startFakeHa, type FakeHaOptions, type FakeState } from './fake-ha.ts';
+import { startFakeHa, type FakeHaOptions, type FakeState, type Received } from './fake-ha.ts';
 
 export const USERS_TOKEN = 'users-token';
 export const ADMIN_TOKEN = 'admin-token';
 export const ERAS = ['legacy', 'modern'] as const;
+/** All startup and `check` may send: the client's handshake, the admin check and name lookups; nothing refreshed or subscribed. */
+export const STARTUP_COMMANDS = ['supported_features', 'auth/current_user', 'get_services', 'get_states', 'extract_from_target'];
 
 const state = (entity_id: string, friendly_name: string, value: string): FakeState => ({
   entity_id,
@@ -35,7 +38,7 @@ export const HOUSE: FakeState[] = [
     attributes: { friendly_name: 'Den Speaker', entity_picture: '/api/media_player_proxy/media_player.den?token=MEDIASECRET&cache=42' },
   },
 ];
-/** The house's registries: the coffee maker is in an area through its device, and the lamp has an alias. */
+/** The house's registries: the coffee maker is in an area through its device, the lamp has an alias, and the lock a label. */
 export const REGISTRIES: Partial<FakeHaOptions> = {
   entities: [
     { entity_id: 'switch.coffee_maker', device_id: 'dev_coffee' },
@@ -88,6 +91,10 @@ export function newKey() {
   const key = `hamcp_${randomBytes(32).toString('base64url')}`;
   return { key, sha256: createHash('sha256').update(key).digest('hex') };
 }
+
+/** A Policy declaring a Caller per key, followed by `rules`, its grants and denies in YAML. */
+export const policyOf = (keys: Record<string, { sha256: string }>, rules: string) =>
+  `version: 1\ncallers:\n${Object.entries(keys).map(([name, { sha256 }]) => `  ${name}:\n    keys: [{ sha256: ${sha256} }]\n`).join('')}${rules}`;
 
 export async function fakeHa(t: TestContext, options: Partial<FakeHaOptions> = {}) {
   const ha = await startFakeHa({
@@ -157,11 +164,22 @@ export async function connect(t: TestContext, url: string, key: string, era: (ty
   return client;
 }
 
-/** Parses the JSON text of a tool result. */
 export function body(result: unknown): unknown {
   const { content } = result as { content: { type: string; text: string }[] };
   return JSON.parse(content[0]?.text ?? 'null');
 }
+
+export const withoutId = ({ message }: Received) => Object.fromEntries(Object.entries(message).filter(([k]) => k !== 'id'));
+
+/** Calls a tool, returning the result and what reached HA, after asserting all of it went at the admin tier and no secret came back. */
+export const adminCaller = (ha: { received: Received[] }, client: Client) => async (name: string, args: Record<string, unknown>) => {
+  const before = ha.received.length;
+  const result = await client.callTool({ name, arguments: args });
+  const sent = ha.received.slice(before);
+  assert.ok(sent.every((r) => r.token === ADMIN_TOKEN));
+  assert.doesNotMatch(JSON.stringify(result), /SECRET/);
+  return { result, sent: sent.map(withoutId) };
+};
 
 /**
  * Runs the built image as a deployer would, read-only and on the host network so it reaches HA on loopback.

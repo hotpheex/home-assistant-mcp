@@ -27,7 +27,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      - run: npm ci --ignore-scripts
+      - run: npm ci
       - run: docker build --tag "$HAMCP_IMAGE" .
       - run: docker pull "$HAMCP_HA_IMAGE"
       - run: node --test test/image.test.ts test/e2e.test.ts

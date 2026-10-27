@@ -7,7 +7,7 @@ import { auditFor, type Audit, type Log } from './log.ts';
 import type { Policy } from './policy.ts';
 import { buildServer, type AuditOptions } from './tools.ts';
 
-const deny = (res: ServerResponse, status: number, headers: Record<string, string> = {}) => void res.writeHead(status, headers).end();
+const status = (res: ServerResponse, status: number, headers: Record<string, string> = {}) => void res.writeHead(status, headers).end();
 
 /** Streamable HTTP at /mcp for both protocol eras, statelessly. Each request is checked in order: Origin, key, then the SDK. */
 export function createHttp(policy: Policy, allowedOrigins: ReadonlySet<string>, gate: Gate, log: Log, audit: Audit, options: AuditOptions) {
@@ -19,15 +19,19 @@ export function createHttp(policy: Policy, allowedOrigins: ReadonlySet<string>, 
   const http = createServer((req: IncomingMessage & { auth?: AuthInfo }, res) => {
     const path = new URL(req.url ?? '/', 'http://x').pathname;
     // Probes are unauthenticated, so they answer with a status and nothing else.
-    if (path === '/healthz') return deny(res, 200);
-    if (path === '/readyz') return deny(res, gate.ready() ? 200 : 503);
-    if (path !== '/mcp') return deny(res, 404);
+    if (path === '/healthz') return status(res, 200);
+    if (path === '/readyz') return status(res, gate.ready() ? 200 : 503);
+    if (path !== '/mcp') return status(res, 404);
     const origin = req.headers.origin;
-    if (origin !== undefined && !allowedOrigins.has(origin)) return deny(res, 403);
+    const remote = req.socket.remoteAddress;
+    if (origin !== undefined && !allowedOrigins.has(origin)) {
+      auditFor(audit, {}, 'authenticate')({ decision: 'deny', reason: 'origin not allowed', origin, remote });
+      return status(res, 403);
+    }
     const result = authenticate(req.headers.authorization, new Date());
     if (!result.ok) {
-      auditFor(audit, result, 'authenticate')({ decision: 'deny', reason: result.reason, remote: req.socket.remoteAddress });
-      return deny(res, 401, { 'www-authenticate': 'Bearer' });
+      auditFor(audit, result, 'authenticate')({ decision: 'deny', reason: result.reason, remote });
+      return status(res, 401, { 'www-authenticate': 'Bearer' });
     }
     req.auth = { token: '', clientId: result.caller, scopes: [], extra: { caller: result } };
     void handle(req, res);

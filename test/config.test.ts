@@ -2,47 +2,17 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import { REDACTED as M } from '../src/redaction.ts';
-import { ADMIN_TOKEN, body, connect, fakeHa, newKey, startServer } from './harness.ts';
+import { ADMIN_TOKEN, adminCaller, body, connect, fakeHa, newKey, policyOf, startServer } from './harness.ts';
 
 const auditor = newKey();
-const writer = newKey();
-const policy = `
-version: 1
-callers:
-  auditor:
-    keys: [{ sha256: ${auditor.sha256} }]
-  writer:
-    keys: [{ sha256: ${writer.sha256} }]
-grants:
-  - caller: auditor
-    read: config
-  - caller: writer
-    config_write: script
-`;
+const policy = policyOf({ auditor }, 'grants:\n  - caller: auditor\n    read: config\n');
 
 async function auditorOn(t: TestContext) {
   const ha = await fakeHa(t);
   const server = await startServer(t, policy, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
   const client = await connect(t, server.url, auditor.key, 'modern');
-  const call = async (name: string, args: Record<string, unknown>) => {
-    const before = ha.received.length;
-    const result = await client.callTool({ name, arguments: args });
-    const sent = ha.received.slice(before);
-    assert.ok(sent.every((r) => r.token === ADMIN_TOKEN));
-    assert.doesNotMatch(JSON.stringify(result), /SECRET/);
-    return { result, sent: sent.map((r) => Object.fromEntries(Object.entries(r.message).filter(([k]) => k !== 'id'))) };
-  };
-  return { ha, server, client, call };
+  return { ha, server, client, call: adminCaller(ha, client) };
 }
-
-test('config read or a config write lists the config-read tools, and nothing else', async (t) => {
-  const { server, client } = await auditorOn(t);
-  const configTools = ['ha_get_config', 'ha_list_traces', 'ha_get_trace'];
-  const names = async (c: typeof client) => (await c.listTools()).tools.map((tool) => tool.name);
-  assert.deepEqual(await names(client), configTools);
-  const writing = await connect(t, server.url, writer.key, 'modern');
-  assert.deepEqual((await names(writing)).filter((name) => configTools.includes(name)), configTools);
-});
 
 test('ha_get_config reads an automation or script config with its secrets masked', async (t) => {
   const { call } = await auditorOn(t);

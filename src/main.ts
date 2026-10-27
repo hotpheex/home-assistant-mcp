@@ -7,13 +7,13 @@ import { check } from './check.ts';
 import { NAME_LOOKUP, neededTiers } from './evaluator.ts';
 import { openGate } from './gate.ts';
 import { createHttp } from './http.ts';
-import { logger, type Write } from './log.ts';
+import { logger } from './log.ts';
 import { parsePolicy, policyWarnings } from './policy.ts';
 import { unknownNames } from './resolver.ts';
 import { readSettings, readTokens } from './settings.ts';
 
 export interface Io {
-  write: Write;
+  write: (line: string) => void;
   exit: (code: number) => void;
 }
 

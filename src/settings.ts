@@ -30,7 +30,6 @@ const schema = z.object({
 
 export type Settings = z.output<typeof schema>;
 
-/** Settings come from the environment only, read once at startup. */
 export function readSettings(env: Record<string, string | undefined>, policyFlag?: string): Settings {
   const result = schema.safeParse({ ...env, HAMCP_POLICY: policyFlag ?? env.HAMCP_POLICY ?? '' });
   if (!result.success) {

@@ -75,7 +75,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-      - run: npm ci --omit=dev --ignore-scripts
+      - run: npm ci --omit=dev
       - name: Generate the Policy JSON Schema
         run: >-
           node --input-type=module -e "import { policyJsonSchema } from './src/policy.ts';

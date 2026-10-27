@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { NAME_LOOKUP } from './evaluator.ts';
+import { expiryWarnings } from './auth.ts';
 import { HaUnavailable, openGate } from './gate.ts';
 import type { Log } from './log.ts';
 import { parsePolicy, policyWarnings } from './policy.ts';
@@ -17,7 +18,7 @@ const CONNECT_WAIT_MS = 10_000;
 export async function check(path: string, env: Record<string, string | undefined>, log: Log): Promise<boolean> {
   const policy = parsePolicy(readFileSync(path, 'utf8'));
   log('info', 'policy loaded', { policy_sha256: policy.sha256 });
-  for (const warning of policyWarnings(policy, new Date())) log('warn', warning);
+  for (const warning of [...policyWarnings(policy, new Date()), ...expiryWarnings(policy, new Date())]) log('warn', warning);
   if (env.HAMCP_HA_URL === undefined) return true;
 
   const { HAMCP_HA_URL } = readSettings(env, path);

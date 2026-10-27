@@ -15,14 +15,12 @@ import {
   planServiceCall,
   splitHelperId,
   type Allowed,
-  type ConfigKind,
   type ConfigWrite,
-  type ConfigWriteDecision,
   type Operation,
 } from './evaluator.ts';
 import { HaUnavailable, OutcomeUnknown, type Command, type Gate, type RestRequest } from './gate.ts';
 import { auditFor, type Audit } from './log.ts';
-import type { Policy } from './policy.ts';
+import { CONFIG_KINDS, type Policy } from './policy.ts';
 import { maskSecrets, redactedPath, stripBearerTokens } from './redaction.ts';
 import { domainsOf, expandAll, extract, mergeTarget } from './resolver.ts';
 
@@ -48,22 +46,21 @@ const OPERATION_NAME: Record<Operation, string> = {
   config_write: 'config writes',
 };
 
-interface Context {
-  policy: Policy;
-  auth: Authenticated;
-  gate: Gate;
-  /** Writes a record naming this request's Caller, key, Operation and tool. */
-  audit: Audit;
-  options: AuditOptions;
-}
-
-/** A decision that needs the arguments, not just the tool's kind: the allowing Grants, what a denial names, and the names to audit. */
+/** The allowing Grants, what a denial names, and the names to audit. */
 interface Decided {
   grants: number[];
   lacking: string;
   request: Record<string, unknown>;
-  /** The write decided here, so `run` sends what was checked rather than deciding again. */
-  allowed?: ConfigWriteDecision['allowed'];
+  /** What `run` sends, so it sends what was checked rather than deciding again; a service call decides per target in `run`. */
+  allowed?: Allowed;
+}
+
+interface Context extends Decided {
+  policy: Policy;
+  auth: Authenticated;
+  gate: Gate;
+  audit: Audit;
+  options: AuditOptions;
 }
 
 interface ToolSpec<Input extends z.ZodType> {
@@ -71,10 +68,12 @@ interface ToolSpec<Input extends z.ZodType> {
   description: string;
   input: Input;
   annotations: { readOnlyHint: boolean; destructiveHint: boolean };
-  decide?(args: z.output<Input>, ctx: Context): Decided;
-  run(args: z.output<Input>, ctx: Context, decided?: Decided): Promise<CallToolResult>;
+  /** For a decision that needs the arguments, not just the tool's kind. */
+  decide?(args: z.output<Input>, policy: Policy, caller: string): Decided;
+  run(args: z.output<Input>, ctx: Context): Promise<CallToolResult>;
 }
 
+const PAGED = 'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.';
 const page = {
   limit: z.number().int().min(1).max(500).default(50).describe('Page size, at most 500.'),
   offset: z.number().int().min(0).default(0).describe('Entries to skip.'),
@@ -87,12 +86,12 @@ const pageOf = (key: string, items: unknown[], { limit, offset }: Page) => ({
   [key]: items.slice(offset, offset + limit),
 });
 
+const slug = z.string().regex(/^[a-z0-9_]+$/);
 const entityId = z.string().regex(/^[a-z0-9_]+\.[a-z0-9_]+$/, 'must be an entity_id such as light.kitchen');
 const window = {
   start: z.iso.datetime({ offset: true }).optional().describe('ISO 8601 start time.'),
   end: z.iso.datetime({ offset: true }).optional().describe('ISO 8601 end time; defaults to now.'),
 };
-/** Fills a window left open: `end` defaults to now and `start` to `hours` before `end`. */
 function windowOf(args: { start?: string; end?: string }, hours: number) {
   const end = args.end ?? new Date().toISOString();
   return { start: args.start ?? new Date(Date.parse(end) - hours * 3_600_000).toISOString(), end };
@@ -121,19 +120,18 @@ function outage(e: unknown): unknown {
   return e;
 }
 
-/** Sends a read the evaluator allowed. */
-async function read<T>(ctx: Context, allowed: Allowed | undefined, command: Command): Promise<T> {
-  if (!allowed) throw new Error('read sent without an Allowed');
+/** Sends over WebSocket; HA's refusals and outages become failures the Caller can act on. */
+async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Command): Promise<T> {
+  if (!allowed) throw new Error('sent without an Allowed');
   try {
     return stripBearerTokens(await ctx.gate.send(allowed, command)) as T;
   } catch (e) {
-    if (e instanceof HaUnavailable || e instanceof OutcomeUnknown) throw outage(e);
     const refusal = e as { code?: unknown; message?: unknown } | null;
     // HA's error results arrive as plain {code, message} objects, never as Errors.
     if (!(e instanceof Error) && typeof refusal?.code === 'string' && typeof refusal.message === 'string') {
       throw new ToolFailure(`Home Assistant refused the request: ${refusal.message}`);
     }
-    throw e;
+    throw outage(e);
   }
 }
 
@@ -146,13 +144,8 @@ function writeResult(value: unknown): CallToolResult {
   return { content: [{ type: 'text', text: kept + marker }] };
 }
 
-/** Sends a plain read, which the evaluator decides by the Caller alone. */
-const plainRead = <T>(ctx: Context, command: Command) =>
-  read<T>(ctx, decideRead(ctx.policy, ctx.auth.caller, 'plain_read').allowed, command);
-
-/** Sends a config read at the admin tier and masks what comes back. */
-const configRead = async <T>(ctx: Context, command: Command, kind: ConfigKind = 'automation') =>
-  maskSecrets(await read(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, command)) as T;
+const plainRead = <T>(ctx: Context, command: Command) => send<T>(ctx, ctx.allowed, command);
+const configRead = async <T>(ctx: Context, command: Command) => maskSecrets(await send(ctx, ctx.allowed, command)) as T;
 
 /** Sends a config REST request; HA's error statuses become failures, except a 404 on GET, which means no such item. */
 async function rest(ctx: Context, allowed: Allowed | undefined, request: RestRequest): Promise<unknown> {
@@ -216,12 +209,12 @@ const getStates = defineTool({
     'Filter by `domain` (such as `light`), by exact `state` (such as `on`), and by `query`, a case-insensitive substring of the entity_id, friendly name, aliases, or area and label names.',
     'Filter by `area` or `label` id to get what a Home Assistant service call targeting that area or label acts on.',
     'Attributes are left out unless `full` is true; bearer tokens in camera, image and media_player attributes are always removed.',
-    'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    PAGED,
     'Example: {"domain": "light", "query": "kitchen", "state": "on"} lists the kitchen lights that are on.',
   ].join(' '),
   input: z.strictObject({
     query: z.string().min(1).optional().describe('Case-insensitive substring of the entity_id, friendly name, aliases, or area and label names.'),
-    domain: z.string().regex(/^[a-z0-9_]+$/).optional().describe('Entity domain, such as light or sensor.'),
+    domain: slug.optional().describe('Entity domain, such as light or sensor.'),
     state: z.string().min(1).optional().describe('Exact state, such as on or unavailable.'),
     area: z.string().min(1).optional().describe('Area id, such as living_room.'),
     label: z.string().min(1).optional().describe('Label id.'),
@@ -276,7 +269,8 @@ const getHistory = defineTool({
     'Lists the state changes of the given entities over a time window, one row per change with its entity_id, state and last_changed time, sorted by entity_id and then time.',
     'The window defaults to the last 24 hours; `start` and `end` take ISO 8601 times.',
     'With `summary` it returns one entry per entity instead: the number of changes, the first and last state, and either the minimum, maximum and mean of numeric states or a count of each state.',
-    'Attributes are not returned. Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    'Attributes are not returned.',
+    PAGED,
     'Example: {"entity_ids": ["sensor.kitchen_temperature"], "summary": true} summarises the kitchen temperature over the last day.',
   ].join(' '),
   input: z.strictObject({
@@ -308,7 +302,7 @@ const getLogbook = defineTool({
   description: [
     'Lists Home Assistant logbook entries over a time window, oldest first: what changed or happened, when, and the context that caused it.',
     'The window defaults to the last hour; `start` and `end` take ISO 8601 times, and `entity_id` keeps only one entity\'s entries.',
-    'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    PAGED,
     'Example: {"entity_id": "lock.front_door", "start": "2026-10-26T06:00:00Z"} shows the front door lock since 6 am UTC.',
   ].join(' '),
   input: z.strictObject({
@@ -329,7 +323,6 @@ const getLogbook = defineTool({
   },
 });
 
-/** Whether any text field of a registry entry, or any text in a list field, contains `query`. */
 const mentions = (entry: Record<string, unknown>, query: string) =>
   Object.values(entry).some((v) => [v].flat().some((x) => typeof x === 'string' && x.toLowerCase().includes(query)));
 
@@ -339,7 +332,7 @@ const getRegistry = defineTool({
     'Lists the entries of one Home Assistant registry, in registry order: `entity`, `device`, `area`, `label` or `floor`.',
     'Entries are returned as Home Assistant stores them, with ids, names and the area, floor, device and label ids that link them.',
     '`query` keeps entries whose text fields contain it, case-insensitively, such as an id, a name or an alias.',
-    'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    PAGED,
     'Example: {"registry": "area", "query": "kitchen"} finds the kitchen area and its floor_id.',
   ].join(' '),
   input: z.strictObject({
@@ -358,7 +351,7 @@ const getRegistry = defineTool({
 const scriptKind = z.enum(['automation', 'script']);
 const itemId = z.string().min(1).describe("The automation's config `id`, or the script's object id (the part after `script.`).");
 
-const configKind = z.enum(['automation', 'script', 'scene', 'helper']);
+const configKind = z.enum(CONFIG_KINDS);
 const helperId = new RegExp(`^(${HELPER_DOMAINS.join('|')})\\.[a-z0-9_]+$`);
 const HELPER_ID_RULE = 'must be <helper domain>.<id>, such as input_boolean.guest_mode';
 
@@ -384,16 +377,16 @@ const getConfig = defineTool({
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
     }),
   annotations: { readOnlyHint: true, destructiveHint: false },
-  decide: ({ kind }, ctx) => ({ grants: decideConfigRead(ctx.policy, ctx.auth.caller, kind).grants, lacking: `${kind} config`, request: { kind } }),
+  decide: ({ kind }, policy, caller) => ({ ...decideConfigRead(policy, caller, kind), lacking: `${kind} config`, request: { kind } }),
   async run({ kind, entity_id, id }, ctx) {
     if (kind === 'automation' || kind === 'script') return text(await configRead(ctx, { type: `${kind}/config`, entity_id }));
     if (kind === 'scene') {
-      const config = await rest(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, { method: 'GET', path: configPath(kind, id!) });
+      const config = await rest(ctx, ctx.allowed, { method: 'GET', path: configPath(kind, id!) });
       if (config === undefined) throw new ToolFailure(`Scene ${id} not found.`);
       return text({ config: maskSecrets(stripBearerTokens(config)) });
     }
     const [domain, item] = splitHelperId(id!);
-    const config = (await configRead<{ id: string }[]>(ctx, { type: `${domain}/list` }, kind)).find((h) => h.id === item);
+    const config = (await configRead<{ id: string }[]>(ctx, { type: `${domain}/list` })).find((h) => h.id === item);
     if (config === undefined) throw new ToolFailure(`Helper ${id} not found.`);
     return text({ config });
   },
@@ -407,7 +400,7 @@ const listTraces = defineTool({
     'Lists the stored runs of one automation or script, newest first, as summaries: run_id, start and finish time, state, last step, what triggered it and any error.',
     'Name the item by `kind` (automation or script) and `id`: an automation\'s config `id` from its config, or a script\'s object id, the part of its entity_id after `script.`.',
     'Secret-looking values come back as **REDACTED**, best-effort.',
-    'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    PAGED,
     'Example: {"kind": "script", "id": "morning"} lists the runs of script.morning.',
   ].join(' '),
   // HA's trace/list without item_id returns every item's traces, so both are required.
@@ -461,11 +454,11 @@ const listServices = defineTool({
     'Lists every service Home Assistant offers, sorted by name, each with its fields, whether it takes a target, whether it returns a response, and whether this Caller may call it (`callable`).',
     'A service marked callable may still be refused for a particular target that this Caller may not act on.',
     'Filter by `domain` (such as `light`).',
-    'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.',
+    PAGED,
     'Example: {"domain": "light"} lists the light services.',
   ].join(' '),
   input: z.strictObject({
-    domain: z.string().regex(/^[a-z0-9_]+$/).optional().describe('Service domain, such as light.'),
+    domain: slug.optional().describe('Service domain, such as light.'),
     ...page,
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
@@ -477,8 +470,8 @@ const listServices = defineTool({
       .sort((a, b) => a.service.localeCompare(b.service))
       .map(({ service, d }) => ({
         service,
-        ...(d.name === undefined ? {} : { name: d.name }),
-        ...(d.description === undefined ? {} : { description: d.description }),
+        name: d.name,
+        description: d.description,
         fields: d.fields ?? {},
         target: d.target !== undefined,
         response: d.response !== undefined,
@@ -498,8 +491,8 @@ const callService = defineTool({
     'Example: {"domain": "light", "service": "turn_on", "target": {"area_id": "kitchen"}, "data": {"brightness_pct": 40}}.',
   ].join(' '),
   input: z.strictObject({
-    domain: z.string().regex(/^[a-z0-9_]+$/).describe('Service domain, such as light.'),
-    service: z.string().regex(/^[a-z0-9_]+$/).describe('Service name, such as turn_on.'),
+    domain: slug.describe('Service domain, such as light.'),
+    service: slug.describe('Service name, such as turn_on.'),
     target: z
       .strictObject({ entity_id: targetIds, device_id: targetIds, area_id: targetIds, floor_id: targetIds, label_id: targetIds })
       .optional()
@@ -523,7 +516,7 @@ const callService = defineTool({
       return denial;
     }
     const { plan } = planned;
-    const lookup = (command: Command) => read(ctx, plan.lookup, command);
+    const lookup = (command: Command) => send(ctx, plan.lookup, command);
     const description = ((await lookup({ type: 'get_services' })) as Record<string, Record<string, HaService> | undefined>)[domain]?.[service];
     if (!description) throw new ToolFailure(`Service ${name} not found.`);
     const targeted = description.target !== undefined;
@@ -554,9 +547,9 @@ const callService = defineTool({
     }
     // Recorded before sending, so a call that fails or ends "outcome unknown" still leaves a record.
     if (ctx.options.auditWrites) audit({ decision: 'allow', entities: expansion.entities, grants });
-    const result = await read<{ context: { id: string }; response?: unknown }>(ctx, decision.allowed, decision.allowed.write.command);
+    const result = await send<{ context: { id: string }; response?: unknown }>(ctx, decision.allowed, decision.allowed.write.command);
     if (ctx.options.auditWrites) audit({ outcome: 'done', context_id: result.context.id });
-    return writeResult({ entity_ids: expansion.entities, context_id: result.context.id, ...('response' in result ? { response: result.response } : {}) });
+    return writeResult({ entity_ids: expansion.entities, context_id: result.context.id, response: result.response });
   },
 });
 
@@ -582,15 +575,15 @@ const writeConfig = defineTool({
       if (action === 'delete' && config !== undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: 'is not taken by delete' });
     }),
   annotations: { readOnlyHint: false, destructiveHint: true },
-  decide: (change: ConfigWrite, ctx) => ({
-    ...decideConfigWrite(ctx.policy, ctx.auth.caller, change),
+  decide: (change: ConfigWrite, policy, caller) => ({
+    ...decideConfigWrite(policy, caller, change),
     lacking: `config writes of ${change.kind}`,
     request: { kind: change.kind, action: change.action, id: change.id },
   }),
-  async run(change: ConfigWrite, ctx, decided) {
+  async run(change: ConfigWrite, ctx) {
     const { kind, action, id } = change;
-    if (!decided?.allowed) throw new Error('config write sent without an Allowed');
-    let { allowed } = decided;
+    let allowed = ctx.allowed;
+    if (!allowed) throw new Error('config write sent without an Allowed');
     const marked = redactedPath(change.config);
     if (marked !== undefined) {
       ctx.audit({ kind, action, id, decision: 'deny', reason: 'config carries a redacted value' });
@@ -603,9 +596,10 @@ const writeConfig = defineTool({
       if (action === 'update' && !stored) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
       if (stored) allowed = mergedUpdate(allowed, stored);
     }
-    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: decided.grants });
+    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
     const { write } = allowed;
-    const result = write.via === 'websocket' ? await read(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
+    if (!write) throw new Error('config write sent without a write');
+    const result = write.via === 'websocket' ? await send(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
     // A helper write echoes the whole stored item, keys the Caller did not send included.
     return writeResult({ kind, action, id, result: maskSecrets(stripBearerTokens(result)) });
   },
@@ -671,9 +665,9 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
     const { name } = params;
     if (!isTool(name)) throw new ProtocolError(ProtocolErrorCode.InvalidParams, `Tool ${name} not found`);
     const operation = TOOL_KIND[name];
-    const ctx: Context = { policy, auth, gate, audit: auditFor(audit, auth, operation, name), options };
+    const audited = auditFor(audit, auth, operation, name);
     if (!holds(name)) {
-      ctx.audit({ decision: 'deny', grants: [] });
+      audited({ decision: 'deny', grants: [] });
       return failure(`Denied: this Caller holds no Grant for ${OPERATION_NAME[operation]}. Do not retry this call.`);
     }
     const tool = TOOLS[name];
@@ -681,16 +675,20 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
     if (!args.success) {
       return failure(`Input validation error: ${args.error.issues.map((i) => `${i.path.join('.') || '(arguments)'}: ${i.message}`).join('; ')}`);
     }
-    const decided = tool.decide?.(args.data, ctx) ?? { grants: grantsFor(policy, auth.caller, operation), lacking: OPERATION_NAME[operation], request: {} };
+    const decided = tool.decide?.(args.data, policy, auth.caller) ?? {
+      ...(operation === 'plain_read' || operation === 'config_read' ? decideRead(policy, auth.caller, operation) : { grants: grantsFor(policy, auth.caller, operation) }),
+      lacking: OPERATION_NAME[operation],
+      request: {},
+    };
     if (decided.grants.length === 0) {
-      ctx.audit({ ...decided.request, decision: 'deny', grants: [] });
+      audited({ ...decided.request, decision: 'deny', grants: [] });
       return failure(`Denied: this Caller holds no Grant for ${decided.lacking}. Do not retry this call.`);
     }
     if (options.auditReads && READS.has(operation)) {
-      ctx.audit({ decision: 'allow', grants: decided.grants, request: args.data });
+      audited({ decision: 'allow', grants: decided.grants, request: args.data });
     }
     try {
-      const result = await tool.run(args.data, ctx, decided);
+      const result = await tool.run(args.data, { ...decided, policy, auth, gate, audit: audited, options });
       // A read is refused whole rather than cut off, so the Caller never reasons over a truncated answer.
       if (READS.has(operation) && Buffer.byteLength(JSON.stringify(result.content)) > BYTE_CAP) {
         return failure(`The response is over ${BYTE_CAP / 1000} kB, so nothing was returned: narrow the query with filters, a shorter window or a smaller limit.`);

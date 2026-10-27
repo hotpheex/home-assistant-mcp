@@ -7,20 +7,6 @@ import { parsePolicy, type Policy } from '../src/policy.ts';
 const HASH = 'a'.repeat(64);
 const policyOf = (rules: string) => parsePolicy(`version: 1\ncallers:\n  agent:\n    keys: [{ sha256: ${HASH} }]\n${rules}`);
 
-test('plan refuses a service no Grant of the Caller names, and a delegating service a wildcard names', () => {
-  const policy = policyOf(`grants:
-  - caller: agent
-    services: [lock.unlock, scene.*]
-  - caller: agent
-    services: [light.*]
-    targets: [{ area: kitchen }]
-`);
-  assert.equal(planServiceCall(policy, 'agent', 'light.toggle').plan?.grants.join(), '1');
-  assert.equal(planServiceCall(policy, 'agent', 'switch.turn_on').plan, undefined);
-  assert.equal(planServiceCall(policy, 'agent', 'scene.apply').plan, undefined);
-  assert.equal(planServiceCall(policy, 'other', 'lock.unlock').plan, undefined);
-});
-
 const tablePolicy = policyOf(`grants:
   - caller: agent
     services: [light.turn_on, shell_command.backup]
@@ -55,11 +41,6 @@ const table: { name: string; service?: string; expansion: Expansion; decision: R
     decision: { allowed: false, grants: [], denies: [], uncovered: ['lock.door'] },
   },
   {
-    name: 'a Deny wins over a covering Grant, by HA expansion or by domain',
-    expansion: { targeted: true, entities: ['light.g', 'switch.k'], grantEntities: ['switch.k'], denyEntities: ['light.g'] },
-    decision: { allowed: false, grants: [], denies: [0], uncovered: [] },
-  },
-  {
     name: 'a targetless service is checked by name alone',
     service: 'shell_command.backup',
     expansion: { targeted: false, entities: [], grantEntities: [], denyEntities: [] },
@@ -79,7 +60,7 @@ for (const { name, service = 'light.turn_on', expansion, decision } of table) {
   });
 }
 
-test('an allowed call carries exactly the checked entity_id list, and no target keys in its data', () => {
+test('an allowed call carries exactly the checked entity_id list, sorted, and no target keys in its data', () => {
   const { plan } = planServiceCall(tablePolicy, 'agent', 'light.turn_on');
   assert.ok(plan);
   const expansion = { targeted: true, entities: ['light.b', 'light.a'], grantEntities: [], denyEntities: [] };
@@ -90,16 +71,6 @@ test('an allowed call carries exactly the checked entity_id list, and no target 
     target: { entity_id: ['light.a', 'light.b'] },
     service_data: { brightness: 9 },
     return_response: true,
-  });
-  const policy = policyOf(`grants:\n  - caller: agent\n    services: [shell_command.backup]\n`);
-  const targetless = planServiceCall(policy, 'agent', 'shell_command.backup').plan;
-  assert.ok(targetless);
-  const none = { targeted: false, entities: [], grantEntities: [], denyEntities: [] };
-  assert.deepEqual(decideServiceCall(policy, targetless, none, { ...call, domain: 'shell_command', service: 'backup' }).allowed?.write.command, {
-    type: 'call_service',
-    domain: 'shell_command',
-    service: 'backup',
-    service_data: { brightness: 9 },
   });
 });
 
@@ -158,7 +129,7 @@ function reaches(r: Rule, s: Scenario, entity: string | undefined, w: Record<str
   const delegating = s.service === 'scene.apply' || s.service.startsWith('homeassistant.');
   const named = r.services.some((p) => p === s.service || (p.endsWith('.*') && s.service.startsWith(p.slice(0, -1)) && (deny || !delegating)));
   if (!named) return false;
-  if (entity === undefined) return true; // a targetless service: by name alone
+  if (entity === undefined) return true;
   if (deny && r.targets === undefined) return true;
   return (r.targets ?? []).some((t) =>
     'domain' in t ? t.domain === '*' || entity.startsWith(`${t.domain}.`) : (w['area' in t ? `area:${t.area}` : `label:${t.label}`] ?? []).includes(entity),

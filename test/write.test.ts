@@ -2,14 +2,12 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import { REDACTED as M } from '../src/redaction.ts';
-import { ADMIN_TOKEN, body, connect, fakeHa, newKey, startServer, until } from './harness.ts';
+import { ADMIN_TOKEN, adminCaller, body, connect, fakeHa, newKey, policyOf, startServer, until } from './harness.ts';
 
 const keys = Object.fromEntries(['auditor', 'automator', 'scripter', 'scener', 'helperer'].map((name) => [name, newKey()]));
-const policy = `
-version: 1
-callers:
-${Object.entries(keys).map(([name, { sha256 }]) => `  ${name}:\n    keys: [{ sha256: ${sha256} }]`).join('\n')}
-grants:
+const policy = policyOf(
+  keys,
+  `grants:
   - caller: auditor
     read: config
   - caller: automator
@@ -20,37 +18,27 @@ grants:
     config_write: scene
   - caller: helperer
     config_write: helper
-`;
+`,
+);
 
 async function house(t: TestContext) {
   const ha = await fakeHa(t);
   const server = await startServer(t, policy, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN, HAMCP_AUDIT_WRITES: 'true' });
-  /** Calls a tool as `who`, returning the result and what reached HA, all of it at the admin tier. */
   const as = async (who: string) => {
     const client = await connect(t, server.url, keys[who]!.key, 'modern');
-    const call = async (name: string, args: Record<string, unknown>) => {
-      const before = ha.received.length;
-      const result = await client.callTool({ name, arguments: args });
-      const sent = ha.received.slice(before);
-      assert.ok(sent.every((r) => r.token === ADMIN_TOKEN));
-      assert.doesNotMatch(JSON.stringify(result), /SECRET/);
-      return { result, sent: sent.map((r) => Object.fromEntries(Object.entries(r.message).filter(([k]) => k !== 'id'))) };
-    };
-    return { client, call };
+    return { client, call: adminCaller(ha, client) };
   };
   return { ha, server, as };
 }
 
 const NEW_AUTOMATION = { alias: 'Hall light', triggers: [{ trigger: 'sun', event: 'sunset' }], actions: [{ action: 'light.turn_on' }] };
 
-test('a config-write Grant lists ha_write_config, described as admin-equivalent; config read does not', async (t) => {
+test('a config-write Grant lists ha_write_config, described as admin-equivalent; config read lists only the config-read tools', async (t) => {
   const { as } = await house(t);
   const listed = (await (await as('automator')).client.listTools()).tools;
-  const definition = listed.find((d) => d.name === 'ha_write_config');
-  assert.match(definition?.description ?? '', /admin-equivalent/);
-  assert.deepEqual(Object.keys(definition?.inputSchema.properties ?? {}).sort(), ['action', 'config', 'id', 'kind']);
+  assert.match(listed.find((d) => d.name === 'ha_write_config')?.description ?? '', /admin-equivalent/);
   const auditing = (await (await as('auditor')).client.listTools()).tools;
-  assert.equal(auditing.some((d) => d.name === 'ha_write_config'), false);
+  assert.deepEqual(auditing.map((d) => d.name), ['ha_get_config', 'ha_list_traces', 'ha_get_trace']);
 });
 
 test('an automation create posts the config to HA, and the allowed write is audited by name only', async (t) => {

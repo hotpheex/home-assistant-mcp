@@ -10,6 +10,7 @@ test('bearer tokens are stripped wherever the token parameter sits in the URL', 
     ['/api/image_proxy/image.a?token=T1&time=5', '/api/image_proxy/image.a?time=5'],
     ['/api/media_player_proxy/media_player.a?cache=1&token=T1', '/api/media_player_proxy/media_player.a?cache=1'],
     ['https://ha.example/api/camera_proxy/camera.a?w=1&token=T1&h=2#x', 'https://ha.example/api/camera_proxy/camera.a?w=1&h=2#x'],
+    ['/api/camera_proxy/camera.a?token=T1&token=T2&x=1', '/api/camera_proxy/camera.a?x=1'],
   ];
   for (const [url, stripped] of cases) {
     const domain = /(camera|image|media_player)\.a/.exec(url!)![1]!;
@@ -35,9 +36,12 @@ test('expected leak: tokens outside the attributes of camera, image and media_pl
 
 const M = REDACTED;
 
-test('values under secret-looking keys are masked, at any depth and whatever their type', () => {
+test('values under secret-looking keys are masked, at any depth and whatever their type; auth only as a whole word', () => {
   const config = {
     alias: 'Ping the API',
+    author: 'Jane',
+    automation: 'a',
+    tokenizer: 'b',
     password: 'hunter2',
     PassWD: 'hunter2',
     client_secret: 's3cr3t',
@@ -57,6 +61,9 @@ test('values under secret-looking keys are masked, at any depth and whatever the
   };
   assert.deepEqual(maskSecrets(config), {
     alias: 'Ping the API',
+    author: 'Jane',
+    automation: 'a',
+    tokenizer: M,
     password: M,
     PassWD: M,
     client_secret: M,
@@ -74,10 +81,6 @@ test('values under secret-looking keys are masked, at any depth and whatever the
     pin: 1234,
     actions: [{ action: 'rest_command.ping', data: { headers: { 'X-Auth-Token': M }, sensor_token: M } }],
   });
-});
-
-test('auth matches only as a whole word of the key; the other listed words match anywhere in it', () => {
-  assert.deepEqual(maskSecrets({ author: 'Jane', automation: 'a', tokenizer: 'b' }), { author: 'Jane', automation: 'a', tokenizer: M });
 });
 
 test('URL userinfo and Bearer tokens are masked inside any string, leaving the rest', () => {

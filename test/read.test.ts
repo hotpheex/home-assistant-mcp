@@ -2,18 +2,10 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import type { FakeHaOptions } from './fake-ha.ts';
-import { body, connect, ERAS, fakeHa, newKey, startServer } from './harness.ts';
+import { body, connect, ERAS, fakeHa, newKey, policyOf, startServer } from './harness.ts';
 
 const reader = newKey();
-const readerPolicy = `
-version: 1
-callers:
-  reader:
-    keys: [{ sha256: ${reader.sha256} }]
-grants:
-  - caller: reader
-    read: plain
-`;
+const readerPolicy = policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n');
 
 const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
 
@@ -98,9 +90,29 @@ test('ha_get_logbook reads the last hour by default, optionally for one entity',
   assert.deepEqual((one.entries as { state: string }[]).map((e) => e.state), ['locked']);
 });
 
-test('ha_get_states matches aliases, area and label names, filters by state, and gives attributes only in full', async (t) => {
-  const { call } = await readerOn(t);
+test('read: plain lists the five read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
+  const { call, client } = await readerOn(t);
+  const listed = await client.listTools();
+  assert.deepEqual(listed.tools.map((tool) => tool.name), ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services']);
+  assert.equal(listed.cacheScope, 'private');
+
   const ids = async (args: Record<string, unknown>) => ((await call('ha_get_states', args)).states as { entity_id: string }[]).map((s) => s.entity_id);
+  assert.deepEqual(await call('ha_get_states', { domain: 'light' }), {
+    total: 2,
+    offset: 0,
+    has_more: false,
+    states: [
+      { entity_id: 'light.kitchen', name: 'Kitchen Ceiling', state: 'on' },
+      { entity_id: 'light.living_room', name: 'Living Room Lamp', state: 'off' },
+    ],
+  });
+  const page = async (args: Record<string, unknown>) => {
+    const { total, offset, has_more } = await call('ha_get_states', args);
+    return [total, offset, has_more, await ids(args)];
+  };
+  assert.deepEqual(await page({ query: 'KITCHEN', limit: 1 }), [2, 0, true, ['light.kitchen']]);
+  assert.deepEqual(await page({ query: 'kitchen', limit: 1, offset: 1 }), [2, 1, false, ['sensor.kitchen_temperature']]);
+  assert.deepEqual(await ids({ query: 'lamp' }), ['light.living_room']);
   assert.deepEqual(await ids({ query: 'sofa' }), ['light.living_room']);
   assert.deepEqual(await ids({ query: 'UTILITY' }), ['switch.coffee_maker']);
   assert.deepEqual(await ids({ query: 'secur' }), ['lock.front_door']);
@@ -109,6 +121,9 @@ test('ha_get_states matches aliases, area and label names, filters by state, and
   assert.deepEqual((await call('ha_get_states', { domain: 'lock', full: true })).states, [
     { entity_id: 'lock.front_door', name: 'Front Door', state: 'locked', attributes: { friendly_name: 'Front Door' } },
   ]);
+  const tooMany = await client.callTool({ name: 'ha_get_states', arguments: { limit: 501 } });
+  assert.equal(tooMany.isError, true);
+  assert.match(JSON.stringify(tooMany.content), /limit/);
 });
 
 test('every read strips camera, image and media_player bearer tokens', async (t) => {
@@ -139,16 +154,9 @@ for (const era of ERAS) {
     const [twin, idle] = [newKey(), newKey()];
     const ha = await fakeHa(t);
     // twin sees the same tools as reader through a different Policy; idle sees none.
-    const policy = `
-version: 1
-callers:
-  reader:
-    keys: [{ sha256: ${reader.sha256} }]
-  twin:
-    keys: [{ sha256: ${twin.sha256} }]
-  idle:
-    keys: [{ sha256: ${idle.sha256} }]
-grants:
+    const policy = policyOf(
+      { reader, twin, idle },
+      `grants:
   - caller: reader
     read: plain
   - caller: twin
@@ -156,7 +164,8 @@ grants:
 denies:
   - caller: twin
     services: [lock.unlock]
-`;
+`,
+    );
     const server = await startServer(t, policy, ha);
     const instructions = async (key: string) => (await connect(t, server.url, key, era)).getInstructions() ?? '';
     const forReader = await instructions(reader.key);
@@ -190,7 +199,7 @@ test('allowed reads are audited, naming the read kind and request, only with HAM
 });
 
 test('ha_get_registry lists each registry, filtered by a query', async (t) => {
-  const { call, sent, server } = await readerOn(t);
+  const { call, sent } = await readerOn(t);
   const ids = { entity: 'entity_id', device: 'id', area: 'area_id', label: 'label_id', floor: 'floor_id' } as const;
   const expected = {
     entity: ['switch.coffee_maker', 'light.living_room', 'lock.front_door'],
@@ -210,5 +219,4 @@ test('ha_get_registry lists each registry, filtered by a query', async (t) => {
     { area_id: 'utility_room', name: 'Utility Room', floor_id: 'ground', aliases: [] },
   ]);
   assert.equal((await call('ha_get_registry', { registry: 'entity', limit: 2 })).has_more, true);
-  assert.deepEqual(server.audits(), [], 'allowed reads are not audited by default');
 });

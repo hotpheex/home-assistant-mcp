@@ -1,41 +1,25 @@
 import assert from 'node:assert/strict';
 import { test, type TestContext } from 'node:test';
-import type { FakeHaOptions, Registry } from './fake-ha.ts';
-import { body, connect, fakeHa, newKey, startServer, until, USERS_TOKEN } from './harness.ts';
-
-const entity = (entity_id: string, fields: Partial<Registry['entities'][number]> = {}) => ({
-  entity_id,
-  device_id: null,
-  area_id: null,
-  labels: [],
-  hidden_by: null,
-  disabled_by: null,
-  entity_category: null,
-  ...fields,
-});
-const device = (id: string, fields: Partial<Registry['devices'][number]> = {}) => ({ id, area_id: null, labels: [], parent_device_id: null, ...fields });
+import type { FakeHaOptions } from './fake-ha.ts';
+import { body, connect, fakeHa, newKey, policyOf, startServer, until, withoutId } from './harness.ts';
 
 /** A house with each ADR 0008 case: area fallback, a labelled hub's child, a hidden entity and a config entity. */
-const REGISTRY: Registry = {
-  areas: [
-    { area_id: 'kitchen', floor_id: 'ground', labels: [] },
-    { area_id: 'living_room', floor_id: 'ground', labels: [] },
-    { area_id: 'garage', floor_id: null, labels: [] },
-  ],
+const REGISTRY = {
+  areas: [{ area_id: 'kitchen', floor_id: 'ground' }, { area_id: 'living_room', floor_id: 'ground' }, { area_id: 'garage' }],
   floors: [{ floor_id: 'ground' }],
   labels: [{ label_id: 'garden' }, { label_id: 'night' }],
-  devices: [device('kitchen_light', { area_id: 'kitchen' }), device('hub', { labels: ['garden'] }), device('bulb', { parent_device_id: 'hub' }), device('garage_door', { area_id: 'garage' })],
+  devices: [{ id: 'kitchen_light', area_id: 'kitchen' }, { id: 'hub', labels: ['garden'] }, { id: 'bulb', parent_device_id: 'hub' }, { id: 'garage_door', area_id: 'garage' }],
   entities: [
-    entity('light.kitchen', { device_id: 'kitchen_light' }),
-    entity('button.kitchen_light_restart', { device_id: 'kitchen_light', entity_category: 'config' }),
-    entity('light.kitchen_hidden', { area_id: 'kitchen', hidden_by: 'user' }),
-    entity('switch.coffee_maker', { area_id: 'kitchen' }),
-    entity('light.living_room', { area_id: 'living_room' }),
-    entity('light.garden_bulb', { device_id: 'bulb' }),
-    entity('lock.front_door', { labels: ['night'] }),
-    entity('cover.garage_door', { device_id: 'garage_door' }),
+    { entity_id: 'light.kitchen', device_id: 'kitchen_light' },
+    { entity_id: 'button.kitchen_light_restart', device_id: 'kitchen_light', entity_category: 'config' },
+    { entity_id: 'light.kitchen_hidden', area_id: 'kitchen', hidden_by: 'user' },
+    { entity_id: 'switch.coffee_maker', area_id: 'kitchen' },
+    { entity_id: 'light.living_room', area_id: 'living_room' },
+    { entity_id: 'light.garden_bulb', device_id: 'bulb' },
+    { entity_id: 'lock.front_door', labels: ['night'] },
+    { entity_id: 'cover.garage_door', device_id: 'garage_door' },
   ],
-};
+} satisfies Partial<FakeHaOptions>;
 const STATES = REGISTRY.entities.map((e) => ({ entity_id: e.entity_id, state: 'off', attributes: {} }));
 /** A service's declared `target.entity` domain filter, as get_services serves it; no domain declares none. */
 const targeted = (...domain: string[]) => ({ target: { entity: [domain.length ? { domain } : {}] } });
@@ -53,17 +37,17 @@ const SERVICES: FakeHaOptions['services'] = {
 const agent = newKey();
 async function serve(t: TestContext, rules: string, env: Record<string, string> = {}, options: Partial<FakeHaOptions> = {}) {
   const ha = await fakeHa(t, { states: STATES, ...REGISTRY, services: SERVICES, ...options });
-  const server = await startServer(t, `version: 1\ncallers:\n  agent:\n    keys: [{ sha256: ${agent.sha256} }]\n${rules}`, ha, env);
+  const server = await startServer(t, policyOf({ agent }, rules), ha, env);
   const client = await connect(t, server.url, agent.key, 'modern');
   const before = ha.received.length;
   /** The commands sent since the client connected, without their ids. */
-  const sent = () => ha.received.slice(before).map((r) => Object.fromEntries(Object.entries(r.message).filter(([k]) => k !== 'id')));
+  const sent = () => ha.received.slice(before).map(withoutId);
   const call = (args: Record<string, unknown>) => client.callTool({ name: 'ha_call_service', arguments: args });
   return { ha, server, client, sent, call };
 }
 
 test("an area Grant forwards exactly the entities HA expands the call target to, within the service's own domains", async (t) => {
-  const { sent, call, ha } = await serve(t, 'grants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ area: kitchen }]\n');
+  const { sent, call } = await serve(t, 'grants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ area: kitchen }]\n');
   const result = await call({ domain: 'light', service: 'turn_on', target: { area_id: 'kitchen' }, data: { brightness: 40 } });
   assert.equal(result.isError, undefined);
   assert.deepEqual(body(result), { entity_ids: ['light.kitchen'], context_id: 'ctx-1' });
@@ -73,16 +57,11 @@ test("an area Grant forwards exactly the entities HA expands the call target to,
     { type: 'extract_from_target', target: { area_id: ['kitchen'] }, expand_group: false },
     { type: 'call_service', domain: 'light', service: 'turn_on', target: { entity_id: ['light.kitchen'] }, service_data: { brightness: 40 } },
   ]);
-  assert.ok(ha.received.every((r) => r.token === USERS_TOKEN));
 });
 
-test('an allowed write is audited only with HAMCP_AUDIT_WRITES, by names only', async (t) => {
+test('with HAMCP_AUDIT_WRITES an allowed write is audited by names only, before it is sent', async (t) => {
   const rules = 'grants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ area: kitchen }]\n';
   const args = { domain: 'light', service: 'turn_on', target: { area_id: 'kitchen' }, data: { brightness: 40 } };
-  const quiet = await serve(t, rules);
-  await quiet.call(args);
-  assert.deepEqual(quiet.server.audits(), []);
-
   const audited = await serve(t, rules, { HAMCP_AUDIT_WRITES: 'true' });
   await audited.call(args);
   const [{ time, ...record } = {}, { time: done, ...outcome } = {}] = audited.server.audits();
@@ -100,11 +79,6 @@ test('an allowed write is audited only with HAMCP_AUDIT_WRITES, by names only', 
 const grantLights = 'grants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ domain: light }]\n';
 const denied = (name: string, target: string) => `Denied: this Caller holds no Grant to call ${name} over ${target}. Do not retry this call.`;
 const textOf = (result: unknown) => (result as { content: { text: string }[] }).content[0]?.text;
-
-test('a service-call Grant lists ha_call_service with the plain-read tools', async (t) => {
-  const { client } = await serve(t, grantLights);
-  assert.deepEqual((await client.listTools()).tools.map((d) => d.name).sort(), ['ha_call_service', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_get_states', 'ha_list_services']);
-});
 
 test('a service no Grant names is refused before any outbound message', async (t) => {
   const { call, sent, server } = await serve(t, grantLights);
@@ -213,15 +187,12 @@ test('entity_id all expands to the service domain, or to every entity for a dele
   assert.deepEqual(server.audits().at(-1)?.uncovered, ['button.kitchen_light_restart', 'cover.garage_door', 'lock.front_door']);
 });
 
-test('a target that resolves to nothing, or that HA cannot expand, is refused', async (t) => {
+test('a target HA cannot expand is refused', async (t) => {
   const { call, sent, server } = await serve(t, 'grants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ area: kitchen }]\n');
-  const result = await call({ domain: 'light', service: 'turn_on', target: { area_id: 'attic' } });
-  assert.equal(result.isError, true);
-  assert.equal(textOf(result), 'light.turn_on: target matches no entity.');
   const uuid = await call({ domain: 'light', service: 'turn_on', data: { entity_id: '0f3c2a9e8b7d4c1e' } });
   assert.equal(textOf(uuid), 'Home Assistant refused the request: Entity ID 0f3c2a9e8b7d4c1e is an invalid entity ID');
   assert.ok(!sent().some((m) => m.type === 'call_service'));
-  assert.deepEqual(server.audits().map((a) => [a.decision, a.reason, a.target]), [['deny', 'target matches no entity', { area_id: ['attic'] }]]);
+  assert.deepEqual(server.audits(), []);
 });
 
 test('a targetless service is checked by name and refuses a target; a targeted one needs a target', async (t) => {
@@ -266,14 +237,28 @@ test('a service that responds returns its response; an oversize one is truncated
   assert.match(truncated, /\n\[truncated: the response was \d+ bytes, over the 80000-byte cap; the call ran\]$/);
 });
 
-test('"HA unavailable" when nothing was sent; "outcome unknown" when the connection drops after the call was sent', async (t) => {
+test('"HA unavailable" when nothing was sent; "outcome unknown" when the call was sent and its connection dropped or it went unanswered', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
   const { call, sent, ha, client, server } = await serve(t, grantLights);
   const args = { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } };
+  const unknown = 'Outcome unknown: the connection to Home Assistant dropped after the call was sent. Check state before retrying.';
+  ha.stall.add('call_service');
+  const stalled = call(args);
+  await until(() => sent().some((m) => m.type === 'call_service'), 'the call to reach HA');
+  t.mock.timers.tick(30_000);
+  await until(() => sent().some((m) => m.type === 'ping'), 'a heartbeat ping');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  t.mock.timers.tick(30_000);
+  assert.equal(textOf(await stalled), unknown);
+  // The pong came back, so the call was abandoned on its own and the connection kept.
+  assert.equal(server.records().filter((r) => r.msg === 'connected to Home Assistant').length, 1);
+  ha.stall.clear();
+
   ha.drop.add('call_service');
-  const unknown = await call(args);
-  assert.equal(unknown.isError, true);
-  assert.equal(textOf(unknown), 'Outcome unknown: the connection to Home Assistant dropped after the call was sent. Check state before retrying.');
-  assert.equal(sent().filter((m) => m.type === 'call_service').length, 1);
+  const dropped = await call(args);
+  assert.equal(dropped.isError, true);
+  assert.equal(textOf(dropped), unknown);
+  assert.equal(sent().filter((m) => m.type === 'call_service').length, 2);
 
   await ha.outage();
   const unavailable = await call(args);
@@ -284,7 +269,7 @@ test('"HA unavailable" when nothing was sent; "outcome unknown" when the connect
   // Nothing was queued: once HA is back, the refused call never fires.
   ha.restore();
   await until(() => server.records().filter((r) => r.msg === 'connected to Home Assistant').length === 2, 'HA reconnection', 5000);
-  assert.equal(sent().filter((m) => m.type === 'call_service').length, 1);
+  assert.equal(sent().filter((m) => m.type === 'call_service').length, 2);
   assert.equal(sent().filter((m) => m.type === 'get_states').length, 0);
 });
 

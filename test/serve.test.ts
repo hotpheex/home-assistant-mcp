@@ -1,74 +1,13 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decideServiceCall, NAME_LOOKUP, OPERATION_TIER, planServiceCall, type Allowed, type Operation } from '../src/evaluator.ts';
+import { decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type Operation } from '../src/evaluator.ts';
 import { openGate } from '../src/gate.ts';
 import { parsePolicy } from '../src/policy.ts';
 import { TOOL_KIND, type ToolName } from '../src/tools.ts';
-import { ADMIN_TOKEN, body, connect, ERAS, fakeHa, newKey, startServer, USERS_TOKEN } from './harness.ts';
+import { ADMIN_TOKEN, connect, ERAS, fakeHa, newKey, policyOf, startServer, STARTUP_COMMANDS, USERS_TOKEN } from './harness.ts';
 
 const reader = newKey();
-const readerPolicy = `
-version: 1
-callers:
-  reader:
-    keys:
-      - sha256: ${reader.sha256}
-grants:
-  - caller: reader
-    read: plain
-`;
-
-for (const era of ERAS) {
-  test(`a Caller with read: plain lists states, filtered and paged (${era})`, async (t) => {
-    const ha = await fakeHa(t);
-    const server = await startServer(t, readerPolicy, ha);
-    const client = await connect(t, server.url, reader.key, era);
-
-    const listed = await client.listTools();
-    assert.deepEqual(
-      listed.tools.map((tool) => tool.name),
-      ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services'],
-    );
-    if (era === 'modern') assert.equal(listed.cacheScope, 'private');
-
-    const call = async (args: Record<string, unknown>) => {
-      const result = await client.callTool({ name: 'ha_get_states', arguments: args });
-      assert.equal(result.isError, undefined);
-      return body(result);
-    };
-    assert.deepEqual(await call({ domain: 'light' }), {
-      total: 2,
-      offset: 0,
-      has_more: false,
-      states: [
-        { entity_id: 'light.kitchen', name: 'Kitchen Ceiling', state: 'on' },
-        { entity_id: 'light.living_room', name: 'Living Room Lamp', state: 'off' },
-      ],
-    });
-    assert.deepEqual(await call({ query: 'KITCHEN', limit: 1 }), {
-      total: 2,
-      offset: 0,
-      has_more: true,
-      states: [{ entity_id: 'light.kitchen', name: 'Kitchen Ceiling', state: 'on' }],
-    });
-    assert.deepEqual(await call({ query: 'kitchen', limit: 1, offset: 1 }), {
-      total: 2,
-      offset: 1,
-      has_more: false,
-      states: [{ entity_id: 'sensor.kitchen_temperature', name: 'Kitchen Temperature', state: '21.5' }],
-    });
-    assert.deepEqual(await call({ query: 'lamp' }), {
-      total: 1,
-      offset: 0,
-      has_more: false,
-      states: [{ entity_id: 'light.living_room', name: 'Living Room Lamp', state: 'off' }],
-    });
-
-    const tooMany = await client.callTool({ name: 'ha_get_states', arguments: { limit: 501 } });
-    assert.equal(tooMany.isError, true);
-    assert.match(JSON.stringify(tooMany.content), /limit/);
-  });
-}
+const readerPolicy = policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n');
 
 test('missing, malformed, unknown and expired keys get the same 401, each audited without the key', async (t) => {
   const expired = newKey();
@@ -119,7 +58,7 @@ grants:
   assert.doesNotMatch(server.lines.join('\n'), /hamcp_/);
 });
 
-test('a request with an Origin outside HAMCP_ALLOWED_ORIGINS gets 403', async (t) => {
+test('a request with an Origin outside HAMCP_ALLOWED_ORIGINS gets 403 and is audited', async (t) => {
   const ha = await fakeHa(t);
   const server = await startServer(t, readerPolicy, ha, { HAMCP_ALLOWED_ORIGINS: 'https://allowed.example' });
   const post = (origin: string) =>
@@ -130,6 +69,10 @@ test('a request with an Origin outside HAMCP_ALLOWED_ORIGINS gets 403', async (t
     });
   assert.equal((await post('https://evil.example')).status, 403);
   assert.equal((await post('https://allowed.example')).status, 200);
+  assert.deepEqual(
+    server.records().filter((r) => r.audit).map((r) => [r.decision, r.reason, r.origin]),
+    [['deny', 'origin not allowed', 'https://evil.example']],
+  );
 });
 
 /** A Grant that gives each Operation, for the matrix rows that hold it. */
@@ -170,12 +113,6 @@ const PURE_READS = new Set([
   'trace/get',
   ...['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'].map((d) => `${d}/list`),
 ]);
-const TIER_TOKEN = { users: USERS_TOKEN, admin: ADMIN_TOKEN };
-
-test('the admin pin: the admin tier serves exactly config read and config write', () => {
-  assert.deepEqual(Object.keys(OPERATION_TIER).filter((op) => OPERATION_TIER[op as Operation] === 'admin'), ['config_read', 'config_write']);
-});
-
 test('the gate sends only an Allowed the evaluator issued, as issued: a forged, spread or altered one sends nothing', async (t) => {
   const ha = await fakeHa(t);
   const gate = openGate(ha.url, new Map([['users', USERS_TOKEN], ['admin', ADMIN_TOKEN]] as const), () => {}, (reason) => assert.fail(reason));
@@ -212,22 +149,7 @@ for (const era of ERAS) {
       const holder = newKey();
       const idle = newKey();
       const ha = await fakeHa(t);
-      const server = await startServer(
-        t,
-        `
-version: 1
-callers:
-  holder:
-    keys: [{ sha256: ${holder.sha256} }]
-  idle:
-    keys: [{ sha256: ${idle.sha256} }]
-grants:
-  - caller: holder
-    ${GRANT_FOR[kind]}
-`,
-        ha,
-        { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN },
-      );
+      const server = await startServer(t, policyOf({ holder, idle }, `grants:\n  - caller: holder\n    ${GRANT_FOR[kind]}\n`), ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
 
       const holding = await connect(t, server.url, holder.key, era);
       const definition = (await holding.listTools()).tools.find((d) => d.name === tool);
@@ -237,15 +159,14 @@ grants:
       const sentences = definition.description?.match(/[.!?](?=\s|$)/g)?.length ?? 0;
       assert.ok(sentences >= 3 && sentences <= 6, `${tool} has ${sentences} sentences`);
       assert.doesNotMatch(definition.description ?? '', /\bha_/, 'a description points to no other tool');
-      // Nothing is refreshed, subscribed or flowed at startup: beyond the handshake and admin check, only name lookups.
-      const startup = ['supported_features', 'auth/current_user', 'get_services', 'get_states', 'extract_from_target'];
-      assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !startup.includes(type)), []);
+      assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !STARTUP_COMMANDS.includes(type)), []);
       const before = ha.received.length;
       const allowed = await holding.callTool({ name: tool, arguments: SAMPLE_ARGS[tool] });
       assert.equal(allowed.isError, undefined);
       const sent = ha.received.slice(before);
       assert.ok(sent.length > 0);
-      assert.deepEqual(new Set(sent.map((r) => r.token)), new Set([TIER_TOKEN[OPERATION_TIER[kind]]]));
+      // The admin pin, written out here rather than read from the code it pins.
+      assert.deepEqual(new Set(sent.map((r) => r.token)), new Set([kind.startsWith('config_') ? ADMIN_TOKEN : USERS_TOKEN]));
       if (definition.annotations?.readOnlyHint) {
         assert.deepEqual(sent.map((r) => r.message.type).filter((type) => !PURE_READS.has(type)), [], 'a read tool sends only read-only commands');
       }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { test } from 'node:test';
-import { body, connect, fakeHa, newKey, runImage, USERS_TOKEN, writePolicy } from './harness.ts';
+import { body, connect, fakeHa, newKey, policyOf, runImage, USERS_TOKEN, writePolicy } from './harness.ts';
 
 /** The built image under test; CI builds one and sets this, and without it there is nothing to run. */
 const image = process.env.HAMCP_IMAGE;
@@ -9,15 +9,7 @@ const image = process.env.HAMCP_IMAGE;
 test('the image serves as UID 65532 on a read-only root filesystem', { skip: !image && 'HAMCP_IMAGE is not set' }, async (t) => {
   const ha = await fakeHa(t);
   const reader = newKey();
-  const policy = writePolicy(`version: 1
-callers:
-  reader:
-    keys:
-      - sha256: ${reader.sha256}
-grants:
-  - caller: reader
-    read: plain
-`);
+  const policy = writePolicy(policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n'));
   const server = runImage(image!, policy, { HAMCP_HA_URL: ha.url, HAMCP_HA_USERS_TOKEN: USERS_TOKEN }, (fn) => t.after(fn));
 
   await server.logged('connected to Home Assistant', 30_000);

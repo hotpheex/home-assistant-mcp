@@ -3,7 +3,7 @@ const TOKEN_DOMAINS = new Set(['camera', 'image', 'media_player']);
 
 const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-const stripTokenParam = (url: string) => url.replace(/([?&])token=[^&#]*&?/g, '$1').replace(/[?&](?=#|$)/, '');
+const stripTokenParam = (url: string) => url.replace(/(?<=[?&])token=[^&#]*(&|(?=#|$))/g, '').replace(/[?&](?=#|$)/, '');
 
 function stripTokenParams(value: unknown): unknown {
   if (typeof value === 'string') return stripTokenParam(value);

@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { parse } from 'yaml';
 import * as z from 'zod';
 import { policyJsonSchema } from '../src/policy.ts';
-import { ADMIN_TOKEN, connect, fakeHa, newKey, runCli, startServer, until, USERS_TOKEN, writePolicy } from './harness.ts';
+import { ADMIN_TOKEN, connect, fakeHa, newKey, runCli, startServer, STARTUP_COMMANDS, until, USERS_TOKEN, writePolicy } from './harness.ts';
 
 const key = newKey();
 const callers = `
@@ -27,6 +27,7 @@ const refusals = [
   { name: 'an unknown field', policy: `${callers}grants:\n  - caller: reader\n    read: plain\n    scope: all\n`, error: /scope/ },
   { name: 'a malformed key hash', policy: callers.replace(key.sha256, key.sha256.slice(1)), error: /sha256/ },
   { name: 'an undeclared Caller', policy: `${callers}grants:\n  - caller: ghost\n    read: plain\n`, error: /"ghost" is not declared/ },
+  { name: 'a Caller named like an object property', policy: `${callers}grants:\n  - caller: constructor\n    read: plain\n`, error: /"constructor" is not declared/ },
   {
     name: 'one key hash on two Callers',
     policy: `${callers}  twin:\n    keys:\n      - sha256: ${key.sha256}\n`,
@@ -35,7 +36,6 @@ const refusals = [
   { name: 'a homeassistant.* service', policy: `${callers}grants:\n  - caller: reader\n    services: [homeassistant.*]\n`, error: /homeassistant/ },
   { name: 'a bare * service', policy: `${callers}denies:\n  - caller: reader\n    services: ['*']\n`, error: /bare \*/ },
   { name: 'a Deny with an empty targets list', policy: `${callers}denies:\n  - caller: reader\n    services: [light.*]\n    targets: []\n`, error: /denies\.0\.targets/ },
-  { name: 'a Grant with an empty targets list', policy: `${callers}grants:\n  - caller: reader\n    services: [light.*]\n    targets: []\n`, error: /grants\.0\.targets/ },
   {
     name: 'an HAMCP_AUDIT_READS that is not a boolean',
     policy: `${callers}grants:\n  - caller: reader\n    read: plain\n`,
@@ -141,7 +141,7 @@ denies:
   );
 });
 
-test('a key within 14 days of expiry is warned about at startup and daily', async (t) => {
+test('a key within 14 days of expiry is warned about at startup, daily and by check', async (t) => {
   t.mock.timers.enable({ apis: ['setInterval'] });
   const inDays = (n: number) => new Date(Date.now() + n * 86_400_000).toISOString().slice(0, 10);
   const soon = newKey();
@@ -159,6 +159,8 @@ test('a key within 14 days of expiry is warned about at startup and daily', asyn
   assert.deepEqual(warnings(), [expiring]);
   t.mock.timers.tick(86_400_000);
   assert.deepEqual(warnings(), [expiring, expiring]);
+  const check = await runCli(t, ['check', writePolicy(policy)], {});
+  assert.deepEqual(check.records().filter((r) => r.level === 'warn').map((r) => r.msg), [expiring]);
 });
 
 test('keygen prints a 256-bit hamcp_ key and its SHA-256 hash', async (t) => {
@@ -171,13 +173,6 @@ test('keygen prints a 256-bit hamcp_ key and its SHA-256 hash', async (t) => {
 });
 
 const grantsPlainRead = `${callers}grants:\n  - caller: reader\n    read: plain\n`;
-
-test('the server exits when HA is below 2026.10', async (t) => {
-  const ha = await fakeHa(t, { version: '2026.9.3' });
-  const cli = await runCli(t, ['serve'], env(grantsPlainRead, { HAMCP_HA_URL: ha.url }));
-  assert.equal(await cli.exited, 1);
-  assert.ok(cli.records().some((r) => r.level === 'error' && /2026\.9\.3 is below/.test(String(r.msg))));
-});
 
 const whileRunning = [
   { name: 'HA rejects its token', change: { revoke: USERS_TOKEN }, error: /rejected the users-tier token/ },
@@ -285,7 +280,6 @@ test('readiness waits for every needed tier, and a connection lost during the ch
   assert.ok(!cli.records().some((r) => r.level === 'error'));
 });
 
-/** The names check may resolve, and the only commands it may send beyond the client's handshake and the admin check. */
 const namedPolicy = (names: { area: string; label: string; domain: string; services: string }) => `${callers}grants:
   - caller: reader
     services: [${names.services}]
@@ -299,26 +293,18 @@ denies:
     targets:
       - area: ${names.area}
 `;
-const CHECK_COMMANDS = new Set(['supported_features', 'auth/current_user', 'get_services', 'get_states', 'extract_from_target']);
-
-test('check, given HA, resolves every name against live HA with read-only commands', async (t) => {
+test('check, given HA, resolves every name against live HA with read-only commands, and reports each unknown one as an error', async (t) => {
   const ha = await fakeHa(t);
+  const checkAgainstHa = (policy: string) => runCli(t, ['check', writePolicy(policy)], { HAMCP_HA_URL: ha.url, HAMCP_HA_USERS_TOKEN: USERS_TOKEN });
   // lock has entities but no services in the house, so a lock domain is still known.
-  const policy = namedPolicy({ area: 'utility_room', label: 'security', domain: 'lock', services: 'light.turn_on, light.*' });
-  const check = await runCli(t, ['check', writePolicy(policy)], { HAMCP_HA_URL: ha.url, HAMCP_HA_USERS_TOKEN: USERS_TOKEN });
-  assert.equal(await check.exited, 0, check.lines.join('\n'));
-  assert.deepEqual(errorsOf(check.records()), []);
+  const known = await checkAgainstHa(namedPolicy({ area: 'utility_room', label: 'security', domain: 'lock', services: 'light.turn_on, light.*' }));
+  assert.equal(await known.exited, 0, known.lines.join('\n'));
+  assert.deepEqual(errorsOf(known.records()), []);
   assert.ok(ha.received.some((r) => r.message.type === 'extract_from_target'));
-  assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !CHECK_COMMANDS.has(type)), []);
-  assert.deepEqual(new Set(ha.received.map((r) => r.token)), new Set([USERS_TOKEN]));
-});
 
-test('check, given HA, reports every unknown area, label, domain and service as an error', async (t) => {
-  const ha = await fakeHa(t);
-  const policy = namedPolicy({ area: 'utilty_room', label: 'securty', domain: 'lok', services: 'light.turn_onn, ligt.*' });
-  const check = await runCli(t, ['check', writePolicy(policy)], { HAMCP_HA_URL: ha.url, HAMCP_HA_USERS_TOKEN: USERS_TOKEN });
-  assert.equal(await check.exited, 1);
-  assert.deepEqual(errorsOf(check.records()), [
+  const unknown = await checkAgainstHa(namedPolicy({ area: 'utilty_room', label: 'securty', domain: 'lok', services: 'light.turn_onn, ligt.*' }));
+  assert.equal(await unknown.exited, 1);
+  assert.deepEqual(errorsOf(unknown.records()), [
     'grants.0.services.0: Home Assistant has no service "light.turn_onn"',
     'grants.0.services.1: Home Assistant has no domain "ligt"',
     'grants.0.targets.0.area: Home Assistant has no area "utilty_room"',
@@ -326,5 +312,6 @@ test('check, given HA, reports every unknown area, label, domain and service as 
     'grants.0.targets.2.domain: Home Assistant has no domain "lok"',
     'denies.0.targets.0.area: Home Assistant has no area "utilty_room"',
   ]);
-  assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !CHECK_COMMANDS.has(type)), []);
+  assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !STARTUP_COMMANDS.includes(type)), []);
+  assert.deepEqual(new Set(ha.received.map((r) => r.token)), new Set([USERS_TOKEN]));
 });

@@ -32,7 +32,6 @@ const gateRules = {
 };
 
 export default defineConfig(
-  { ignores: ['node_modules/'] },
   tseslint.configs.recommendedTypeChecked,
   { languageOptions: { parserOptions: { projectService: true } } },
   { files: ['**/*.js'], extends: [tseslint.configs.disableTypeChecked] },

@@ -12,6 +12,8 @@ const service = z
     else if (!/^[a-z0-9_]+\.([a-z0-9_]+|\*)$/.test(ctx.value)) ctx.issues.push({ code: 'custom', input: ctx.value, message: 'must be <domain>.<service> or <domain>.*' });
   });
 
+export const CONFIG_KINDS = ['automation', 'script', 'scene', 'helper'] as const;
+
 const target = z
   .strictObject({ domain: z.union([z.literal('*'), name]).optional(), area: name.optional(), label: name.optional() })
   .refine((t) => Object.keys(t).length === 1, 'each target holds exactly one of domain, area or label');
@@ -25,7 +27,7 @@ const grant = z
     read: z.enum(['plain', 'config']).optional(),
     services: z.array(service).min(1).optional(),
     targets,
-    config_write: z.enum(['automation', 'script', 'scene', 'helper']).optional(),
+    config_write: z.enum(CONFIG_KINDS).optional(),
   })
   .refine(
     (g) => [g.read, g.services, g.config_write].filter((kind) => kind !== undefined).length === 1,
@@ -57,7 +59,7 @@ const schema = z
     }
     for (const list of ['grants', 'denies'] as const) {
       policy[list].forEach(({ caller }, i) => {
-        if (!(caller in policy.callers)) ctx.addIssue({ code: 'custom', path: [list, i, 'caller'], message: `Caller "${caller}" is not declared under callers` });
+        if (!Object.hasOwn(policy.callers, caller)) ctx.addIssue({ code: 'custom', path: [list, i, 'caller'], message: `Caller "${caller}" is not declared under callers` });
       });
     }
   });

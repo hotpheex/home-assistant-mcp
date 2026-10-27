@@ -13,7 +13,7 @@ import type { Log } from './log.ts';
 const MINIMUM_HA = [2026, 10] as const;
 /** The client has no timeout, so a half-open connection would hang every send; a ping unanswered for a whole beat drops it. */
 const HEARTBEAT_MS = 30_000;
-/** The release of the pinned-stable HA in ci.yml, kept in step by a startup test; a newer release warns but serves. */
+/** The pinned-stable HA release in ci.yml; a startup test keeps the two in step. */
 const TESTED_HA = [2026, 10] as const;
 
 /** Read Operations, and a service call's lookups, may send only these read-only commands. */
@@ -55,11 +55,13 @@ export class HaUnavailable extends Error {
 }
 /** The connection dropped after a write was sent, so it may or may not have run. */
 export class OutcomeUnknown extends Error {}
+/** A request still unanswered a whole beat after the heartbeat saw it. */
+class Abandoned extends Error {}
 
 /** The client rejects with a bare 3 when nothing was sent, and with a whole envelope coded 3 when the result never came. */
 function failureOf(e: unknown, write: boolean): unknown {
   if (e === ERR_CONNECTION_LOST) return new HaUnavailable();
-  const lost = typeof e === 'object' && e !== null && 'error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST;
+  const lost = e instanceof Abandoned || (typeof e === 'object' && e !== null && 'error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST);
   if (lost) return write ? new OutcomeUnknown() : new HaUnavailable(true);
   return e;
 }
@@ -68,7 +70,6 @@ export interface Gate {
   send(allowed: Allowed, command: Command): Promise<unknown>;
   /** Every needed tier is connected and checked. */
   ready(): boolean;
-  /** Resolves the first time the gate is ready. */
   connected: Promise<void>;
   /** Answers with HA's status and JSON body, leaving their meaning to the caller. */
   rest(allowed: Allowed, request: RestRequest): Promise<{ status: number; body: unknown }>;
@@ -91,10 +92,7 @@ function issuedOnly(allowed: Allowed) {
   if (!isIssued(allowed)) throw new Error('the gate sends only an Allowed the evaluator issued');
 }
 
-/**
- * The only code that reaches HA. It holds one connection per needed tier, plus REST for config, and exits the server
- * (through `fatal`) on a rejected token, an HA below the minimum, or an admin behind the users tier.
- */
+/** The only code that reaches HA: one connection per needed tier, plus REST for config; `fatal` exits the server. */
 export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Log, fatal: (reason: string) => void): Gate {
   const connections = new Map<Tier, Connection>();
   const opened = new Set<Connection>();
@@ -152,8 +150,19 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
   for (const [tier, token] of tokens) void connect(tier, token);
 
   const unanswered = new Set<Connection>();
-  /** REST in flight, marked once a beat has seen it, so one unanswered at the next beat is aborted: a 30–60 s timeout. */
+  /** Requests in flight, marked once a beat has seen them, so one unanswered at the next beat is abandoned: a 30–60 s timeout. */
   const requests = new Map<AbortController, boolean>();
+  /** HA answers a script called directly only when the script ends, and a connection that still answers pings is never dropped. */
+  async function timed<T>(request: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const abort = new AbortController();
+    requests.set(abort, false);
+    try {
+      return await request(abort.signal);
+    } finally {
+      requests.delete(abort);
+    }
+  }
+  const abandoned = (signal: AbortSignal) => new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(new Abandoned())));
   const heartbeat = setInterval(() => {
     for (const [request, seen] of requests) {
       if (seen) request.abort();
@@ -181,7 +190,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       const conn = connections.get(allowed.tier);
       if (!conn?.connected) throw new HaUnavailable();
       try {
-        return await conn.sendMessagePromise({ ...command });
+        return await timed((signal) => Promise.race([conn.sendMessagePromise({ ...command }), abandoned(signal)]));
       } catch (e) {
         throw failureOf(e, write);
       }
@@ -194,24 +203,20 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       const lookup = allowed.operation === 'config_read' && request.method === 'GET' && CONFIG_PATH.test(request.path);
       if (!write && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
       if (!connections.get(allowed.tier)?.connected) throw new HaUnavailable();
-      const abort = new AbortController();
-      requests.set(abort, false);
-      let res: Response, text: string;
       try {
-        res = await fetch(`${url}${request.path}`, {
-          method: request.method,
-          headers: { authorization: `Bearer ${tokens.get(allowed.tier)}`, 'content-type': 'application/json' },
-          ...(request.body !== undefined && { body: JSON.stringify(request.body) }),
-          signal: abort.signal,
+        return await timed(async (signal) => {
+          const res = await fetch(`${url}${request.path}`, {
+            method: request.method,
+            headers: { authorization: `Bearer ${tokens.get(allowed.tier)}`, 'content-type': 'application/json' },
+            ...(request.body !== undefined && { body: JSON.stringify(request.body) }),
+            signal,
+          });
+          return { status: res.status, body: jsonOf(await res.text()) };
         });
-        text = await res.text();
       } catch {
         // fetch cannot tell a refused connection from one dropped or abandoned mid-request, so a write errs towards unknown.
         throw write ? new OutcomeUnknown() : new HaUnavailable(true);
-      } finally {
-        requests.delete(abort);
       }
-      return { status: res.status, body: jsonOf(text) };
     },
     close() {
       closed = true;

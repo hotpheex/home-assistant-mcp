@@ -28,7 +28,6 @@ export interface ServiceDescription {
 }
 /** A device, area, label or floor registry entry, served as given. */
 export type FakeEntry = Record<string, unknown>;
-/** A recorded state change, served by history. */
 export interface FakeChange {
   entity_id: string;
   state: string;
@@ -192,6 +191,7 @@ export async function startFakeHa(options: FakeHaOptions) {
   const received: Received[] = [];
   let contexts = 0;
   const drop = new Set<string>();
+  const stall = new Set<string>();
   let down = false;
   let hung = false;
   let refused = 0;
@@ -364,6 +364,7 @@ export async function startFakeHa(options: FakeHaOptions) {
       lastId = id;
       if (hung) return;
       if (drop.has(msg.type)) return ws.terminate();
+      if (stall.has(msg.type)) return;
       if (msg.type === 'ping') return send({ id, type: 'pong' });
       const handler = handlers[msg.type];
       if (!handler) {
@@ -387,6 +388,8 @@ export async function startFakeHa(options: FakeHaOptions) {
     helpers,
     /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
     drop,
+    /** Command types recorded and never answered while pings still are, as HA does with a script called directly until it ends. */
+    stall,
     /** Drops every connection and refuses new ones, until the client has seen the outage by trying to reconnect. */
     async outage() {
       down = true;
@@ -417,4 +420,3 @@ export async function startFakeHa(options: FakeHaOptions) {
   };
 }
 
-export type FakeHa = Awaited<ReturnType<typeof startFakeHa>>;

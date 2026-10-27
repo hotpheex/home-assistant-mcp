@@ -5,7 +5,7 @@ export type Tier = 'users' | 'admin';
 export type Operation = 'plain_read' | 'config_read' | 'service_call' | 'config_write';
 export type ReadKind = 'plain_read' | 'config_read';
 
-/** Fixed in code: nothing runs at admin unless its Operation's tier is admin. */
+/** In code, not Policy, so no Grant can move an Operation onto the admin token. */
 export const OPERATION_TIER = {
   plain_read: 'users',
   config_read: 'admin',
@@ -52,10 +52,11 @@ export function operationsOf(grant: Grant): Operation[] {
   return ['config_write', 'config_read', 'plain_read'];
 }
 
-/** The indices of the Caller's Grants that give `operation`; empty means the Caller lacks it. */
-export function grantsFor(policy: Policy, caller: string, operation: Operation): number[] {
-  return policy.grants.flatMap((g, i) => (g.caller === caller && operationsOf(g).includes(operation) ? [i] : []));
-}
+const indicesOf = <T>(list: readonly T[], match: (item: T) => boolean) => list.flatMap((item, i) => (match(item) ? [i] : []));
+
+/** The indices of the Caller's Grants that give `operation`. */
+export const grantsFor = (policy: Policy, caller: string, operation: Operation) =>
+  indicesOf(policy.grants, (g) => g.caller === caller && operationsOf(g).includes(operation));
 
 export function neededTiers(policy: Policy): Set<Tier> {
   return new Set(policy.grants.flatMap((g) => operationsOf(g).map((op) => OPERATION_TIER[op])));
@@ -63,12 +64,11 @@ export function neededTiers(policy: Policy): Set<Tier> {
 
 export type ReadDecision = { allowed: Allowed; grants: number[] } | { allowed: undefined; grants: [] };
 
+const readOf = (grants: number[], kind: ReadKind): ReadDecision =>
+  grants.length === 0 ? { allowed: undefined, grants: [] } : { allowed: issue({ operation: kind, tier: OPERATION_TIER[kind] }), grants };
+
 /** A read is decided by the Caller and the read kind alone. */
-export function decideRead(policy: Policy, caller: string, kind: ReadKind): ReadDecision {
-  const grants = grantsFor(policy, caller, kind);
-  if (grants.length === 0) return { allowed: undefined, grants: [] };
-  return { allowed: issue({ operation: kind, tier: OPERATION_TIER[kind] }), grants };
-}
+export const decideRead = (policy: Policy, caller: string, kind: ReadKind) => readOf(grantsFor(policy, caller, kind), kind);
 
 /** Resolving Policy names, for `check` and startup warnings, may send only plain read's read-only commands, at its tier. */
 export const NAME_LOOKUP = issue({ operation: 'plain_read', tier: OPERATION_TIER.plain_read });
@@ -80,23 +80,17 @@ export const isDelegating = (service: string) => service.startsWith('homeassista
 const names = (pattern: string, service: string, deny: boolean) =>
   pattern === service || (pattern.endsWith('.*') && service.startsWith(pattern.slice(0, -1)) && (deny || !isDelegating(service)));
 
-const indicesOf = <T>(list: readonly T[], match: (item: T) => boolean) => list.flatMap((item, i) => (match(item) ? [i] : []));
-
 export interface Selectors {
   area_id: string[];
   label_id: string[];
 }
 
-const selectorsOf = (rules: readonly { targets?: { area?: string; label?: string }[] }[]): Selectors => {
+export const selectorsOf = (rules: readonly { targets?: { area?: string; label?: string }[] }[]): Selectors => {
   const targets = rules.flatMap((r) => r.targets ?? []);
-  return {
-    area_id: [...new Set(targets.flatMap((t) => (t.area === undefined ? [] : [t.area])))],
-    label_id: [...new Set(targets.flatMap((t) => (t.label === undefined ? [] : [t.label])))],
-  };
+  return { area_id: [...new Set(targets.flatMap((t) => t.area ?? []))], label_id: [...new Set(targets.flatMap((t) => t.label ?? []))] };
 };
 
 export interface ServicePlan {
-  service: string;
   /** Indices of the Caller's Grants and Denies that name the service. */
   grants: number[];
   denies: number[];
@@ -115,7 +109,6 @@ export function planServiceCall(policy: Policy, caller: string, service: string)
   if (grants.length === 0 || withheld.length > 0) return { plan: undefined, denies: withheld };
   return {
     plan: {
-      service,
       grants,
       denies,
       grantSelectors: selectorsOf(grants.map((i) => policy.grants[i]!)),
@@ -140,7 +133,7 @@ export interface Expansion {
   denyEntities: readonly string[];
 }
 
-export interface ServiceCall {
+interface ServiceCall {
   domain: string;
   service: string;
   data: Record<string, unknown>;
@@ -186,23 +179,17 @@ export function decideServiceCall(policy: Policy, plan: ServicePlan, expansion: 
 }
 
 export type ConfigKind = NonNullable<Grant['config_write']>;
-/** What a `helper` config write covers: input_*, counter, timer and schedule. */
 export const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'] as const;
 
 export const configPath = (kind: ConfigKind, id: string) => `/api/config/${kind}/config/${encodeURIComponent(id)}`;
 /** A helper's config id is unique only within its domain, so the server names it `<domain>.<id>`. */
 export const splitHelperId = (id: string) => [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)] as const;
 
-const writersOf = (policy: Policy, caller: string, kind: ConfigKind) =>
-  policy.grants.flatMap((g, i) => (g.caller === caller && g.config_write === kind ? [i] : []));
+const writersOf = (policy: Policy, caller: string, kind: ConfigKind) => indicesOf(policy.grants, (g) => g.caller === caller && g.config_write === kind);
 
 /** Automation and script config is config read; scene and helper config only a config write of that kind gives. */
-export function decideConfigRead(policy: Policy, caller: string, kind: ConfigKind): ReadDecision {
-  if (kind === 'automation' || kind === 'script') return decideRead(policy, caller, 'config_read');
-  const grants = writersOf(policy, caller, kind);
-  if (grants.length === 0) return { allowed: undefined, grants: [] };
-  return { allowed: issue({ operation: 'config_read', tier: OPERATION_TIER.config_read }), grants };
-}
+export const decideConfigRead = (policy: Policy, caller: string, kind: ConfigKind) =>
+  readOf(kind === 'automation' || kind === 'script' ? grantsFor(policy, caller, 'config_read') : writersOf(policy, caller, kind), 'config_read');
 
 export interface ConfigWrite {
   kind: ConfigKind;

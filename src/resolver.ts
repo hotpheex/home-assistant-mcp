@@ -1,4 +1,4 @@
-import { isDelegating, TARGET_KEYS } from './evaluator.ts';
+import { isDelegating, selectorsOf, TARGET_KEYS } from './evaluator.ts';
 import type { Command } from './gate.ts';
 import type { Policy } from './policy.ts';
 
@@ -19,7 +19,7 @@ export function mergeTarget(target: Record<string, unknown> = {}, data: Record<s
 }
 
 /**
- * The domains a service's declared `target.entity` filter admits, or undefined when it admits any (ADR 0008 amendment).
+ * The domains a service's declared `target.entity` filter admits, or undefined when it admits any.
  * HA acts only on these, so the resolver leaves the rest of an expansion out; a filter entry without a domain admits any.
  */
 export function domainsOf(target: unknown): Set<string> | undefined {
@@ -59,8 +59,7 @@ export async function unknownNames(policy: Policy, send: Send): Promise<string[]
   const rules = [...policy.grants.map((r, i) => [`grants.${i}`, r] as const), ...policy.denies.map((r, i) => [`denies.${i}`, r] as const)];
   if (!rules.some(([, r]) => r.services)) return [];
   const targets = rules.flatMap(([, r]) => r.targets ?? []);
-  const areas = [...new Set(targets.flatMap((t) => t.area ?? []))];
-  const labels = [...new Set(targets.flatMap((t) => t.label ?? []))];
+  const selectors = selectorsOf(rules.map(([, r]) => r));
   const services = (await send({ type: 'get_services' })) as Record<string, Record<string, unknown>>;
   const domains = new Set(Object.keys(services));
   if (targets.some((t) => t.domain !== undefined && t.domain !== '*' && !domains.has(t.domain))) {
@@ -68,9 +67,9 @@ export async function unknownNames(policy: Policy, send: Send): Promise<string[]
   }
   type Missing = Record<'missing_areas' | 'missing_labels', string[]>;
   const missing: Missing =
-    areas.length + labels.length === 0
+    selectors.area_id.length + selectors.label_id.length === 0
       ? { missing_areas: [], missing_labels: [] }
-      : ((await send({ type: 'extract_from_target', target: { area_id: areas, label_id: labels }, expand_group: false })) as Missing);
+      : ((await send({ type: 'extract_from_target', target: selectors, expand_group: false })) as Missing);
 
   return rules.flatMap(([path, rule]) => [
     ...(rule.services ?? []).flatMap((s, j) => {
