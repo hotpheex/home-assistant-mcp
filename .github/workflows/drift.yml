@@ -1,0 +1,42 @@
+name: drift
+
+# Floating HA tags weekly, so a change in HA shows up in its beta week. Advisory: no release waits on this.
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        ha: [stable, beta]
+    permissions:
+      contents: read
+    uses: ./.github/workflows/e2e.yml
+    with:
+      ha: ${{ matrix.ha }}
+
+  report:
+    needs: e2e
+    if: failure()
+    runs-on: ubuntu-24.04
+    permissions:
+      issues: write
+    steps:
+      - name: Open an issue, or comment on the one still open
+        run: |
+          title='Real-HA e2e fails against floating stable or beta'
+          body="The weekly drift run failed: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          open=$(gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number')
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}

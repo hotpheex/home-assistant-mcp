@@ -1,0 +1,9 @@
+{
+  "domain": "hamcp_house",
+  "name": "HAMCP e2e house",
+  "codeowners": [],
+  "documentation": "https://github.com/hotpheex/home-assistant-mcp",
+  "iot_class": "calculated",
+  "single_config_entry": true,
+  "version": "1.0.0"
+}
