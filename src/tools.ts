@@ -158,8 +158,9 @@ function writeResult(value: unknown): CallToolResult {
   return { content: [{ type: 'text', text: kept + marker }] };
 }
 
-const plainRead = <T>(ctx: Context, command: Command) => send<T>(ctx, ctx.allowed, command);
-const configRead = async <T>(ctx: Context, command: Command) => maskSecrets(await send(ctx, ctx.allowed, command)) as T;
+/** Every read masks secrets, so Redaction means one thing on every read; a write's lookup uses `send`, unmasked, to merge. */
+const plainRead = async <T>(ctx: Context, command: Command) => maskSecrets(await send(ctx, ctx.allowed, command)) as T;
+const configRead = plainRead;
 
 /** Sends a config REST request; HA's error statuses become failures, except a 404 on GET, which means no such item. */
 async function rest(ctx: Context, allowed: Allowed | undefined, request: RestRequest): Promise<unknown> {
@@ -222,7 +223,7 @@ const getStates = defineTool({
     'Lists the current state of Home Assistant entities, sorted by entity_id, with each entity_id, friendly name and state.',
     'Filter by `domain` (such as `light`), by exact `state` (such as `on`), and by `query`, a case-insensitive substring of the entity_id, friendly name, aliases, or area and label names.',
     'Filter by `area` or `label` id to get what a Home Assistant service call targeting that area or label acts on.',
-    'Attributes are left out unless `full` is true; bearer tokens in camera, image and media_player attributes are always removed.',
+    'Attributes are left out unless `full` is true; bearer tokens in camera, image and media_player attributes are always removed, and secret-looking values come back as **REDACTED**, best-effort.',
     PAGED,
     'Example: {"domain": "light", "query": "kitchen", "state": "on"} lists the kitchen lights that are on.',
   ].join(' '),
