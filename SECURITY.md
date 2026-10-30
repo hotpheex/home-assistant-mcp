@@ -23,7 +23,7 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 | Grant | Tools | Gives |
 |---|---|---|
 | `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services` | States, history, logbook, registries and the service list of the **whole house**, at the users tier. |
-| `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read. |
+| `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
 

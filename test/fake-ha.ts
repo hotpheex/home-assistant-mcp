@@ -17,6 +17,9 @@ export interface FakeEntity {
   hidden_by?: string | null;
   disabled_by?: string | null;
   entity_category?: 'config' | 'diagnostic' | null;
+  platform?: string;
+  /** An automation's config id, or a script's object id. */
+  unique_id?: string;
   /** Served only by get_entries, as in HA. */
   aliases?: string[];
 }
@@ -108,7 +111,7 @@ const haError = (code: string, message: string): never => {
 };
 
 type Target = Partial<Record<'entity_id' | 'device_id' | 'area_id' | 'floor_id' | 'label_id', string | string[]>>;
-type Entity = Required<Omit<FakeEntity, 'name' | 'aliases'>>;
+type Entity = Required<Omit<FakeEntity, 'name' | 'aliases' | 'platform' | 'unique_id'>>;
 type Device = { id: string; area_id: string | null; labels: string[]; parent_device_id: string | null };
 /** The registry fields `extract_from_target` reads, with HA's defaults filled in. */
 export type Registry = {
@@ -269,10 +272,18 @@ export async function startFakeHa(options: FakeHaOptions) {
     'config/area_registry/list': () => options.areas ?? [],
     'config/label_registry/list': () => options.labels ?? [],
     'config/floor_registry/list': () => options.floors ?? [],
+    // HA leads with the state each entity already had at the window start, stamped with the start time.
     'history/history_during_period': (_, msg) => {
       const out: Record<string, { s: string; lu: number }[]> = {};
-      for (const c of options.history ?? []) {
-        if ((msg.entity_ids as string[]).includes(c.entity_id) && inWindow(c.when, msg)) (out[c.entity_id] ??= []).push({ s: c.state, lu: seconds(c.when) });
+      const start = Date.parse(msg.start_time as string);
+      for (const id of msg.entity_ids as string[]) {
+        const changes = (options.history ?? []).filter((c) => c.entity_id === id);
+        const before = changes.filter((c) => Date.parse(c.when) <= start).at(-1);
+        const rows = [
+          ...(before ? [{ s: before.state, lu: start / 1000 }] : []),
+          ...changes.filter((c) => Date.parse(c.when) > start && inWindow(c.when, msg)).map((c) => ({ s: c.state, lu: seconds(c.when) })),
+        ];
+        if (rows.length > 0) out[id] = rows;
       }
       return out;
     },

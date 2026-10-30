@@ -92,9 +92,12 @@ const window = {
   start: z.iso.datetime({ offset: true }).optional().describe('ISO 8601 start time.'),
   end: z.iso.datetime({ offset: true }).optional().describe('ISO 8601 end time; defaults to now.'),
 };
+/** A backwards window is refused before anything is sent: HA answers it with a made-up row or nothing. */
 function windowOf(args: { start?: string; end?: string }, hours: number) {
   const end = args.end ?? new Date().toISOString();
-  return { start: args.start ?? new Date(Date.parse(end) - hours * 3_600_000).toISOString(), end };
+  const start = args.start ?? new Date(Date.parse(end) - hours * 3_600_000).toISOString();
+  if (Date.parse(start) > Date.parse(end)) throw new ToolFailure(`Input validation error: start ${start} is after end ${end}.`);
+  return { start, end };
 }
 /** HA sends times as float seconds. */
 const isoOf = (seconds: number) => new Date(Math.round(seconds * 1000)).toISOString();
@@ -265,25 +268,53 @@ const getStates = defineTool({
   },
 });
 
-/** One entity's changes in a window: numeric states get min, max and mean, others a count per state. */
-function summarise(entity_id: string, states: string[]) {
-  const summary = { entity_id, changes: states.length, first: states[0], last: states.at(-1) };
-  const numbers = states.filter((s) => s.trim() !== '').map(Number).filter(Number.isFinite);
+/** HA keeps the history of a deleted or renamed entity, so a named entity_id that is not current is noted, not refused. */
+async function notCurrent(ctx: Context, entityIds: string[]) {
+  const current = new Set((await plainRead<HaState[]>(ctx, { type: 'get_states' })).map((s) => s.entity_id));
+  const missing = entityIds.filter((id) => !current.has(id));
+  return missing.length > 0 ? { not_current_entity_ids: missing } : {};
+}
+
+type HistoryRow = { s: string; lu: number; lc?: number };
+
+/**
+ * One entity's window: HA's first row is the state at the start when stamped with the start time, so it is not a change.
+ * The numeric mean weights each value by how long it held, leaving out unknown, unavailable and other non-numeric stretches.
+ */
+function summarise(entity_id: string, rows: HistoryRow[], start: string, end: string) {
+  const [from, to] = [Date.parse(start), Date.parse(end)];
+  const atStart = rows[0] !== undefined && Math.round(rows[0].lu * 1000) === from;
+  const summary = { entity_id, changes: rows.length - (atStart ? 1 : 0), first: rows[0]?.s, last: rows.at(-1)?.s };
+  const at = (row: HistoryRow) => Math.max(from, Math.round((row.lc ?? row.lu) * 1000));
+  const numbers: number[] = [];
+  let [weighted, held, skipped] = [0, 0, 0];
+  for (const [i, row] of rows.entries()) {
+    const value = row.s.trim() === '' ? NaN : Number(row.s);
+    if (!Number.isFinite(value)) {
+      skipped += 1;
+      continue;
+    }
+    const next = rows[i + 1];
+    const span = (next ? at(next) : to) - at(row);
+    numbers.push(value);
+    weighted += value * span;
+    held += span;
+  }
   if (numbers.length > 0) {
-    const sum = numbers.reduce((a, b) => a + b, 0);
-    return { ...summary, min: numbers.reduce((a, b) => Math.min(a, b)), max: numbers.reduce((a, b) => Math.max(a, b)), mean: sum / numbers.length };
+    const mean = held > 0 ? weighted / held : numbers.reduce((a, b) => a + b, 0) / numbers.length;
+    return { ...summary, min: numbers.reduce((a, b) => Math.min(a, b)), max: numbers.reduce((a, b) => Math.max(a, b)), mean, skipped };
   }
   const counts: Record<string, number> = {};
-  for (const s of states) counts[s] = (counts[s] ?? 0) + 1;
+  for (const row of rows) counts[row.s] = (counts[row.s] ?? 0) + 1;
   return { ...summary, states: counts };
 }
 
 const getHistory = defineTool({
   title: 'Get entity history',
   description: [
-    'Lists the state changes of the given entities over a time window, one row per change with its entity_id, state and last_changed time, sorted by entity_id and then time.',
-    'The window defaults to the last 24 hours; `start` and `end` take ISO 8601 times.',
-    'With `summary` it returns one entry per entity instead: the number of changes, the first and last state, and either the minimum, maximum and mean of numeric states or a count of each state.',
+    'Lists the state changes of the given entities over a time window, one row per change with its entity_id, state and last_changed time, sorted by entity_id and then time; each entity\'s first row is the state it already had at the window start, stamped with the start time.',
+    'The window defaults to the last 24 hours; `start` and `end` take ISO 8601 times, and a `start` after `end` is refused; a named entity_id that is not a current entity is still read, because HA keeps the history of deleted and renamed entities, and is listed in `not_current_entity_ids`.',
+    'With `summary` it returns one entry per entity instead: the number of changes after the window start, the state at the window start and the last state, and either the minimum, maximum and time-weighted mean of numeric states, with `skipped` counting the unknown, unavailable and other non-numeric states left out, or a count of each state.',
     'Attributes are not returned.',
     PAGED,
     'Example: {"entity_ids": ["sensor.kitchen_temperature"], "summary": true} summarises the kitchen temperature over the last day.',
@@ -297,18 +328,21 @@ const getHistory = defineTool({
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run(args, ctx) {
     const { start, end } = windowOf(args, 24);
-    const changes = await plainRead<Record<string, { s: string; lu: number; lc?: number }[]>>(ctx, {
-      type: 'history/history_during_period',
-      start_time: start,
-      end_time: end,
-      entity_ids: args.entity_ids,
-      no_attributes: true,
-    });
+    const [changes, missing] = await Promise.all([
+      plainRead<Record<string, HistoryRow[]>>(ctx, {
+        type: 'history/history_during_period',
+        start_time: start,
+        end_time: end,
+        entity_ids: args.entity_ids,
+        no_attributes: true,
+      }),
+      notCurrent(ctx, args.entity_ids),
+    ]);
     const ids = Object.keys(changes).sort();
     const entries = args.summary
-      ? ids.map((id) => summarise(id, changes[id]!.map((c) => c.s)))
+      ? ids.map((id) => summarise(id, changes[id]!, start, end))
       : ids.flatMap((id) => changes[id]!.map((c) => ({ entity_id: id, state: c.s, last_changed: isoOf(c.lc ?? c.lu) })));
-    return text({ start, end, ...pageOf('history', entries, args) });
+    return text({ start, end, ...missing, ...pageOf('history', entries, args) });
   },
 });
 
@@ -317,6 +351,7 @@ const getLogbook = defineTool({
   description: [
     'Lists Home Assistant logbook entries over a time window, oldest first: what changed or happened, when, and the context that caused it.',
     'The window defaults to the last hour; `start` and `end` take ISO 8601 times, and `entity_id` keeps only one entity\'s entries.',
+    'A `start` after `end` is refused; an `entity_id` that is not a current entity is still read, because HA keeps the logbook of deleted and renamed entities, and is listed in `not_current_entity_ids`.',
     PAGED,
     'Example: {"entity_id": "lock.front_door", "start": "2026-10-26T06:00:00Z"} shows the front door lock since 6 am UTC.',
   ].join(' '),
@@ -328,13 +363,16 @@ const getLogbook = defineTool({
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run(args, ctx) {
     const { start, end } = windowOf(args, 1);
-    const entries = await plainRead<{ when: number }[]>(ctx, {
-      type: 'logbook/get_events',
-      start_time: start,
-      end_time: end,
-      ...(args.entity_id !== undefined && { entity_ids: [args.entity_id] }),
-    });
-    return text({ start, end, ...pageOf('entries', entries.map((e) => ({ ...e, when: isoOf(e.when) })), args) });
+    const [entries, missing] = await Promise.all([
+      plainRead<{ when: number }[]>(ctx, {
+        type: 'logbook/get_events',
+        start_time: start,
+        end_time: end,
+        ...(args.entity_id !== undefined && { entity_ids: [args.entity_id] }),
+      }),
+      args.entity_id === undefined ? {} : notCurrent(ctx, [args.entity_id]),
+    ]);
+    return text({ start, end, ...missing, ...pageOf('entries', entries.map((e) => ({ ...e, when: isoOf(e.when) })), args) });
   },
 });
 
@@ -418,11 +456,22 @@ const getConfig = defineTool({
 
 type TraceSummary = { timestamp: { start: string } };
 
+/**
+ * Refuses a trace call whose id names no automation or script, so a wrong id is not read as no runs.
+ * The registry's unique_id is the config id or object id, YAML automations included; only the outcome is returned.
+ */
+async function assertItemExists(ctx: Context, kind: string, id: string) {
+  const entities = await send<{ platform: string; unique_id: string }[]>(ctx, ctx.allowed, { type: 'config/entity_registry/list' });
+  if (entities.some((e) => e.platform === kind && e.unique_id === id)) return;
+  throw new ToolFailure(`No ${kind} has the id ${id}. Name it by an automation's config id or a script's object id (the part after script.), not by its entity_id.`);
+}
+
 const listTraces = defineTool({
   title: 'List traces',
   description: [
     'Lists the stored runs of one automation or script, newest first, as summaries: run_id, start and finish time, state, last step, what triggered it and any error.',
     'Name the item by `kind` (automation or script) and `id`: an automation\'s config `id` from its config, or a script\'s object id, the part of its entity_id after `script.`.',
+    'An id that names no automation or script is refused; one with no stored runs returns an empty list.',
     'Secret-looking values come back as **REDACTED**, best-effort.',
     PAGED,
     'Example: {"kind": "script", "id": "morning"} lists the runs of script.morning.',
@@ -432,6 +481,7 @@ const listTraces = defineTool({
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run({ kind, id, ...paging }, ctx) {
     const traces = await configRead<TraceSummary[]>(ctx, { type: 'trace/list', domain: kind, item_id: id });
+    if (traces.length === 0) await assertItemExists(ctx, kind, id);
     return text(pageOf('traces', traces.sort((a, b) => Date.parse(b.timestamp.start) - Date.parse(a.timestamp.start)), paging));
   },
 });
@@ -456,7 +506,10 @@ const getTrace = defineTool({
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run({ kind, id, run_id, sections }, ctx) {
-    const trace = await configRead<Record<string, unknown>>(ctx, { type: 'trace/get', domain: kind, item_id: id, run_id });
+    const trace = await configRead<Record<string, unknown>>(ctx, { type: 'trace/get', domain: kind, item_id: id, run_id }).catch(async (e: unknown) => {
+      if (e instanceof ToolFailure) await assertItemExists(ctx, kind, id);
+      throw e;
+    });
     const left = TRACE_SECTIONS.filter((s) => !sections.includes(s)) as string[];
     return text(Object.fromEntries(Object.entries(trace).filter(([key]) => !left.includes(key))));
   },
