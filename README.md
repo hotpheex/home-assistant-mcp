@@ -8,6 +8,7 @@ Home Assistant tokens carry no scope: any token can do anything its user can. Th
 - **HA decides what a target means.** For each service call the server asks HA which entities the target covers, exactly as HA would run it, and checks every one.
 - **Least privilege towards HA.** Reads and service calls use a non-admin HA user; only config reads and writes use an admin token.
 - **Audited.** Every refusal is logged as a JSON line, and allowed calls can be too.
+- **Redacted.** Every read masks values under secret-looking keys, URL credentials and `Bearer` tokens as `**REDACTED**`, and strips camera, image and media_player bearer tokens. This is best-effort: see [SECURITY.md](SECURITY.md).
 
 Requires Home Assistant 2026.10 or newer.
 
