@@ -99,8 +99,22 @@ function windowOf(args: { start?: string; end?: string }, hours: number) {
 /** HA sends times as float seconds. */
 const isoOf = (seconds: number) => new Date(Math.round(seconds * 1000)).toISOString();
 
-/** About 80 kB keeps a result under Claude Code's default MCP output limit. */
-const BYTE_CAP = 80_000;
+/**
+ * Claude Code saves a text result over 50,000 characters to a file and shows only a preview, so the cap
+ * sits below that, counted as Claude Code counts: string length, not bytes.
+ */
+const CHAR_CAP = 48_000;
+/** Each read tool's size refusal names only the narrowing that tool offers. */
+const NARROWING: Partial<Record<ToolName, string>> = {
+  ha_get_states: 'the domain, state, query, area or label filters, `full` off, or a smaller limit',
+  ha_get_history: 'fewer entity_ids, a shorter window, `summary` or a smaller limit',
+  ha_get_logbook: 'an entity_id, a shorter window or a smaller limit',
+  ha_get_registry: 'a query or a smaller limit',
+  ha_list_services: 'a domain or a smaller limit',
+  ha_list_traces: 'a smaller limit',
+  ha_get_trace: 'fewer sections',
+};
+const charsOf = (result: CallToolResult) => result.content.reduce((n, c) => n + (c.type === 'text' ? c.text.length : 0), 0);
 const READS: ReadonlySet<Operation> = new Set(['plain_read', 'config_read']);
 
 const text = (value: unknown): CallToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
@@ -137,10 +151,10 @@ async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Comm
 
 /** A write has already run, so an oversize response is cut with a visible marker rather than refused. */
 function writeResult(value: unknown): CallToolResult {
-  const full = Buffer.from(JSON.stringify(value));
-  if (full.length <= BYTE_CAP) return text(value);
-  const marker = `\n[truncated: the response was ${full.length} bytes, over the ${BYTE_CAP}-byte cap; the call ran]`;
-  const kept = full.subarray(0, BYTE_CAP - Buffer.byteLength(marker)).toString().replace(/\uFFFD$/, '');
+  const full = JSON.stringify(value);
+  if (full.length <= CHAR_CAP) return text(value);
+  const marker = `\n[truncated: the response was ${full.length} characters, over the ${CHAR_CAP}-character cap; the call ran]`;
+  const kept = full.slice(0, CHAR_CAP - marker.length).replace(/[\uD800-\uDBFF]$/, '');
   return { content: [{ type: 'text', text: kept + marker }] };
 }
 
@@ -690,8 +704,10 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
     try {
       const result = await tool.run(args.data, { ...decided, policy, auth, gate, audit: audited, options });
       // A read is refused whole rather than cut off, so the Caller never reasons over a truncated answer.
-      if (READS.has(operation) && Buffer.byteLength(JSON.stringify(result.content)) > BYTE_CAP) {
-        return failure(`The response is over ${BYTE_CAP / 1000} kB, so nothing was returned: narrow the query with filters, a shorter window or a smaller limit.`);
+      if (READS.has(operation) && charsOf(result) > CHAR_CAP) {
+        const narrowing = NARROWING[name];
+        const over = `The response is over ${CHAR_CAP} characters, so nothing was returned`;
+        return failure(narrowing === undefined ? `${over}, and this tool offers no narrower query.` : `${over}: narrow the query with ${narrowing}.`);
       }
       return server.projectCallToolResult(result, undefined);
     } catch (e) {
