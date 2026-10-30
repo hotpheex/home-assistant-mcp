@@ -596,9 +596,14 @@ const writeConfig = defineTool({
       ctx.audit({ kind, action, id, decision: 'deny', reason: 'config carries a redacted value' });
       throw new ToolFailure(`config carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
     }
-    if (kind !== 'helper' && action !== 'delete') {
+    // A new helper takes its id from its name, so only a helper update has a stored item to look up.
+    if (action === 'update' || (kind !== 'helper' && action === 'create')) {
       const lookup = decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed;
-      const stored = (await rest(ctx, lookup, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
+      const [domain, item] = splitHelperId(id);
+      const stored =
+        kind === 'helper'
+          ? (await send<Record<string, unknown>[]>(ctx, lookup, { type: `${domain}/list` })).find((h) => h.id === item)
+          : ((await rest(ctx, lookup, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined);
       if (action === 'create' && stored) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
       if (action === 'update' && !stored) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
       if (stored) allowed = mergedUpdate(allowed, stored);

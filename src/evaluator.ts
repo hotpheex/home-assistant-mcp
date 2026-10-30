@@ -217,9 +217,15 @@ export function decideConfigWrite(policy: Policy, caller: string, write: ConfigW
   return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: writeOf(write) }), grants };
 }
 
-/** HA's config REST replaces a whole entry, so an allowed update's POST is reissued over the stored config it changes. */
+/** HA replaces a whole entry on update, so an allowed update is reissued over the stored config it changes; a helper's update schema takes no `id`. */
 export function mergedUpdate(allowed: Allowed, stored: Record<string, unknown>): Allowed & { write: Write } {
   const { write } = allowed;
-  if (!isIssued(allowed) || write?.via !== 'rest' || write.request.method !== 'POST') throw new Error('only an issued config POST merges');
-  return issue({ ...allowed, write: { via: 'rest', request: { ...write.request, body: { ...stored, ...(write.request.body as object) } } } });
+  if (isIssued(allowed) && write?.via === 'rest' && write.request.method === 'POST') {
+    return issue({ ...allowed, write: { via: 'rest', request: { ...write.request, body: { ...stored, ...(write.request.body as object) } } } });
+  }
+  if (isIssued(allowed) && write?.via === 'websocket' && write.command.type.endsWith('/update')) {
+    const item = Object.fromEntries(Object.entries(stored).filter(([k]) => k !== 'id'));
+    return issue({ ...allowed, write: { via: 'websocket', command: { ...item, ...write.command } } });
+  }
+  throw new Error('only an issued config update merges');
 }

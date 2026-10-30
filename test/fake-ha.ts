@@ -64,6 +64,19 @@ export interface FakeHaOptions {
 }
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
+const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+/** Each helper's storage schema in HA 2026.10: its required keys and the defaults it fills. */
+const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<string, unknown> }> = {
+  input_boolean: { required: ['name'], defaults: {} },
+  input_number: { required: ['name', 'min', 'max'], defaults: { step: 1, mode: 'slider' } },
+  input_select: { required: ['name', 'options'], defaults: {} },
+  input_text: { required: ['name'], defaults: { min: 0, max: 100, mode: 'text' } },
+  input_datetime: { required: ['name'], defaults: { has_date: false, has_time: false } },
+  input_button: { required: ['name'], defaults: {} },
+  counter: { required: ['name'], defaults: { initial: 0, maximum: null, minimum: null, restore: true, step: 1 } },
+  timer: { required: ['name'], defaults: { duration: '0:00:00', restore: false } },
+  schedule: { required: ['name'], defaults: Object.fromEntries(DAYS.map((d) => [d, []])) },
+};
 /** HA validates the whole body of a config POST, so a partial one is refused. */
 const REQUIRED_KEYS: Record<string, string[]> = { automation: ['triggers', 'actions'], script: ['sequence'], scene: ['name', 'entities'] };
 
@@ -291,7 +304,17 @@ export async function startFakeHa(options: FakeHaOptions) {
       items().push(item);
       return item;
     });
-    handlers[`${domain}/update`] = adminOnly((_, msg) => Object.assign(find(msg), fieldsOf(msg)));
+    // HA validates an update against the full schema and replaces the item, keeping only its id.
+    handlers[`${domain}/update`] = adminOnly((_, msg) => {
+      const item = find(msg);
+      const fields = fieldsOf(msg);
+      const { required, defaults } = HELPER_SCHEMAS[domain]!;
+      const missing = required.find((k) => !(k in fields));
+      if (missing) haError('invalid_format', `required key not provided @ data['${missing}']. Got None`);
+      const replaced = { id: item.id, ...defaults, ...fields };
+      items().splice(items().indexOf(item), 1, replaced);
+      return replaced;
+    });
     handlers[`${domain}/delete`] = adminOnly((_, msg) => {
       items().splice(items().indexOf(find(msg)), 1);
       return null;

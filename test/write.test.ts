@@ -130,21 +130,34 @@ test('a config write of a kind the Caller does not hold is refused and audited, 
   assert.doesNotMatch(JSON.stringify(server.audits()), /Hall light|triggers/, 'audit lines carry names, never bodies');
 });
 
-test('helper writes go through the helper domain WebSocket commands, which merge updates themselves', async (t) => {
+test('helper writes go through the helper domain WebSocket commands; an update sends the stored helper with its keys merged over it', async (t) => {
   const { ha, as } = await house(t);
   const { call } = await as('helperer');
   const created = await call('ha_write_config', { kind: 'helper', action: 'create', id: 'input_boolean.guest_mode', config: { name: 'Guest mode' } });
   assert.deepEqual(created.sent, [{ type: 'input_boolean/create', name: 'Guest mode' }]);
   assert.deepEqual(body(created.result), { kind: 'helper', action: 'create', id: 'input_boolean.guest_mode', result: { id: 'guest_mode', name: 'Guest mode' } });
 
+  // HA replaces a helper on update, so a partial update would reset step and mode and drop the unit.
+  const thermostat = { name: 'Target temp', min: 10, max: 30, step: 0.5, mode: 'box', unit_of_measurement: '°C', icon: 'mdi:thermometer' };
+  await call('ha_write_config', { kind: 'helper', action: 'create', id: 'input_number.target_temp', config: thermostat });
+  const icon = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'input_number.target_temp', config: { icon: 'mdi:fire' } });
+  assert.deepEqual(icon.sent, [{ type: 'input_number/list' }, { type: 'input_number/update', ...thermostat, icon: 'mdi:fire', input_number_id: 'target_temp' }]);
+  assert.deepEqual(ha.helpers.input_number, [{ id: 'target_temp', ...thermostat, icon: 'mdi:fire' }]);
+
+  await call('ha_write_config', { kind: 'helper', action: 'create', id: 'timer.tea', config: { name: 'Tea', duration: '0:04:00', restore: true } });
+  await call('ha_write_config', { kind: 'helper', action: 'update', id: 'timer.tea', config: { name: 'Green tea' } });
+  assert.deepEqual(ha.helpers.timer, [{ id: 'tea', name: 'Green tea', duration: '0:04:00', restore: true }]);
+
   const updated = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'input_text.wifi_password', config: { initial: 'y' } });
-  assert.deepEqual(updated.sent, [{ type: 'input_text/update', initial: 'y', input_text_id: 'wifi_password' }]);
-  assert.deepEqual(ha.helpers.input_text, [{ id: 'wifi_password', name: 'Wifi password', initial: 'y', api_key: 'HELPERSECRET' }]);
+  const stored = { id: 'wifi_password', name: 'Wifi password', initial: 'y', api_key: 'HELPERSECRET', min: 0, max: 100, mode: 'text' };
+  assert.deepEqual(ha.helpers.input_text, [stored]);
+  assert.deepEqual(body(updated.result), { kind: 'helper', action: 'update', id: 'input_text.wifi_password', result: { ...stored, api_key: M } });
 
   const deleted = await call('ha_write_config', { kind: 'helper', action: 'delete', id: 'input_boolean.guest_mode' });
   assert.deepEqual(deleted.sent, [{ type: 'input_boolean/delete', input_boolean_id: 'guest_mode' }]);
   const unknown = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'timer.nope', config: { duration: '00:01:00' } });
-  assert.match(JSON.stringify(unknown.result.content), /Home Assistant refused the request: Unable to find timer_id nope/);
+  assert.match(JSON.stringify(unknown.result.content), /The helper timer\.nope does not exist; create it instead/);
+  assert.deepEqual(unknown.sent, [{ type: 'timer/list' }]);
 
   const person = await call('ha_write_config', { kind: 'helper', action: 'delete', id: 'person.bob' });
   assert.match(JSON.stringify(person.result.content), /id: must be <helper domain>\.<id>/);
