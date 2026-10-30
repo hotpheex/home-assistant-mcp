@@ -23,7 +23,7 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 | Grant | Tools | Gives |
 |---|---|---|
 | `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services` | States, history, logbook, registries and the service list of the **whole house**, at the users tier. |
-| `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read. |
+| `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
 
@@ -73,14 +73,18 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/services.test.ts`: area and label expansion, the service's domain filter, data-key merging, `entity_id: all`, delegating services and Denies on config entities.
 - `test/e2e.test.ts`: against real HA, child devices under a label, hidden and config entities outside an area, and an area Deny catching a config button.
 
-**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Config and trace reads mask values under secret-looking keys, URL userinfo and `Bearer` tokens. A config write carrying the mask marker is refused, so a masked secret is never written back.
+**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Every read, plain, config and trace, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config write carrying the mask marker is refused, so a masked secret is never written back.
 - `test/redaction.test.ts`: what is stripped and masked, and the expected leaks.
 - `test/read.test.ts`, `test/config.test.ts` and `test/write.test.ts`: Redaction in the read tools, and the marker refusal.
 - `test/e2e.test.ts`: no bearer token or secret from a real HA appears in any byte the ten tools return.
 
-**Audit.** The server writes one JSON object per line to stdout; audit records carry `"audit": true`. Every refusal is recorded, failed authentication included. Allowed calls are recorded only with `HAMCP_AUDIT_WRITES` or `HAMCP_AUDIT_READS`. Records hold names only: never service data, config bodies, responses or keys.
+**Size cap.** A result is at most 48,000 characters, below Claude Code's 50,000-character file threshold, so a Caller never reasons over a saved file or a preview. A larger read is refused whole, with a hint that names the narrowing the tool offers. A larger write result is cut with a marker, because the write has already run.
+- `test/read.test.ts`: a read at the cap returned whole, and one character over refused with the tool's narrowing.
+- `test/services.test.ts`: an oversize service response cut with a marker.
+
+**Audit.** The server writes one JSON object per line to stdout; audit records carry `"audit": true`. Every refusal is recorded, failed authentication included. Allowed calls are recorded only with `HAMCP_AUDIT_WRITES` or `HAMCP_AUDIT_READS`. An allowed write records `allow` before any request to HA and `outcome: done` once HA accepts it, so an `allow` with no `done` is a write that failed or whose outcome is unknown. Records hold names only: never service data, config bodies, responses or keys.
 - `test/serve.test.ts`: refused keys and Origins audited without the key, and in the coverage matrix, every refused tool call audited and allowed calls audited only on opt-in.
-- `test/services.test.ts` and `test/write.test.ts`: allowed writes audited by name, before they are sent.
+- `test/services.test.ts` and `test/write.test.ts`: allowed writes audited by name before any request to HA, and their outcome once HA accepts them.
 
 ## Kill switch
 

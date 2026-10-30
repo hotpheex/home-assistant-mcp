@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import type { FakeHaOptions } from './fake-ha.ts';
-import { body, connect, ERAS, fakeHa, newKey, policyOf, startServer } from './harness.ts';
+import { body, connect, ERAS, fakeHa, HOUSE, newKey, policyOf, startServer } from './harness.ts';
 
 const reader = newKey();
 const readerPolicy = policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n');
@@ -28,19 +28,22 @@ const near = (actual: unknown, minutes: number) =>
 
 test('ha_get_history reads the last 24 h by default, pages rows, and summarises', async (t) => {
   const history = [
-    { entity_id: 'sensor.kitchen_temperature', state: '19.0', when: ago(30 * 60) },
-    { entity_id: 'sensor.kitchen_temperature', state: '20.5', when: ago(180) },
-    { entity_id: 'sensor.kitchen_temperature', state: '22.5', when: ago(120) },
-    { entity_id: 'sensor.kitchen_temperature', state: '21.5', when: ago(60) },
+    { entity_id: 'sensor.kitchen_temperature', state: '20', when: ago(30 * 60) },
+    { entity_id: 'sensor.kitchen_temperature', state: '30', when: ago(60) },
     { entity_id: 'light.kitchen', state: 'off', when: ago(300) },
     { entity_id: 'light.kitchen', state: 'on', when: ago(240) },
     { entity_id: 'light.kitchen', state: 'off', when: ago(200) },
     { entity_id: 'light.kitchen', state: 'on', when: ago(30) },
+    { entity_id: 'light.living_room', state: 'off', when: ago(48 * 60) },
+    { entity_id: 'switch.coffee_maker', state: '100', when: ago(30 * 60) },
+    { entity_id: 'switch.coffee_maker', state: 'unavailable', when: ago(120) },
+    { entity_id: 'switch.coffee_maker', state: 'unknown', when: ago(90) },
+    { entity_id: 'switch.coffee_maker', state: '200', when: ago(60) },
   ];
-  const { call, sent } = await readerOn(t, { history });
-  const entity_ids = ['sensor.kitchen_temperature', 'light.kitchen'];
+  const { call, sent, client, ha } = await readerOn(t, { history });
+  const entity_ids = ['sensor.kitchen_temperature', 'light.kitchen', 'light.living_room', 'switch.coffee_maker'];
 
-  const page = await call('ha_get_history', { entity_ids, limit: 4 });
+  const page = await call('ha_get_history', { entity_ids, limit: 3, offset: 4 });
   const [request] = sent('history/history_during_period');
   assert.deepEqual(request?.entity_ids, entity_ids);
   assert.equal(request?.no_attributes, true);
@@ -49,22 +52,41 @@ test('ha_get_history reads the last 24 h by default, pages rows, and summarises'
   near(page.start, 24 * 60);
   near(page.end, 0);
   const row = (i: number) => ({ entity_id: history[i]!.entity_id, state: history[i]!.state, last_changed: history[i]!.when });
+  const atStart = (i: number, start: unknown) => ({ ...row(i), last_changed: start });
   assert.deepEqual(
     { total: page.total, offset: page.offset, has_more: page.has_more, history: page.history },
-    { total: 7, offset: 0, has_more: true, history: [row(4), row(5), row(6), row(7)] },
+    { total: 11, offset: 4, has_more: true, history: [atStart(6, page.start), atStart(0, page.start), row(1)] },
   );
 
   const summary = await call('ha_get_history', { entity_ids, summary: true });
-  assert.deepEqual(summary.history, [
+  const rounded = (summary.history as Record<string, unknown>[]).map((e) => (e.mean === undefined ? e : { ...e, mean: Math.round(Number(e.mean) * 100) / 100 }));
+  // 20 for 23 h and 30 for 1 h; 100 for 22 h and 200 for 1 h around an hour of unavailable and unknown.
+  assert.deepEqual(rounded, [
     { entity_id: 'light.kitchen', changes: 4, first: 'off', last: 'on', states: { off: 2, on: 2 } },
-    { entity_id: 'sensor.kitchen_temperature', changes: 3, first: '20.5', last: '21.5', min: 20.5, max: 22.5, mean: 21.5 },
+    { entity_id: 'light.living_room', changes: 0, first: 'off', last: 'off', states: { off: 1 } },
+    { entity_id: 'sensor.kitchen_temperature', changes: 1, first: '20', last: '30', min: 20, max: 30, mean: 20.42, skipped: 0 },
+    { entity_id: 'switch.coffee_maker', changes: 3, first: '100', last: '200', min: 100, max: 200, mean: 104.35, skipped: 2 },
   ]);
 
   const window = { start: ago(201), end: ago(100) };
-  const narrowed = await call('ha_get_history', { entity_ids, ...window });
-  assert.deepEqual(narrowed.history, [row(6), row(1), row(2)]);
+  assert.equal(page.not_current_entity_ids, undefined);
+  const narrowed = await call('ha_get_history', { entity_ids: ['light.kitchen', 'light.kichen'], ...window });
+  assert.deepEqual(narrowed.history, [atStart(3, window.start), row(4)]);
+  assert.deepEqual(narrowed.not_current_entity_ids, ['light.kichen']);
   const last = sent('history/history_during_period').at(-1);
   assert.deepEqual([last?.start_time, last?.end_time], [window.start, window.end]);
+  const precise = await call('ha_get_history', { entity_ids: ['light.kitchen'], start: window.start.replace('Z', '6Z'), end: window.end, summary: true });
+  assert.equal((precise.history as { changes: number }[])[0]?.changes, 1);
+
+  const sentBefore = ha.received.length;
+  const backwards = await client.callTool({ name: 'ha_get_history', arguments: { entity_ids, start: window.end, end: window.start } });
+  assert.equal(backwards.isError, true);
+  assert.ok(JSON.stringify(backwards.content).includes(window.start) && JSON.stringify(backwards.content).includes(window.end));
+  const future = await client.callTool({ name: 'ha_get_logbook', arguments: { start: new Date(Date.now() + 3_600_000).toISOString() } });
+  assert.equal(future.isError, true);
+  assert.match(JSON.stringify(future.content), /after/);
+  assert.equal(ha.received.length, sentBefore);
+  assert.equal((await call('ha_get_logbook', { start: window.start, end: window.start })).total, 0);
 });
 
 test('ha_get_logbook reads the last hour by default, optionally for one entity', async (t) => {
@@ -88,6 +110,9 @@ test('ha_get_logbook reads the last hour by default, optionally for one entity',
   const one = await call('ha_get_logbook', { entity_id: 'lock.front_door', start: ago(120) });
   assert.deepEqual(sent('logbook/get_events').at(-1)?.entity_ids, ['lock.front_door']);
   assert.deepEqual((one.entries as { state: string }[]).map((e) => e.state), ['locked']);
+  assert.equal(one.not_current_entity_ids, undefined);
+  const typo = await call('ha_get_logbook', { entity_id: 'lock.front_dor', start: ago(120) });
+  assert.deepEqual([typo.total, typo.not_current_entity_ids], [0, ['lock.front_dor']]);
 });
 
 test('read: plain lists the five read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
@@ -126,27 +151,42 @@ test('read: plain lists the five read tools; ha_get_states filters, matches alia
   assert.match(JSON.stringify(tooMany.content), /limit/);
 });
 
-test('every read strips camera, image and media_player bearer tokens', async (t) => {
-  const { client } = await readerOn(t);
+test('every read masks secrets and strips camera, image and media_player bearer tokens', async (t) => {
+  const { client, call } = await readerOn(t, {
+    states: [...HOUSE, { entity_id: 'sensor.router', state: 'ok', attributes: { friendly_name: 'Router', api_key: 'KEYSECRET' } }],
+    devices: [{ id: 'd1', name: 'Router', configuration_url: 'http://admin:PWSECRET@192.168.1.1/' }],
+  });
   const result = await client.callTool({ name: 'ha_get_states', arguments: { full: true } });
   assert.doesNotMatch(JSON.stringify(result), /SECRET/);
   const states = (body(result) as { states: { entity_id: string; attributes: Record<string, unknown> }[] }).states;
   const attributes = (id: string) => states.find((s) => s.entity_id === id)?.attributes;
   assert.deepEqual(attributes('camera.porch'), { friendly_name: 'Porch', entity_picture: '/api/camera_proxy/camera.porch' });
   assert.deepEqual(attributes('media_player.den'), { friendly_name: 'Den Speaker', entity_picture: '/api/media_player_proxy/media_player.den?cache=42' });
+  assert.deepEqual(attributes('sensor.router'), { friendly_name: 'Router', api_key: '**REDACTED**' });
+  const [device] = (await call('ha_get_registry', { registry: 'device' })).entries as Record<string, unknown>[];
+  assert.equal(device?.configuration_url, 'http://**REDACTED**@192.168.1.1/');
 });
 
-test('a read over the byte cap is refused with "narrow the query", never cut off', async (t) => {
-  const states = Array.from({ length: 200 }, (_, i) => ({
-    entity_id: `sensor.bulk_${String(i).padStart(3, '0')}`,
-    state: '1',
-    attributes: { friendly_name: `Bulk ${i}`, note: 'x'.repeat(500) },
-  }));
-  const { client, call } = await readerOn(t, { states });
-  const refused = await client.callTool({ name: 'ha_get_states', arguments: { full: true, limit: 200 } });
+test('a read over the character cap is refused with "narrow the query", never cut off; one at the cap is returned whole', async (t) => {
+  const cap = 48_000;
+  const states = [{ entity_id: 'sensor.bulk', state: '1', attributes: { friendly_name: 'Bulk', note: '' } }];
+  const history = Array.from({ length: 300 }, (_, i) => ({ entity_id: 'sensor.bulk', state: String(i).padEnd(200, 'x'), when: ago(300 - i) }));
+  const { client } = await readerOn(t, { states, history });
+  const textLength = async () => ((await client.callTool({ name: 'ha_get_states', arguments: { full: true } })).content as { text: string }[])[0]!.text.length;
+  const padding = cap - (await textLength());
+
+  states[0]!.attributes.note = 'x'.repeat(padding);
+  assert.equal(await textLength(), cap);
+
+  states[0]!.attributes.note = 'x'.repeat(padding + 1);
+  const refused = await client.callTool({ name: 'ha_get_states', arguments: { full: true } });
   assert.equal(refused.isError, true);
-  assert.match(JSON.stringify(refused.content), /narrow the query/);
-  assert.equal(((await call('ha_get_states', { full: true, limit: 100 })).states as unknown[]).length, 100);
+  const message = (refused.content as { text: string }[])[0]!.text;
+  assert.match(message, /narrow the query/);
+  assert.match(message, /48000 characters/);
+  assert.doesNotMatch(message, /window/);
+  const long = await client.callTool({ name: 'ha_get_history', arguments: { entity_ids: ['sensor.bulk'], limit: 300 } });
+  assert.match((long.content as { text: string }[])[0]!.text, /narrow the query with .*a shorter window/);
 });
 
 for (const era of ERAS) {
@@ -199,7 +239,17 @@ test('allowed reads are audited, naming the read kind and request, only with HAM
 });
 
 test('ha_get_registry lists each registry, filtered by a query', async (t) => {
-  const { call, sent } = await readerOn(t);
+  const device = {
+    id: 'dev_coffee',
+    name: 'Coffee Maker',
+    area_id: 'utility_room',
+    labels: [],
+    connections: [['mac', 'a4:c1:38:9f:22:0b']],
+    identifiers: [['zha', '0x00158d0001e4b2c7']],
+    config_entries: ['entry_1'],
+    config_entries_subentries: { entry_1: ['subentry_42'] },
+  };
+  const { call, sent } = await readerOn(t, { devices: [device] });
   const ids = { entity: 'entity_id', device: 'id', area: 'area_id', label: 'label_id', floor: 'floor_id' } as const;
   const expected = {
     entity: ['switch.coffee_maker', 'light.living_room', 'lock.front_door'],
@@ -219,4 +269,8 @@ test('ha_get_registry lists each registry, filtered by a query', async (t) => {
     { area_id: 'utility_room', name: 'Utility Room', floor_id: 'ground', aliases: [] },
   ]);
   assert.equal((await call('ha_get_registry', { registry: 'entity', limit: 2 })).has_more, true);
+  for (const query of ['38:9F:22', '0x00158d0001e4', 'subentry_4']) {
+    assert.deepEqual((await call('ha_get_registry', { registry: 'device', query })).entries, [device], query);
+  }
+  assert.equal((await call('ha_get_registry', { registry: 'device', query: 'zigbee' })).total, 0);
 });

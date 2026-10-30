@@ -53,27 +53,19 @@ test('an automation create posts the config to HA, and the allowed write is audi
   assert.deepEqual(Object.values(ha.configs).find((c) => c.id === 'hall_light'), { id: 'hall_light', ...NEW_AUTOMATION });
   assert.deepEqual(body(created.result), { kind: 'automation', action: 'create', id: 'hall_light', result: { result: 'ok' } });
 
-  const [audit] = server.audits().filter((a) => a.caller === 'automator');
+  const who = { time: undefined, audit: true, caller: 'automator', key_hash_prefix: keys.automator!.sha256.slice(0, 8), operation: 'config_write', tool: 'ha_write_config' };
+  const name = { kind: 'automation', action: 'create', id: 'hall_light' };
   assert.deepEqual(
-    { ...audit, time: undefined },
-    {
-      time: undefined,
-      audit: true,
-      caller: 'automator',
-      key_hash_prefix: keys.automator!.sha256.slice(0, 8),
-      operation: 'config_write',
-      tool: 'ha_write_config',
-      kind: 'automation',
-      action: 'create',
-      id: 'hall_light',
-      decision: 'allow',
-      grants: [1],
-    },
+    server.audits().map((a) => ({ ...a, time: undefined })),
+    [
+      { ...who, ...name, decision: 'allow', grants: [1] },
+      { ...who, ...name, outcome: 'done' },
+    ],
   );
 });
 
 test('an update merges its top-level keys into the stored config, since HA replaces the whole entry', async (t) => {
-  const { ha, as } = await house(t);
+  const { ha, server, as } = await house(t);
   const { call } = await as('automator');
   const updated = await call('ha_write_config', { kind: 'automation', action: 'update', id: 'porch_light_1', config: { alias: 'Porch light at dusk' } });
   assert.equal(updated.result.isError, undefined);
@@ -98,10 +90,15 @@ test('an update merges its top-level keys into the stored config, since HA repla
   const invalid = await call('ha_write_config', { kind: 'automation', action: 'create', id: 'bare', config: { alias: 'No triggers' } });
   assert.equal(invalid.result.isError, true);
   assert.match(JSON.stringify(invalid.result.content), /Home Assistant refused the request: Message malformed: required key not provided/);
+  assert.deepEqual(
+    server.audits().map((a) => [a.id, a.decision, a.outcome]),
+    [['porch_light_1', 'allow', undefined], ['porch_light_1', undefined, 'done'], ['nope', 'allow', undefined], ['porch_light_1', 'allow', undefined], ['bare', 'allow', undefined]],
+  );
+  assert.doesNotMatch(JSON.stringify(server.audits()), /malformed|required key|Porch light at dusk/);
 });
 
 test('deletes, and script and scene writes, go to their own config endpoints', async (t) => {
-  const { ha, as } = await house(t);
+  const { ha, server, as } = await house(t);
   const automator = await as('automator');
   const deleted = await automator.call('ha_write_config', { kind: 'automation', action: 'delete', id: 'porch_light_1' });
   assert.deepEqual(deleted.sent, [{ type: 'DELETE /api/config/automation/config/porch_light_1' }]);
@@ -116,6 +113,10 @@ test('deletes, and script and scene writes, go to their own config endpoints', a
   const scene = { name: 'Reading', entities: { 'light.living_room': { state: 'on' } } };
   const created = await (await as('scener')).call('ha_write_config', { kind: 'scene', action: 'create', id: 'reading', config: scene });
   assert.deepEqual(created.sent.at(-1), { type: 'POST /api/config/scene/config/reading', body: scene });
+  assert.deepEqual(
+    server.audits().map((a) => [a.kind, a.action, a.decision ?? a.outcome]),
+    [['automation', 'delete', 'allow'], ['automation', 'delete', 'done'], ['automation', 'delete', 'allow'], ['script', 'update', 'allow'], ['script', 'update', 'done'], ['scene', 'create', 'allow'], ['scene', 'create', 'done']],
+  );
 });
 
 test('a config write of a kind the Caller does not hold is refused and audited, with nothing sent', async (t) => {
@@ -130,25 +131,53 @@ test('a config write of a kind the Caller does not hold is refused and audited, 
   assert.doesNotMatch(JSON.stringify(server.audits()), /Hall light|triggers/, 'audit lines carry names, never bodies');
 });
 
-test('helper writes go through the helper domain WebSocket commands, which merge updates themselves', async (t) => {
-  const { ha, as } = await house(t);
+test('helper writes go through the helper domain WebSocket commands; an update sends the stored helper with its keys merged over it', async (t) => {
+  const { ha, server, as } = await house(t);
   const { call } = await as('helperer');
   const created = await call('ha_write_config', { kind: 'helper', action: 'create', id: 'input_boolean.guest_mode', config: { name: 'Guest mode' } });
   assert.deepEqual(created.sent, [{ type: 'input_boolean/create', name: 'Guest mode' }]);
   assert.deepEqual(body(created.result), { kind: 'helper', action: 'create', id: 'input_boolean.guest_mode', result: { id: 'guest_mode', name: 'Guest mode' } });
 
-  const updated = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'input_text.wifi_password', config: { initial: 'y' } });
-  assert.deepEqual(updated.sent, [{ type: 'input_text/update', initial: 'y', input_text_id: 'wifi_password' }]);
-  assert.deepEqual(ha.helpers.input_text, [{ id: 'wifi_password', name: 'Wifi password', initial: 'y', api_key: 'HELPERSECRET' }]);
+  // HA replaces a helper on update, so a partial update would reset step and mode and drop the unit.
+  const thermostat = { name: 'Target temp', min: 10, max: 30, step: 0.5, mode: 'box', unit_of_measurement: '°C', icon: 'mdi:thermometer' };
+  await call('ha_write_config', { kind: 'helper', action: 'create', id: 'input_number.target_temp', config: thermostat });
+  const icon = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'input_number.target_temp', config: { icon: 'mdi:fire' } });
+  assert.deepEqual(icon.sent, [{ type: 'input_number/list' }, { type: 'input_number/update', ...thermostat, icon: 'mdi:fire', input_number_id: 'target_temp' }]);
+  assert.deepEqual(ha.helpers.input_number, [{ id: 'target_temp', ...thermostat, icon: 'mdi:fire' }]);
+
+  await call('ha_write_config', { kind: 'helper', action: 'create', id: 'timer.tea', config: { name: 'Tea', duration: '0:04:00', restore: true } });
+  await call('ha_write_config', { kind: 'helper', action: 'update', id: 'timer.tea', config: { name: 'Green tea' } });
+  assert.deepEqual(ha.helpers.timer, [{ id: 'tea', name: 'Green tea', duration: '0:04:00', restore: true }]);
+  const extra = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'timer.tea', config: { colour: 'green' } });
+  assert.match(JSON.stringify(extra.result.content), /Home Assistant refused the request: extra keys not allowed @ data\['colour'\]/);
+
+  const updated = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'input_text.nas_url', config: { icon: 'mdi:nas' } });
+  const stored = { id: 'nas_url', name: 'NAS URL', initial: 'https://bob:HELPERSECRET@nas.local', icon: 'mdi:nas', min: 0, max: 100, mode: 'text' };
+  assert.deepEqual(ha.helpers.input_text, [stored]);
+  assert.deepEqual(body(updated.result), { kind: 'helper', action: 'update', id: 'input_text.nas_url', result: { ...stored, initial: `https://${M}@nas.local` } });
 
   const deleted = await call('ha_write_config', { kind: 'helper', action: 'delete', id: 'input_boolean.guest_mode' });
   assert.deepEqual(deleted.sent, [{ type: 'input_boolean/delete', input_boolean_id: 'guest_mode' }]);
   const unknown = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'timer.nope', config: { duration: '00:01:00' } });
-  assert.match(JSON.stringify(unknown.result.content), /Home Assistant refused the request: Unable to find timer_id nope/);
+  assert.match(JSON.stringify(unknown.result.content), /The helper timer\.nope does not exist; create it instead/);
+  assert.deepEqual(unknown.sent, [{ type: 'timer/list' }]);
 
   const person = await call('ha_write_config', { kind: 'helper', action: 'delete', id: 'person.bob' });
   assert.match(JSON.stringify(person.result.content), /id: must be <helper domain>\.<id>/);
   assert.deepEqual(person.sent, []);
+  assert.deepEqual(
+    server.audits().map((a) => [a.action, a.id, a.decision ?? a.outcome]),
+    [
+      ['create', 'input_boolean.guest_mode', 'allow'], ['create', 'input_boolean.guest_mode', 'done'],
+      ['create', 'input_number.target_temp', 'allow'], ['create', 'input_number.target_temp', 'done'],
+      ['update', 'input_number.target_temp', 'allow'], ['update', 'input_number.target_temp', 'done'],
+      ['create', 'timer.tea', 'allow'], ['create', 'timer.tea', 'done'],
+      ['update', 'timer.tea', 'allow'], ['update', 'timer.tea', 'done'], ['update', 'timer.tea', 'allow'],
+      ['update', 'input_text.nas_url', 'allow'], ['update', 'input_text.nas_url', 'done'],
+      ['delete', 'input_boolean.guest_mode', 'allow'], ['delete', 'input_boolean.guest_mode', 'done'],
+      ['update', 'timer.nope', 'allow'],
+    ],
+  );
 });
 
 test('a config carrying the Redaction marker is refused with its path, audited by name, and nothing is sent', async (t) => {
@@ -187,17 +216,20 @@ test('ha_get_config serves scene and helper config, masked, only to a Caller tha
   assert.match(JSON.stringify((await scener.call('ha_get_config', { kind: 'scene', id: 'nope' })).result.content), /Scene nope not found/);
 
   const helperer = await as('helperer');
-  const helper = await helperer.call('ha_get_config', { kind: 'helper', id: 'input_text.wifi_password' });
+  const helper = await helperer.call('ha_get_config', { kind: 'helper', id: 'input_text.nas_url' });
   assert.deepEqual(helper.sent, [{ type: 'input_text/list' }]);
-  assert.deepEqual(body(helper.result), { config: { id: 'wifi_password', name: 'Wifi password', initial: 'x', api_key: M } });
+  assert.deepEqual(body(helper.result), { config: { id: 'nas_url', name: 'NAS URL', initial: `https://${M}@nas.local` } });
   const automation = await helperer.call('ha_get_config', { kind: 'automation', entity_id: 'automation.porch_light' });
   assert.equal(automation.result.isError, undefined, 'any config write gives automation and script config read');
-  const noId = await helperer.call('ha_get_config', { kind: 'helper', entity_id: 'input_text.wifi_password' });
+  const noId = await helperer.call('ha_get_config', { kind: 'helper', entity_id: 'input_text.nas_url' });
   assert.match(JSON.stringify(noId.result.content), /id: is required for a helper/);
+  const extraEntity = await scener.call('ha_get_config', { kind: 'scene', id: 'movie_night_1', entity_id: 'scene.movie_night' });
+  assert.match(JSON.stringify(extraEntity.result.content), /entity_id: is not taken for a scene, which takes only id/);
+  assert.deepEqual(extraEntity.sent, []);
 
   for (const [who, args] of [
     ['auditor', { kind: 'scene', id: 'movie_night_1' }],
-    ['auditor', { kind: 'helper', id: 'input_text.wifi_password' }],
+    ['auditor', { kind: 'helper', id: 'input_text.nas_url' }],
     ['automator', { kind: 'scene', id: 'movie_night_1' }],
   ] as const) {
     const denied = await (await as(who)).call('ha_get_config', args);

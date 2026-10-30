@@ -232,9 +232,9 @@ test('a service that responds returns its response; an oversize one is truncated
   const dump = await call({ domain: 'rest_command', service: 'dump' });
   assert.equal(dump.isError, undefined);
   const truncated = textOf(dump) ?? '';
-  assert.ok(Buffer.byteLength(truncated) <= 80_000);
+  assert.ok(truncated.length <= 48_000 && truncated.length > 47_900, String(truncated.length));
   assert.ok(truncated.startsWith('{"entity_ids":[],"context_id":"ctx-2","response":{"content":"xxx'));
-  assert.match(truncated, /\n\[truncated: the response was \d+ bytes, over the 80000-byte cap; the call ran\]$/);
+  assert.match(truncated, /\n\[truncated: the response was \d+ characters, over the 48000-character cap; the call ran\]$/);
 });
 
 test('"HA unavailable" when nothing was sent; "outcome unknown" when the call was sent and its connection dropped or it went unanswered', async (t) => {

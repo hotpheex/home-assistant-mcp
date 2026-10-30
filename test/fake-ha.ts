@@ -17,6 +17,9 @@ export interface FakeEntity {
   hidden_by?: string | null;
   disabled_by?: string | null;
   entity_category?: 'config' | 'diagnostic' | null;
+  platform?: string;
+  /** An automation's config id, or a script's object id. */
+  unique_id?: string;
   /** Served only by get_entries, as in HA. */
   aliases?: string[];
 }
@@ -64,6 +67,19 @@ export interface FakeHaOptions {
 }
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
+const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
+/** Each helper's storage schema in HA 2026.10: its required keys, the defaults it fills, and its other keys besides `icon`. */
+const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<string, unknown>; optional: string[] }> = {
+  input_boolean: { required: ['name'], defaults: {}, optional: ['initial'] },
+  input_number: { required: ['name', 'min', 'max'], defaults: { step: 1, mode: 'slider' }, optional: ['initial', 'unit_of_measurement'] },
+  input_select: { required: ['name', 'options'], defaults: {}, optional: ['initial'] },
+  input_text: { required: ['name'], defaults: { min: 0, max: 100, mode: 'text' }, optional: ['initial', 'unit_of_measurement', 'pattern'] },
+  input_datetime: { required: ['name'], defaults: { has_date: false, has_time: false }, optional: ['initial'] },
+  input_button: { required: ['name'], defaults: {}, optional: [] },
+  counter: { required: ['name'], defaults: { initial: 0, maximum: null, minimum: null, restore: true, step: 1 }, optional: [] },
+  timer: { required: ['name'], defaults: { duration: '0:00:00', restore: false }, optional: [] },
+  schedule: { required: ['name'], defaults: Object.fromEntries(DAYS.map((d) => [d, []])), optional: [] },
+};
 /** HA validates the whole body of a config POST, so a partial one is refused. */
 const REQUIRED_KEYS: Record<string, string[]> = { automation: ['triggers', 'actions'], script: ['sequence'], scene: ['name', 'entities'] };
 
@@ -95,7 +111,7 @@ const haError = (code: string, message: string): never => {
 };
 
 type Target = Partial<Record<'entity_id' | 'device_id' | 'area_id' | 'floor_id' | 'label_id', string | string[]>>;
-type Entity = Required<Omit<FakeEntity, 'name' | 'aliases'>>;
+type Entity = Required<Omit<FakeEntity, 'name' | 'aliases' | 'platform' | 'unique_id'>>;
 type Device = { id: string; area_id: string | null; labels: string[]; parent_device_id: string | null };
 /** The registry fields `extract_from_target` reads, with HA's defaults filled in. */
 export type Registry = {
@@ -256,10 +272,18 @@ export async function startFakeHa(options: FakeHaOptions) {
     'config/area_registry/list': () => options.areas ?? [],
     'config/label_registry/list': () => options.labels ?? [],
     'config/floor_registry/list': () => options.floors ?? [],
+    // HA parses times to the microsecond, so the start row keeps any digits past the millisecond.
     'history/history_during_period': (_, msg) => {
       const out: Record<string, { s: string; lu: number }[]> = {};
-      for (const c of options.history ?? []) {
-        if ((msg.entity_ids as string[]).includes(c.entity_id) && inWindow(c.when, msg)) (out[c.entity_id] ??= []).push({ s: c.state, lu: seconds(c.when) });
+      const start = Date.parse(msg.start_time as string);
+      for (const id of msg.entity_ids as string[]) {
+        const changes = (options.history ?? []).filter((c) => c.entity_id === id);
+        const before = changes.filter((c) => Date.parse(c.when) <= start).at(-1);
+        const rows = [
+          ...(before ? [{ s: before.state, lu: start / 1000 + Number(`0.000${/\.\d{3}(\d{1,3})/.exec(msg.start_time as string)?.[1] ?? ''}`) }] : []),
+          ...changes.filter((c) => Date.parse(c.when) > start && inWindow(c.when, msg)).map((c) => ({ s: c.state, lu: seconds(c.when) })),
+        ];
+        if (rows.length > 0) out[id] = rows;
       }
       return out;
     },
@@ -291,7 +315,20 @@ export async function startFakeHa(options: FakeHaOptions) {
       items().push(item);
       return item;
     });
-    handlers[`${domain}/update`] = adminOnly((_, msg) => Object.assign(find(msg), fieldsOf(msg)));
+    // HA validates an update against the full schema and replaces the item, keeping only its id.
+    handlers[`${domain}/update`] = adminOnly((_, msg) => {
+      const item = find(msg);
+      const fields = fieldsOf(msg);
+      const { required, defaults, optional } = HELPER_SCHEMAS[domain]!;
+      const missing = required.find((k) => !(k in fields));
+      if (missing) haError('invalid_format', `required key not provided @ data['${missing}']. Got None`);
+      const known = new Set([...required, ...Object.keys(defaults), ...optional, 'icon']);
+      const extra = Object.keys(fields).find((k) => !known.has(k));
+      if (extra) haError('invalid_format', `extra keys not allowed @ data['${extra}']`);
+      const replaced = { id: item.id, ...defaults, ...fields };
+      items().splice(items().indexOf(item), 1, replaced);
+      return replaced;
+    });
     handlers[`${domain}/delete`] = adminOnly((_, msg) => {
       items().splice(items().indexOf(find(msg)), 1);
       return null;

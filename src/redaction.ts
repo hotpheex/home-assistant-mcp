@@ -22,7 +22,7 @@ const USERINFO = /\b([a-z][a-z0-9+.-]*:\/\/)[^\s/?#@]+@/gi;
 const BEARER = /\b(bearer\s+)(?=[\w.~+/-]*[\d.~+/-])[\w.~+/-]+=*/gi;
 
 /**
- * Masks values under secret-looking keys, URL userinfo and `Bearer <token>`, for config and trace reads.
+ * Masks values under secret-looking keys, URL userinfo and `Bearer <token>`, for every read.
  * Best-effort: secrets under other keys or in other shapes pass through, as the expected-leak tests list.
  */
 export function maskSecrets(value: unknown): unknown {

@@ -67,7 +67,7 @@ export const CONFIGS: Partial<FakeHaOptions> = {
       entities: { 'media_player.den': { state: 'playing', password: 'SCENESECRET', access_token: 'SCENESECRET', entity_picture: '/api/media_player_proxy/media_player.den?token=SCENESECRET' } },
     },
   },
-  helpers: { input_text: [{ id: 'wifi_password', name: 'Wifi password', initial: 'x', api_key: 'HELPERSECRET' }] },
+  helpers: { input_text: [{ id: 'nas_url', name: 'NAS URL', initial: 'https://bob:HELPERSECRET@nas.local' }] },
   traces: ['run_1', 'run_2', 'run_3'].map((run_id, i) => ({
     domain: 'automation' as const,
     item_id: 'porch_light_1',

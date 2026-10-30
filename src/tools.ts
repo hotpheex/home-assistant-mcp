@@ -74,6 +74,7 @@ interface ToolSpec<Input extends z.ZodType> {
 }
 
 const PAGED = 'Results come in pages: `limit` (default 50, at most 500) and `offset` pick the page, and the response gives `total` and `has_more`.';
+const MASKED = 'Values that look like secrets, such as passwords, tokens, API keys and URL credentials, come back as **REDACTED**; this is best-effort, so other secrets may still show.';
 const page = {
   limit: z.number().int().min(1).max(500).default(50).describe('Page size, at most 500.'),
   offset: z.number().int().min(0).default(0).describe('Entries to skip.'),
@@ -92,15 +93,36 @@ const window = {
   start: z.iso.datetime({ offset: true }).optional().describe('ISO 8601 start time.'),
   end: z.iso.datetime({ offset: true }).optional().describe('ISO 8601 end time; defaults to now.'),
 };
+/**
+ * A backwards window is refused before anything is sent: HA answers it with a made-up row or nothing.
+ * Times go to HA to the millisecond, so `summarise` can match the stamp of HA's window-start row.
+ */
 function windowOf(args: { start?: string; end?: string }, hours: number) {
-  const end = args.end ?? new Date().toISOString();
-  return { start: args.start ?? new Date(Date.parse(end) - hours * 3_600_000).toISOString(), end };
+  const end = args.end === undefined ? Date.now() : Date.parse(args.end);
+  const start = args.start === undefined ? end - hours * 3_600_000 : Date.parse(args.start);
+  const [from, to] = [new Date(start).toISOString(), new Date(end).toISOString()];
+  if (start > end) throw new ToolFailure(`Input validation error: start ${from} is after end ${to}.`);
+  return { start: from, end: to };
 }
 /** HA sends times as float seconds. */
 const isoOf = (seconds: number) => new Date(Math.round(seconds * 1000)).toISOString();
 
-/** About 80 kB keeps a result under Claude Code's default MCP output limit. */
-const BYTE_CAP = 80_000;
+/**
+ * Claude Code saves a text result over 50,000 characters to a file and shows only a preview, so the cap
+ * sits below that, counted as Claude Code counts: string length, not bytes.
+ */
+const CHAR_CAP = 48_000;
+/** Each read tool's size refusal names only the narrowing that tool offers. */
+const NARROWING: Partial<Record<ToolName, string>> = {
+  ha_get_states: 'the domain, state, query, area or label filters, `full` off, or a smaller limit',
+  ha_get_history: 'fewer entity_ids, a shorter window, `summary` or a smaller limit',
+  ha_get_logbook: 'an entity_id, a shorter window or a smaller limit',
+  ha_get_registry: 'a query or a smaller limit',
+  ha_list_services: 'a domain or a smaller limit',
+  ha_list_traces: 'a smaller limit',
+  ha_get_trace: 'fewer sections',
+};
+const charsOf = (result: CallToolResult) => result.content.reduce((n, c) => n + (c.type === 'text' ? c.text.length : 0), 0);
 const READS: ReadonlySet<Operation> = new Set(['plain_read', 'config_read']);
 
 const text = (value: unknown): CallToolResult => ({ content: [{ type: 'text', text: JSON.stringify(value) }] });
@@ -137,15 +159,15 @@ async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Comm
 
 /** A write has already run, so an oversize response is cut with a visible marker rather than refused. */
 function writeResult(value: unknown): CallToolResult {
-  const full = Buffer.from(JSON.stringify(value));
-  if (full.length <= BYTE_CAP) return text(value);
-  const marker = `\n[truncated: the response was ${full.length} bytes, over the ${BYTE_CAP}-byte cap; the call ran]`;
-  const kept = full.subarray(0, BYTE_CAP - Buffer.byteLength(marker)).toString().replace(/\uFFFD$/, '');
+  const full = JSON.stringify(value);
+  if (full.length <= CHAR_CAP) return text(value);
+  const marker = `\n[truncated: the response was ${full.length} characters, over the ${CHAR_CAP}-character cap; the call ran]`;
+  const kept = full.slice(0, CHAR_CAP - marker.length).replace(/[\uD800-\uDBFF]$/, '');
   return { content: [{ type: 'text', text: kept + marker }] };
 }
 
-const plainRead = <T>(ctx: Context, command: Command) => send<T>(ctx, ctx.allowed, command);
-const configRead = async <T>(ctx: Context, command: Command) => maskSecrets(await send(ctx, ctx.allowed, command)) as T;
+/** Every read masks secrets, so Redaction means one thing on every read. */
+const read = async <T>(ctx: Context, command: Command) => maskSecrets(await send(ctx, ctx.allowed, command)) as T;
 
 /** Sends a config REST request; HA's error statuses become failures, except a 404 on GET, which means no such item. */
 async function rest(ctx: Context, allowed: Allowed | undefined, request: RestRequest): Promise<unknown> {
@@ -159,6 +181,13 @@ async function rest(ctx: Context, allowed: Allowed | undefined, request: RestReq
     throw new ToolFailure(`Home Assistant refused the request: ${message}`);
   }
   return answer.body;
+}
+
+/** A stored scene, automation, script or helper by its write id, unmasked, so a write can merge it; undefined if there is none. */
+async function stored(ctx: Context, allowed: Allowed | undefined, kind: ConfigWrite['kind'], id: string): Promise<Record<string, unknown> | undefined> {
+  if (kind !== 'helper') return (await rest(ctx, allowed, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
+  const [domain, item] = splitHelperId(id);
+  return (await send<Record<string, unknown>[]>(ctx, allowed, { type: `${domain}/list` })).find((h) => h.id === item);
 }
 
 interface HaState {
@@ -177,13 +206,13 @@ interface RegistryEntity {
 /** Each registered entity's aliases and its area and label names, which a states query also matches. */
 async function registryNames(ctx: Context): Promise<Map<string, string[]>> {
   const [entities, devices, areas, labels] = await Promise.all([
-    plainRead<RegistryEntity[]>(ctx, { type: 'config/entity_registry/list' }),
-    plainRead<{ id: string; area_id: string | null }[]>(ctx, { type: 'config/device_registry/list' }),
-    plainRead<{ area_id: string; name: string }[]>(ctx, { type: 'config/area_registry/list' }),
-    plainRead<{ label_id: string; name: string }[]>(ctx, { type: 'config/label_registry/list' }),
+    read<RegistryEntity[]>(ctx, { type: 'config/entity_registry/list' }),
+    read<{ id: string; area_id: string | null }[]>(ctx, { type: 'config/device_registry/list' }),
+    read<{ area_id: string; name: string }[]>(ctx, { type: 'config/area_registry/list' }),
+    read<{ label_id: string; name: string }[]>(ctx, { type: 'config/label_registry/list' }),
   ]);
   // Only the extended entries carry aliases.
-  const extended = await plainRead<Record<string, { aliases?: (string | null)[] } | null>>(ctx, {
+  const extended = await read<Record<string, { aliases?: (string | null)[] } | null>>(ctx, {
     type: 'config/entity_registry/get_entries',
     entity_ids: entities.map((e) => e.entity_id),
   });
@@ -206,9 +235,9 @@ const getStates = defineTool({
   title: 'Get entity states',
   description: [
     'Lists the current state of Home Assistant entities, sorted by entity_id, with each entity_id, friendly name and state.',
-    'Filter by `domain` (such as `light`), by exact `state` (such as `on`), and by `query`, a case-insensitive substring of the entity_id, friendly name, aliases, or area and label names.',
-    'Filter by `area` or `label` id to get what a Home Assistant service call targeting that area or label acts on.',
+    'Filter by `domain` (such as `light`), by exact `state` (such as `on`), and by `query`, a case-insensitive substring of the entity_id, friendly name, aliases, or area and label names; filter by `area` or `label` id to get what a Home Assistant service call targeting that area or label acts on.',
     'Attributes are left out unless `full` is true; bearer tokens in camera, image and media_player attributes are always removed.',
+    MASKED,
     PAGED,
     'Example: {"domain": "light", "query": "kitchen", "state": "on"} lists the kitchen lights that are on.',
   ].join(' '),
@@ -223,11 +252,11 @@ const getStates = defineTool({
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run(args, ctx) {
-    const states = await plainRead<HaState[]>(ctx, { type: 'get_states' });
+    const states = await read<HaState[]>(ctx, { type: 'get_states' });
     const query = args.query?.toLowerCase();
     const names = query === undefined ? new Map<string, string[]>() : await registryNames(ctx);
     const within = async (key: 'area_id' | 'label_id', id: string | undefined) =>
-      id === undefined ? undefined : new Set(await extract((command) => plainRead(ctx, command), { [key]: [id] }));
+      id === undefined ? undefined : new Set(await extract((command) => read(ctx, command), { [key]: [id] }));
     const inArea = await within('area_id', args.area);
     const labelled = await within('label_id', args.label);
     const matches = states
@@ -250,26 +279,54 @@ const getStates = defineTool({
   },
 });
 
-/** One entity's changes in a window: numeric states get min, max and mean, others a count per state. */
-function summarise(entity_id: string, states: string[]) {
-  const summary = { entity_id, changes: states.length, first: states[0], last: states.at(-1) };
-  const numbers = states.filter((s) => s.trim() !== '').map(Number).filter(Number.isFinite);
+/** HA keeps the history of a deleted or renamed entity, so a named entity_id that is not current is noted, not refused. */
+async function notCurrent(ctx: Context, entityIds: string[]) {
+  const current = new Set((await read<HaState[]>(ctx, { type: 'get_states' })).map((s) => s.entity_id));
+  const missing = entityIds.filter((id) => !current.has(id));
+  return missing.length > 0 ? { not_current_entity_ids: missing } : {};
+}
+
+type HistoryRow = { s: string; lu: number; lc?: number };
+
+/**
+ * One entity's window: HA's first row is the state at the start when stamped with the start time, so it is not a change.
+ * The numeric mean weights each value by how long it held, leaving out unknown, unavailable and other non-numeric stretches.
+ */
+function summarise(entity_id: string, rows: HistoryRow[], start: string, end: string) {
+  const [from, to] = [Date.parse(start), Date.parse(end)];
+  const atStart = rows[0] !== undefined && Math.round(rows[0].lu * 1000) === from;
+  const summary = { entity_id, changes: rows.length - (atStart ? 1 : 0), first: rows[0]?.s, last: rows.at(-1)?.s };
+  const at = (row: HistoryRow) => Math.max(from, Math.round((row.lc ?? row.lu) * 1000));
+  const numbers: number[] = [];
+  let [weighted, held, skipped] = [0, 0, 0];
+  for (const [i, row] of rows.entries()) {
+    const value = row.s.trim() === '' ? NaN : Number(row.s);
+    if (!Number.isFinite(value)) {
+      skipped += 1;
+      continue;
+    }
+    const next = rows[i + 1];
+    const span = (next ? at(next) : to) - at(row);
+    numbers.push(value);
+    weighted += value * span;
+    held += span;
+  }
   if (numbers.length > 0) {
-    const sum = numbers.reduce((a, b) => a + b, 0);
-    return { ...summary, min: numbers.reduce((a, b) => Math.min(a, b)), max: numbers.reduce((a, b) => Math.max(a, b)), mean: sum / numbers.length };
+    const mean = held > 0 ? weighted / held : numbers.reduce((a, b) => a + b, 0) / numbers.length;
+    return { ...summary, min: numbers.reduce((a, b) => Math.min(a, b)), max: numbers.reduce((a, b) => Math.max(a, b)), mean, skipped };
   }
   const counts: Record<string, number> = {};
-  for (const s of states) counts[s] = (counts[s] ?? 0) + 1;
+  for (const row of rows) counts[row.s] = (counts[row.s] ?? 0) + 1;
   return { ...summary, states: counts };
 }
 
 const getHistory = defineTool({
   title: 'Get entity history',
   description: [
-    'Lists the state changes of the given entities over a time window, one row per change with its entity_id, state and last_changed time, sorted by entity_id and then time.',
-    'The window defaults to the last 24 hours; `start` and `end` take ISO 8601 times.',
-    'With `summary` it returns one entry per entity instead: the number of changes, the first and last state, and either the minimum, maximum and mean of numeric states or a count of each state.',
-    'Attributes are not returned.',
+    'Lists the state changes of the given entities over a time window, without attributes, one row per change with its entity_id, state and last_changed time, sorted by entity_id and then time; each entity\'s first row is the state it already had at the window start, stamped with the start time.',
+    'The window defaults to the last 24 hours; `start` and `end` take ISO 8601 times, and a `start` after `end` is refused; a named entity_id that is not a current entity is still read, because HA keeps the history of deleted and renamed entities, and is listed in `not_current_entity_ids`.',
+    'With `summary` it returns one entry per entity instead: the number of changes after the window start, the state at the window start and the last state, and either the minimum, maximum and time-weighted mean of numeric states, with `skipped` counting the unknown, unavailable and other non-numeric states left out, or a count of each state.',
+    MASKED,
     PAGED,
     'Example: {"entity_ids": ["sensor.kitchen_temperature"], "summary": true} summarises the kitchen temperature over the last day.',
   ].join(' '),
@@ -282,18 +339,21 @@ const getHistory = defineTool({
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run(args, ctx) {
     const { start, end } = windowOf(args, 24);
-    const changes = await plainRead<Record<string, { s: string; lu: number; lc?: number }[]>>(ctx, {
-      type: 'history/history_during_period',
-      start_time: start,
-      end_time: end,
-      entity_ids: args.entity_ids,
-      no_attributes: true,
-    });
+    const [changes, missing] = await Promise.all([
+      read<Record<string, HistoryRow[]>>(ctx, {
+        type: 'history/history_during_period',
+        start_time: start,
+        end_time: end,
+        entity_ids: args.entity_ids,
+        no_attributes: true,
+      }),
+      notCurrent(ctx, args.entity_ids),
+    ]);
     const ids = Object.keys(changes).sort();
     const entries = args.summary
-      ? ids.map((id) => summarise(id, changes[id]!.map((c) => c.s)))
+      ? ids.map((id) => summarise(id, changes[id]!, start, end))
       : ids.flatMap((id) => changes[id]!.map((c) => ({ entity_id: id, state: c.s, last_changed: isoOf(c.lc ?? c.lu) })));
-    return text({ start, end, ...pageOf('history', entries, args) });
+    return text({ start, end, ...missing, ...pageOf('history', entries, args) });
   },
 });
 
@@ -302,6 +362,8 @@ const getLogbook = defineTool({
   description: [
     'Lists Home Assistant logbook entries over a time window, oldest first: what changed or happened, when, and the context that caused it.',
     'The window defaults to the last hour; `start` and `end` take ISO 8601 times, and `entity_id` keeps only one entity\'s entries.',
+    'A `start` after `end` is refused; an `entity_id` that is not a current entity is still read, because HA keeps the logbook of deleted and renamed entities, and is listed in `not_current_entity_ids`.',
+    MASKED,
     PAGED,
     'Example: {"entity_id": "lock.front_door", "start": "2026-10-26T06:00:00Z"} shows the front door lock since 6 am UTC.',
   ].join(' '),
@@ -313,36 +375,42 @@ const getLogbook = defineTool({
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run(args, ctx) {
     const { start, end } = windowOf(args, 1);
-    const entries = await plainRead<{ when: number }[]>(ctx, {
-      type: 'logbook/get_events',
-      start_time: start,
-      end_time: end,
-      ...(args.entity_id !== undefined && { entity_ids: [args.entity_id] }),
-    });
-    return text({ start, end, ...pageOf('entries', entries.map((e) => ({ ...e, when: isoOf(e.when) })), args) });
+    const [entries, missing] = await Promise.all([
+      read<{ when: number }[]>(ctx, {
+        type: 'logbook/get_events',
+        start_time: start,
+        end_time: end,
+        ...(args.entity_id !== undefined && { entity_ids: [args.entity_id] }),
+      }),
+      args.entity_id === undefined ? {} : notCurrent(ctx, [args.entity_id]),
+    ]);
+    return text({ start, end, ...missing, ...pageOf('entries', entries.map((e) => ({ ...e, when: isoOf(e.when) })), args) });
   },
 });
 
-const mentions = (entry: Record<string, unknown>, query: string) =>
-  Object.values(entry).some((v) => [v].flat().some((x) => typeof x === 'string' && x.toLowerCase().includes(query)));
+const mentions = (value: unknown, query: string): boolean =>
+  typeof value === 'string'
+    ? value.toLowerCase().includes(query)
+    : typeof value === 'object' && value !== null && Object.values(value).some((v) => mentions(v, query));
 
 const getRegistry = defineTool({
   title: 'Get registry',
   description: [
     'Lists the entries of one Home Assistant registry, in registry order: `entity`, `device`, `area`, `label` or `floor`.',
     'Entries are returned as Home Assistant stores them, with ids, names and the area, floor, device and label ids that link them.',
-    '`query` keeps entries whose text fields contain it, case-insensitively, such as an id, a name or an alias.',
+    '`query` keeps entries with any text value that contains it, case-insensitively: an id, a name or an alias, and nested values too, such as a device\'s MAC address or identifiers; fixed values such as `disabled_by` match too, so "user" also finds entries a user disabled.',
+    MASKED,
     PAGED,
     'Example: {"registry": "area", "query": "kitchen"} finds the kitchen area and its floor_id.',
   ].join(' '),
   input: z.strictObject({
     registry: z.enum(['entity', 'device', 'area', 'label', 'floor']).describe('The registry to list.'),
-    query: z.string().min(1).optional().describe('Case-insensitive substring of any text field.'),
+    query: z.string().min(1).optional().describe('Case-insensitive substring of any text value in an entry, nested ones included.'),
     ...page,
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run(args, ctx) {
-    const entries = await plainRead<Record<string, unknown>[]>(ctx, { type: `config/${args.registry}_registry/list` });
+    const entries = await read<Record<string, unknown>[]>(ctx, { type: `config/${args.registry}_registry/list` });
     const query = args.query?.toLowerCase();
     return text(pageOf('entries', query === undefined ? entries : entries.filter((e) => mentions(e, query)), args));
   },
@@ -361,7 +429,7 @@ const getConfig = defineTool({
     'Returns the stored configuration of one automation, script, scene or helper (input_*, counter, timer or schedule).',
     'Name an automation or script by `kind` and `entity_id`, such as automation.porch_light; a scene by its config `id`; and a helper by `id` as `<domain>.<id>`, such as input_boolean.guest_mode.',
     'Scene and helper configs are served only to a Caller that may write that kind.',
-    'Values that look like secrets, such as passwords, tokens, API keys, URL credentials and Bearer tokens, come back as **REDACTED**; this is best-effort, so other secrets in the config may still show.',
+    MASKED,
     'Example: {"kind": "automation", "entity_id": "automation.porch_light"}.',
   ].join(' '),
   input: z
@@ -372,34 +440,45 @@ const getConfig = defineTool({
     })
     .superRefine(({ kind, entity_id, id }, ctx) => {
       const byEntity = kind === 'automation' || kind === 'script';
-      if (byEntity && entity_id === undefined) ctx.addIssue({ code: 'custom', path: ['entity_id'], message: `is required for an ${kind}` });
+      const a = kind === 'automation' ? 'an' : 'a';
+      const [taken, other] = byEntity ? (['entity_id', 'id'] as const) : (['id', 'entity_id'] as const);
+      if ({ entity_id, id }[other] !== undefined) ctx.addIssue({ code: 'custom', path: [other], message: `is not taken for ${a} ${kind}, which takes only ${taken}` });
+      if (byEntity && entity_id === undefined) ctx.addIssue({ code: 'custom', path: ['entity_id'], message: `is required for ${a} ${kind}` });
+      if (byEntity && entity_id?.startsWith(`${kind}.`) === false) {
+        ctx.addIssue({ code: 'custom', path: ['entity_id'], message: `its domain must match kind: ${a} ${kind} takes ${kind}.<id>` });
+      }
       if (!byEntity && id === undefined) ctx.addIssue({ code: 'custom', path: ['id'], message: `is required for a ${kind}` });
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
     }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   decide: ({ kind }, policy, caller) => ({ ...decideConfigRead(policy, caller, kind), lacking: `${kind} config`, request: { kind } }),
   async run({ kind, entity_id, id }, ctx) {
-    if (kind === 'automation' || kind === 'script') return text(await configRead(ctx, { type: `${kind}/config`, entity_id }));
-    if (kind === 'scene') {
-      const config = await rest(ctx, ctx.allowed, { method: 'GET', path: configPath(kind, id!) });
-      if (config === undefined) throw new ToolFailure(`Scene ${id} not found.`);
-      return text({ config: maskSecrets(stripBearerTokens(config)) });
-    }
-    const [domain, item] = splitHelperId(id!);
-    const config = (await configRead<{ id: string }[]>(ctx, { type: `${domain}/list` })).find((h) => h.id === item);
-    if (config === undefined) throw new ToolFailure(`Helper ${id} not found.`);
-    return text({ config });
+    if (kind === 'automation' || kind === 'script') return text(await read(ctx, { type: `${kind}/config`, entity_id }));
+    const config = await stored(ctx, ctx.allowed, kind, id!);
+    if (config === undefined) throw new ToolFailure(`${kind === 'scene' ? 'Scene' : 'Helper'} ${id} not found.`);
+    return text({ config: maskSecrets(stripBearerTokens(config)) });
   },
 });
 
 type TraceSummary = { timestamp: { start: string } };
+
+/**
+ * Refuses a trace call whose id names no automation or script, so a wrong id is not read as no runs.
+ * The registry's unique_id is the config id or object id, YAML automations included.
+ */
+async function assertItemExists(ctx: Context, kind: string, id: string) {
+  const entities = await send<{ platform: string; unique_id: string }[]>(ctx, ctx.allowed, { type: 'config/entity_registry/list' });
+  if (entities.some((e) => e.platform === kind && e.unique_id === id)) return;
+  throw new ToolFailure(`No ${kind} has the id ${id}. Name it by an automation's config id or a script's object id (the part after script.), not by its entity_id.`);
+}
 
 const listTraces = defineTool({
   title: 'List traces',
   description: [
     'Lists the stored runs of one automation or script, newest first, as summaries: run_id, start and finish time, state, last step, what triggered it and any error.',
     'Name the item by `kind` (automation or script) and `id`: an automation\'s config `id` from its config, or a script\'s object id, the part of its entity_id after `script.`.',
-    'Secret-looking values come back as **REDACTED**, best-effort.',
+    'An id that names no automation or script is refused; one with no stored runs returns an empty list.',
+    MASKED,
     PAGED,
     'Example: {"kind": "script", "id": "morning"} lists the runs of script.morning.',
   ].join(' '),
@@ -407,7 +486,8 @@ const listTraces = defineTool({
   input: z.strictObject({ kind: scriptKind.describe('automation or script.'), id: itemId, ...page }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run({ kind, id, ...paging }, ctx) {
-    const traces = await configRead<TraceSummary[]>(ctx, { type: 'trace/list', domain: kind, item_id: id });
+    const traces = await read<TraceSummary[]>(ctx, { type: 'trace/list', domain: kind, item_id: id });
+    if (traces.length === 0) await assertItemExists(ctx, kind, id);
     return text(pageOf('traces', traces.sort((a, b) => Date.parse(b.timestamp.start) - Date.parse(a.timestamp.start)), paging));
   },
 });
@@ -421,7 +501,8 @@ const getTrace = defineTool({
     'Returns one run of an automation or script: its summary, plus the `sections` asked for.',
     'The sections are `trace` (each step with its variables and result), `config` (the config the run used), `blueprint_inputs` and `context` (what caused the run).',
     'Name the run by `kind`, `id` (an automation\'s config `id` or a script\'s object id) and `run_id` from its trace list.',
-    'Secret-looking values come back as **REDACTED**, best-effort, and camera, image and media_player bearer tokens are removed.',
+    'Camera, image and media_player bearer tokens are removed.',
+    MASKED,
     'Example: {"kind": "automation", "id": "porch_light_1", "run_id": "1a2b3c", "sections": ["trace"]}.',
   ].join(' '),
   input: z.strictObject({
@@ -432,7 +513,10 @@ const getTrace = defineTool({
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run({ kind, id, run_id, sections }, ctx) {
-    const trace = await configRead<Record<string, unknown>>(ctx, { type: 'trace/get', domain: kind, item_id: id, run_id });
+    const trace = await read<Record<string, unknown>>(ctx, { type: 'trace/get', domain: kind, item_id: id, run_id }).catch(async (e: unknown) => {
+      if (e instanceof ToolFailure) await assertItemExists(ctx, kind, id);
+      throw e;
+    });
     const left = TRACE_SECTIONS.filter((s) => !sections.includes(s)) as string[];
     return text(Object.fromEntries(Object.entries(trace).filter(([key]) => !left.includes(key))));
   },
@@ -454,6 +538,7 @@ const listServices = defineTool({
     'Lists every service Home Assistant offers, sorted by name, each with its fields, whether it takes a target, whether it returns a response, and whether this Caller may call it (`callable`).',
     'A service marked callable may still be refused for a particular target that this Caller may not act on.',
     'Filter by `domain` (such as `light`).',
+    MASKED,
     PAGED,
     'Example: {"domain": "light"} lists the light services.',
   ].join(' '),
@@ -463,7 +548,7 @@ const listServices = defineTool({
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run(args, ctx) {
-    const all = await plainRead<Record<string, Record<string, HaService>>>(ctx, { type: 'get_services' });
+    const all = await read<Record<string, Record<string, HaService>>>(ctx, { type: 'get_services' });
     const services = Object.entries(all)
       .filter(([domain]) => args.domain === undefined || domain === args.domain)
       .flatMap(([domain, byName]) => Object.entries(byName).map(([name, d]) => ({ service: `${domain}.${name}`, d })))
@@ -589,17 +674,19 @@ const writeConfig = defineTool({
       ctx.audit({ kind, action, id, decision: 'deny', reason: 'config carries a redacted value' });
       throw new ToolFailure(`config carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
     }
-    if (kind !== 'helper' && action !== 'delete') {
-      const lookup = decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed;
-      const stored = (await rest(ctx, lookup, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
-      if (action === 'create' && stored) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
-      if (action === 'update' && !stored) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
-      if (stored) allowed = mergedUpdate(allowed, stored);
-    }
+    // Recorded before the lookup, so a write refused by its lookup, failed, or of unknown outcome still leaves a record.
     if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
+    // A new helper takes its id from its name, so only a helper update has a stored item to look up.
+    if (action === 'update' || (kind !== 'helper' && action === 'create')) {
+      const item = await stored(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, kind, id);
+      if (action === 'create' && item) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
+      if (action === 'update' && !item) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
+      if (item) allowed = mergedUpdate(allowed, item);
+    }
     const { write } = allowed;
     if (!write) throw new Error('config write sent without a write');
     const result = write.via === 'websocket' ? await send(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
+    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, outcome: 'done' });
     // A helper write echoes the whole stored item, keys the Caller did not send included.
     return writeResult({ kind, action, id, result: maskSecrets(stripBearerTokens(result)) });
   },
@@ -690,8 +777,10 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
     try {
       const result = await tool.run(args.data, { ...decided, policy, auth, gate, audit: audited, options });
       // A read is refused whole rather than cut off, so the Caller never reasons over a truncated answer.
-      if (READS.has(operation) && Buffer.byteLength(JSON.stringify(result.content)) > BYTE_CAP) {
-        return failure(`The response is over ${BYTE_CAP / 1000} kB, so nothing was returned: narrow the query with filters, a shorter window or a smaller limit.`);
+      if (READS.has(operation) && charsOf(result) > CHAR_CAP) {
+        const narrowing = NARROWING[name];
+        const over = `The response is over ${CHAR_CAP} characters, so nothing was returned`;
+        return failure(narrowing === undefined ? `${over}, and this tool offers no narrower query.` : `${over}: narrow the query with ${narrowing}.`);
       }
       return server.projectCallToolResult(result, undefined);
     } catch (e) {
