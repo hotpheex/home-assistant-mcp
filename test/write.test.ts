@@ -90,7 +90,6 @@ test('an update merges its top-level keys into the stored config, since HA repla
   const invalid = await call('ha_write_config', { kind: 'automation', action: 'create', id: 'bare', config: { alias: 'No triggers' } });
   assert.equal(invalid.result.isError, true);
   assert.match(JSON.stringify(invalid.result.content), /Home Assistant refused the request: Message malformed: required key not provided/);
-  // Recorded before the lookup, so a write refused by its lookup or by HA still leaves its allow line.
   assert.deepEqual(
     server.audits().map((a) => [a.id, a.decision, a.outcome]),
     [['porch_light_1', 'allow', undefined], ['porch_light_1', undefined, 'done'], ['nope', 'allow', undefined], ['porch_light_1', 'allow', undefined], ['bare', 'allow', undefined]],
@@ -149,11 +148,13 @@ test('helper writes go through the helper domain WebSocket commands; an update s
   await call('ha_write_config', { kind: 'helper', action: 'create', id: 'timer.tea', config: { name: 'Tea', duration: '0:04:00', restore: true } });
   await call('ha_write_config', { kind: 'helper', action: 'update', id: 'timer.tea', config: { name: 'Green tea' } });
   assert.deepEqual(ha.helpers.timer, [{ id: 'tea', name: 'Green tea', duration: '0:04:00', restore: true }]);
+  const extra = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'timer.tea', config: { colour: 'green' } });
+  assert.match(JSON.stringify(extra.result.content), /Home Assistant refused the request: extra keys not allowed @ data\['colour'\]/);
 
-  const updated = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'input_text.wifi_password', config: { initial: 'y' } });
-  const stored = { id: 'wifi_password', name: 'Wifi password', initial: 'y', api_key: 'HELPERSECRET', min: 0, max: 100, mode: 'text' };
+  const updated = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'input_text.nas_url', config: { icon: 'mdi:nas' } });
+  const stored = { id: 'nas_url', name: 'NAS URL', initial: 'https://bob:HELPERSECRET@nas.local', icon: 'mdi:nas', min: 0, max: 100, mode: 'text' };
   assert.deepEqual(ha.helpers.input_text, [stored]);
-  assert.deepEqual(body(updated.result), { kind: 'helper', action: 'update', id: 'input_text.wifi_password', result: { ...stored, api_key: M } });
+  assert.deepEqual(body(updated.result), { kind: 'helper', action: 'update', id: 'input_text.nas_url', result: { ...stored, initial: `https://${M}@nas.local` } });
 
   const deleted = await call('ha_write_config', { kind: 'helper', action: 'delete', id: 'input_boolean.guest_mode' });
   assert.deepEqual(deleted.sent, [{ type: 'input_boolean/delete', input_boolean_id: 'guest_mode' }]);
@@ -171,8 +172,8 @@ test('helper writes go through the helper domain WebSocket commands; an update s
       ['create', 'input_number.target_temp', 'allow'], ['create', 'input_number.target_temp', 'done'],
       ['update', 'input_number.target_temp', 'allow'], ['update', 'input_number.target_temp', 'done'],
       ['create', 'timer.tea', 'allow'], ['create', 'timer.tea', 'done'],
-      ['update', 'timer.tea', 'allow'], ['update', 'timer.tea', 'done'],
-      ['update', 'input_text.wifi_password', 'allow'], ['update', 'input_text.wifi_password', 'done'],
+      ['update', 'timer.tea', 'allow'], ['update', 'timer.tea', 'done'], ['update', 'timer.tea', 'allow'],
+      ['update', 'input_text.nas_url', 'allow'], ['update', 'input_text.nas_url', 'done'],
       ['delete', 'input_boolean.guest_mode', 'allow'], ['delete', 'input_boolean.guest_mode', 'done'],
       ['update', 'timer.nope', 'allow'],
     ],
@@ -215,12 +216,12 @@ test('ha_get_config serves scene and helper config, masked, only to a Caller tha
   assert.match(JSON.stringify((await scener.call('ha_get_config', { kind: 'scene', id: 'nope' })).result.content), /Scene nope not found/);
 
   const helperer = await as('helperer');
-  const helper = await helperer.call('ha_get_config', { kind: 'helper', id: 'input_text.wifi_password' });
+  const helper = await helperer.call('ha_get_config', { kind: 'helper', id: 'input_text.nas_url' });
   assert.deepEqual(helper.sent, [{ type: 'input_text/list' }]);
-  assert.deepEqual(body(helper.result), { config: { id: 'wifi_password', name: 'Wifi password', initial: 'x', api_key: M } });
+  assert.deepEqual(body(helper.result), { config: { id: 'nas_url', name: 'NAS URL', initial: `https://${M}@nas.local` } });
   const automation = await helperer.call('ha_get_config', { kind: 'automation', entity_id: 'automation.porch_light' });
   assert.equal(automation.result.isError, undefined, 'any config write gives automation and script config read');
-  const noId = await helperer.call('ha_get_config', { kind: 'helper', entity_id: 'input_text.wifi_password' });
+  const noId = await helperer.call('ha_get_config', { kind: 'helper', entity_id: 'input_text.nas_url' });
   assert.match(JSON.stringify(noId.result.content), /id: is required for a helper/);
   const extraEntity = await scener.call('ha_get_config', { kind: 'scene', id: 'movie_night_1', entity_id: 'scene.movie_night' });
   assert.match(JSON.stringify(extraEntity.result.content), /entity_id: is not taken for a scene, which takes only id/);
@@ -228,7 +229,7 @@ test('ha_get_config serves scene and helper config, masked, only to a Caller tha
 
   for (const [who, args] of [
     ['auditor', { kind: 'scene', id: 'movie_night_1' }],
-    ['auditor', { kind: 'helper', id: 'input_text.wifi_password' }],
+    ['auditor', { kind: 'helper', id: 'input_text.nas_url' }],
     ['automator', { kind: 'scene', id: 'movie_night_1' }],
   ] as const) {
     const denied = await (await as(who)).call('ha_get_config', args);

@@ -48,6 +48,7 @@ test('ha_get_config reads an automation or script config with its secrets masked
   const extraId = await call('ha_get_config', { kind: 'automation', entity_id: 'automation.porch_light', id: 'porch_light_1' });
   assert.match(JSON.stringify(extraId.result.content), /id: is not taken for an automation, which takes only entity_id/);
   assert.deepEqual(extraId.sent, []);
+  assert.match(JSON.stringify((await call('ha_get_config', { kind: 'script' })).result.content), /entity_id: is required for a script/);
 });
 
 test('ha_list_traces requires kind and id, always sends item_id, and pages newest first', async (t) => {

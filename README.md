@@ -9,6 +9,7 @@ Home Assistant tokens carry no scope: any token can do anything its user can. Th
 - **Least privilege towards HA.** Reads and service calls use a non-admin HA user; only config reads and writes use an admin token.
 - **Audited.** Every refusal is logged as a JSON line, and allowed calls can be too.
 - **Redacted.** Every read masks values under secret-looking keys, URL credentials and `Bearer` tokens as `**REDACTED**`, and strips camera, image and media_player bearer tokens. This is best-effort: see [SECURITY.md](SECURITY.md).
+- **Sized to show inline.** A result is at most 48,000 characters, below Claude Code's 50,000-character file threshold. A larger read is refused with a hint on how to narrow it, and a larger write result is cut with a marker.
 
 Requires Home Assistant 2026.10 or newer.
 
