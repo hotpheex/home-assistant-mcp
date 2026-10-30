@@ -17,6 +17,9 @@ export interface FakeEntity {
   hidden_by?: string | null;
   disabled_by?: string | null;
   entity_category?: 'config' | 'diagnostic' | null;
+  platform?: string;
+  /** An automation's config id, or a script's object id. */
+  unique_id?: string;
   /** Served only by get_entries, as in HA. */
   aliases?: string[];
 }
@@ -108,7 +111,7 @@ const haError = (code: string, message: string): never => {
 };
 
 type Target = Partial<Record<'entity_id' | 'device_id' | 'area_id' | 'floor_id' | 'label_id', string | string[]>>;
-type Entity = Required<Omit<FakeEntity, 'name' | 'aliases'>>;
+type Entity = Required<Omit<FakeEntity, 'name' | 'aliases' | 'platform' | 'unique_id'>>;
 type Device = { id: string; area_id: string | null; labels: string[]; parent_device_id: string | null };
 /** The registry fields `extract_from_target` reads, with HA's defaults filled in. */
 export type Registry = {

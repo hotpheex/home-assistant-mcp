@@ -456,11 +456,22 @@ const getConfig = defineTool({
 
 type TraceSummary = { timestamp: { start: string } };
 
+/**
+ * Refuses a trace call whose id names no automation or script, so a wrong id is not read as no runs.
+ * The registry's unique_id is the config id or object id, YAML automations included; only the outcome is returned.
+ */
+async function assertItemExists(ctx: Context, kind: string, id: string) {
+  const entities = await send<{ platform: string; unique_id: string }[]>(ctx, ctx.allowed, { type: 'config/entity_registry/list' });
+  if (entities.some((e) => e.platform === kind && e.unique_id === id)) return;
+  throw new ToolFailure(`No ${kind} has the id ${id}. Name it by an automation's config id or a script's object id (the part after script.), not by its entity_id.`);
+}
+
 const listTraces = defineTool({
   title: 'List traces',
   description: [
     'Lists the stored runs of one automation or script, newest first, as summaries: run_id, start and finish time, state, last step, what triggered it and any error.',
     'Name the item by `kind` (automation or script) and `id`: an automation\'s config `id` from its config, or a script\'s object id, the part of its entity_id after `script.`.',
+    'An id that names no automation or script is refused; one with no stored runs returns an empty list.',
     'Secret-looking values come back as **REDACTED**, best-effort.',
     PAGED,
     'Example: {"kind": "script", "id": "morning"} lists the runs of script.morning.',
@@ -470,6 +481,7 @@ const listTraces = defineTool({
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run({ kind, id, ...paging }, ctx) {
     const traces = await configRead<TraceSummary[]>(ctx, { type: 'trace/list', domain: kind, item_id: id });
+    if (traces.length === 0) await assertItemExists(ctx, kind, id);
     return text(pageOf('traces', traces.sort((a, b) => Date.parse(b.timestamp.start) - Date.parse(a.timestamp.start)), paging));
   },
 });
@@ -494,7 +506,10 @@ const getTrace = defineTool({
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   async run({ kind, id, run_id, sections }, ctx) {
-    const trace = await configRead<Record<string, unknown>>(ctx, { type: 'trace/get', domain: kind, item_id: id, run_id });
+    const trace = await configRead<Record<string, unknown>>(ctx, { type: 'trace/get', domain: kind, item_id: id, run_id }).catch(async (e: unknown) => {
+      if (e instanceof ToolFailure) await assertItemExists(ctx, kind, id);
+      throw e;
+    });
     const left = TRACE_SECTIONS.filter((s) => !sections.includes(s)) as string[];
     return text(Object.fromEntries(Object.entries(trace).filter(([key]) => !left.includes(key))));
   },
