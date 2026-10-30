@@ -123,7 +123,7 @@ All settings are environment variables.
 | `HAMCP_HA_ADMIN_TOKEN[_FILE]` | | Token of an HA admin. Needed only for `read: config` and `config_write` Grants. |
 | `HAMCP_LISTEN` | `0.0.0.0:8080` | Listen address. |
 | `HAMCP_ALLOWED_ORIGINS` | | Comma-separated browser origins allowed to call `/mcp`. |
-| `HAMCP_AUDIT_WRITES` | `false` | Also log allowed writes. |
+| `HAMCP_AUDIT_WRITES` | `false` | Also log allowed writes, and whether HA accepted them. |
 | `HAMCP_AUDIT_READS` | `false` | Also log allowed reads. |
 
 The server reads only the tokens its Grants need. It refuses to start if the users token belongs to an admin.

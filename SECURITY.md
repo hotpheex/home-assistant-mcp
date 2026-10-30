@@ -78,9 +78,9 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/read.test.ts`, `test/config.test.ts` and `test/write.test.ts`: Redaction in the read tools, and the marker refusal.
 - `test/e2e.test.ts`: no bearer token or secret from a real HA appears in any byte the ten tools return.
 
-**Audit.** The server writes one JSON object per line to stdout; audit records carry `"audit": true`. Every refusal is recorded, failed authentication included. Allowed calls are recorded only with `HAMCP_AUDIT_WRITES` or `HAMCP_AUDIT_READS`. Records hold names only: never service data, config bodies, responses or keys.
+**Audit.** The server writes one JSON object per line to stdout; audit records carry `"audit": true`. Every refusal is recorded, failed authentication included. Allowed calls are recorded only with `HAMCP_AUDIT_WRITES` or `HAMCP_AUDIT_READS`. An allowed write records `allow` before any request to HA and `outcome: done` once HA accepts it, so an `allow` with no `done` is a write that failed or whose outcome is unknown. Records hold names only: never service data, config bodies, responses or keys.
 - `test/serve.test.ts`: refused keys and Origins audited without the key, and in the coverage matrix, every refused tool call audited and allowed calls audited only on opt-in.
-- `test/services.test.ts` and `test/write.test.ts`: allowed writes audited by name, before they are sent.
+- `test/services.test.ts` and `test/write.test.ts`: allowed writes audited by name before any request to HA, and their outcome once HA accepts them.
 
 ## Kill switch
 
