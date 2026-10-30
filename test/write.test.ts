@@ -194,6 +194,9 @@ test('ha_get_config serves scene and helper config, masked, only to a Caller tha
   assert.equal(automation.result.isError, undefined, 'any config write gives automation and script config read');
   const noId = await helperer.call('ha_get_config', { kind: 'helper', entity_id: 'input_text.wifi_password' });
   assert.match(JSON.stringify(noId.result.content), /id: is required for a helper/);
+  const extraEntity = await scener.call('ha_get_config', { kind: 'scene', id: 'movie_night_1', entity_id: 'scene.movie_night' });
+  assert.match(JSON.stringify(extraEntity.result.content), /entity_id: is not taken for a scene, which takes only id/);
+  assert.deepEqual(extraEntity.sent, []);
 
   for (const [who, args] of [
     ['auditor', { kind: 'scene', id: 'movie_night_1' }],

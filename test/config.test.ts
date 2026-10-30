@@ -33,6 +33,13 @@ test('ha_get_config reads an automation or script config with its secrets masked
   const unknown = await call('ha_get_config', { kind: 'script', entity_id: 'script.nope' });
   assert.equal(unknown.result.isError, true);
   assert.match(JSON.stringify(unknown.result.content), /Entity not found/);
+
+  const mismatch = await call('ha_get_config', { kind: 'automation', entity_id: 'script.morning' });
+  assert.match(JSON.stringify(mismatch.result.content), /entity_id: its domain must match kind: an automation takes automation\.<id>/);
+  assert.deepEqual(mismatch.sent, []);
+  const extraId = await call('ha_get_config', { kind: 'automation', entity_id: 'automation.porch_light', id: 'porch_light_1' });
+  assert.match(JSON.stringify(extraId.result.content), /id: is not taken for an automation, which takes only entity_id/);
+  assert.deepEqual(extraId.sent, []);
 });
 
 test('ha_list_traces requires kind and id, always sends item_id, and pages newest first', async (t) => {

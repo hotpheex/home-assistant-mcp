@@ -372,7 +372,13 @@ const getConfig = defineTool({
     })
     .superRefine(({ kind, entity_id, id }, ctx) => {
       const byEntity = kind === 'automation' || kind === 'script';
+      const a = kind === 'automation' ? 'an' : 'a';
+      const [taken, other] = byEntity ? (['entity_id', 'id'] as const) : (['id', 'entity_id'] as const);
+      if ({ entity_id, id }[other] !== undefined) ctx.addIssue({ code: 'custom', path: [other], message: `is not taken for ${a} ${kind}, which takes only ${taken}` });
       if (byEntity && entity_id === undefined) ctx.addIssue({ code: 'custom', path: ['entity_id'], message: `is required for an ${kind}` });
+      if (byEntity && entity_id?.startsWith(`${kind}.`) === false) {
+        ctx.addIssue({ code: 'custom', path: ['entity_id'], message: `its domain must match kind: ${a} ${kind} takes ${kind}.<id>` });
+      }
       if (!byEntity && id === undefined) ctx.addIssue({ code: 'custom', path: ['id'], message: `is required for a ${kind}` });
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
     }),
