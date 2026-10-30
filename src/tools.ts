@@ -666,6 +666,8 @@ const writeConfig = defineTool({
       ctx.audit({ kind, action, id, decision: 'deny', reason: 'config carries a redacted value' });
       throw new ToolFailure(`config carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
     }
+    // Recorded before the lookup, so a write refused by its lookup, failed, or of unknown outcome still leaves a record.
+    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
     // A new helper takes its id from its name, so only a helper update has a stored item to look up.
     if (action === 'update' || (kind !== 'helper' && action === 'create')) {
       const lookup = decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed;
@@ -678,10 +680,10 @@ const writeConfig = defineTool({
       if (action === 'update' && !stored) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
       if (stored) allowed = mergedUpdate(allowed, stored);
     }
-    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
     const { write } = allowed;
     if (!write) throw new Error('config write sent without a write');
     const result = write.via === 'websocket' ? await send(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
+    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, outcome: 'done' });
     // A helper write echoes the whole stored item, keys the Caller did not send included.
     return writeResult({ kind, action, id, result: maskSecrets(stripBearerTokens(result)) });
   },

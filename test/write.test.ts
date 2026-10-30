@@ -53,27 +53,19 @@ test('an automation create posts the config to HA, and the allowed write is audi
   assert.deepEqual(Object.values(ha.configs).find((c) => c.id === 'hall_light'), { id: 'hall_light', ...NEW_AUTOMATION });
   assert.deepEqual(body(created.result), { kind: 'automation', action: 'create', id: 'hall_light', result: { result: 'ok' } });
 
-  const [audit] = server.audits().filter((a) => a.caller === 'automator');
+  const who = { time: undefined, audit: true, caller: 'automator', key_hash_prefix: keys.automator!.sha256.slice(0, 8), operation: 'config_write', tool: 'ha_write_config' };
+  const name = { kind: 'automation', action: 'create', id: 'hall_light' };
   assert.deepEqual(
-    { ...audit, time: undefined },
-    {
-      time: undefined,
-      audit: true,
-      caller: 'automator',
-      key_hash_prefix: keys.automator!.sha256.slice(0, 8),
-      operation: 'config_write',
-      tool: 'ha_write_config',
-      kind: 'automation',
-      action: 'create',
-      id: 'hall_light',
-      decision: 'allow',
-      grants: [1],
-    },
+    server.audits().map((a) => ({ ...a, time: undefined })),
+    [
+      { ...who, ...name, decision: 'allow', grants: [1] },
+      { ...who, ...name, outcome: 'done' },
+    ],
   );
 });
 
 test('an update merges its top-level keys into the stored config, since HA replaces the whole entry', async (t) => {
-  const { ha, as } = await house(t);
+  const { ha, server, as } = await house(t);
   const { call } = await as('automator');
   const updated = await call('ha_write_config', { kind: 'automation', action: 'update', id: 'porch_light_1', config: { alias: 'Porch light at dusk' } });
   assert.equal(updated.result.isError, undefined);
@@ -98,10 +90,16 @@ test('an update merges its top-level keys into the stored config, since HA repla
   const invalid = await call('ha_write_config', { kind: 'automation', action: 'create', id: 'bare', config: { alias: 'No triggers' } });
   assert.equal(invalid.result.isError, true);
   assert.match(JSON.stringify(invalid.result.content), /Home Assistant refused the request: Message malformed: required key not provided/);
+  // Recorded before the lookup, so a write refused by its lookup or by HA still leaves its allow line.
+  assert.deepEqual(
+    server.audits().map((a) => [a.id, a.decision, a.outcome]),
+    [['porch_light_1', 'allow', undefined], ['porch_light_1', undefined, 'done'], ['nope', 'allow', undefined], ['porch_light_1', 'allow', undefined], ['bare', 'allow', undefined]],
+  );
+  assert.doesNotMatch(JSON.stringify(server.audits()), /malformed|required key|Porch light at dusk/);
 });
 
 test('deletes, and script and scene writes, go to their own config endpoints', async (t) => {
-  const { ha, as } = await house(t);
+  const { ha, server, as } = await house(t);
   const automator = await as('automator');
   const deleted = await automator.call('ha_write_config', { kind: 'automation', action: 'delete', id: 'porch_light_1' });
   assert.deepEqual(deleted.sent, [{ type: 'DELETE /api/config/automation/config/porch_light_1' }]);
@@ -116,6 +114,10 @@ test('deletes, and script and scene writes, go to their own config endpoints', a
   const scene = { name: 'Reading', entities: { 'light.living_room': { state: 'on' } } };
   const created = await (await as('scener')).call('ha_write_config', { kind: 'scene', action: 'create', id: 'reading', config: scene });
   assert.deepEqual(created.sent.at(-1), { type: 'POST /api/config/scene/config/reading', body: scene });
+  assert.deepEqual(
+    server.audits().map((a) => [a.kind, a.action, a.decision ?? a.outcome]),
+    [['automation', 'delete', 'allow'], ['automation', 'delete', 'done'], ['automation', 'delete', 'allow'], ['script', 'update', 'allow'], ['script', 'update', 'done'], ['scene', 'create', 'allow'], ['scene', 'create', 'done']],
+  );
 });
 
 test('a config write of a kind the Caller does not hold is refused and audited, with nothing sent', async (t) => {
@@ -131,7 +133,7 @@ test('a config write of a kind the Caller does not hold is refused and audited, 
 });
 
 test('helper writes go through the helper domain WebSocket commands; an update sends the stored helper with its keys merged over it', async (t) => {
-  const { ha, as } = await house(t);
+  const { ha, server, as } = await house(t);
   const { call } = await as('helperer');
   const created = await call('ha_write_config', { kind: 'helper', action: 'create', id: 'input_boolean.guest_mode', config: { name: 'Guest mode' } });
   assert.deepEqual(created.sent, [{ type: 'input_boolean/create', name: 'Guest mode' }]);
@@ -162,6 +164,19 @@ test('helper writes go through the helper domain WebSocket commands; an update s
   const person = await call('ha_write_config', { kind: 'helper', action: 'delete', id: 'person.bob' });
   assert.match(JSON.stringify(person.result.content), /id: must be <helper domain>\.<id>/);
   assert.deepEqual(person.sent, []);
+  assert.deepEqual(
+    server.audits().map((a) => [a.action, a.id, a.decision ?? a.outcome]),
+    [
+      ['create', 'input_boolean.guest_mode', 'allow'], ['create', 'input_boolean.guest_mode', 'done'],
+      ['create', 'input_number.target_temp', 'allow'], ['create', 'input_number.target_temp', 'done'],
+      ['update', 'input_number.target_temp', 'allow'], ['update', 'input_number.target_temp', 'done'],
+      ['create', 'timer.tea', 'allow'], ['create', 'timer.tea', 'done'],
+      ['update', 'timer.tea', 'allow'], ['update', 'timer.tea', 'done'],
+      ['update', 'input_text.wifi_password', 'allow'], ['update', 'input_text.wifi_password', 'done'],
+      ['delete', 'input_boolean.guest_mode', 'allow'], ['delete', 'input_boolean.guest_mode', 'done'],
+      ['update', 'timer.nope', 'allow'],
+    ],
+  );
 });
 
 test('a config carrying the Redaction marker is refused with its path, audited by name, and nothing is sent', async (t) => {
