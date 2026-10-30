@@ -324,21 +324,24 @@ const getLogbook = defineTool({
   },
 });
 
-const mentions = (entry: Record<string, unknown>, query: string) =>
-  Object.values(entry).some((v) => [v].flat().some((x) => typeof x === 'string' && x.toLowerCase().includes(query)));
+const mentions = (value: unknown, query: string): boolean =>
+  typeof value === 'string'
+    ? value.toLowerCase().includes(query)
+    : typeof value === 'object' && value !== null && Object.values(value).some((v) => mentions(v, query));
 
 const getRegistry = defineTool({
   title: 'Get registry',
   description: [
     'Lists the entries of one Home Assistant registry, in registry order: `entity`, `device`, `area`, `label` or `floor`.',
     'Entries are returned as Home Assistant stores them, with ids, names and the area, floor, device and label ids that link them.',
-    '`query` keeps entries whose text fields contain it, case-insensitively, such as an id, a name or an alias.',
+    '`query` keeps entries with any text value that contains it, case-insensitively: an id, a name or an alias, and nested values too, such as a device\'s MAC address or identifiers.',
+    'Fixed values such as `disabled_by` match too, so "user" also finds entries a user disabled.',
     PAGED,
     'Example: {"registry": "area", "query": "kitchen"} finds the kitchen area and its floor_id.',
   ].join(' '),
   input: z.strictObject({
     registry: z.enum(['entity', 'device', 'area', 'label', 'floor']).describe('The registry to list.'),
-    query: z.string().min(1).optional().describe('Case-insensitive substring of any text field.'),
+    query: z.string().min(1).optional().describe('Case-insensitive substring of any text value in an entry, nested ones included.'),
     ...page,
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
