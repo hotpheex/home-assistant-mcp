@@ -142,17 +142,33 @@ test('every read masks secrets and strips camera, image and media_player bearer 
   assert.equal(device?.configuration_url, 'http://**REDACTED**@192.168.1.1/');
 });
 
-test('a read over the byte cap is refused with "narrow the query", never cut off', async (t) => {
-  const states = Array.from({ length: 200 }, (_, i) => ({
-    entity_id: `sensor.bulk_${String(i).padStart(3, '0')}`,
-    state: '1',
-    attributes: { friendly_name: `Bulk ${i}`, note: 'x'.repeat(500) },
-  }));
-  const { client, call } = await readerOn(t, { states });
-  const refused = await client.callTool({ name: 'ha_get_states', arguments: { full: true, limit: 200 } });
+test('a read over the character cap is refused with "narrow the query", never cut off; one at the cap is returned whole', async (t) => {
+  // Claude Code saves a text result over 50,000 characters to a file, so the cap sits just below it.
+  const cap = 48_000;
+  const states = [{ entity_id: 'sensor.bulk', state: '1', attributes: { friendly_name: 'Bulk', note: '' } }];
+  const { client } = await readerOn(t, { states });
+  const textLength = async () => ((await client.callTool({ name: 'ha_get_states', arguments: { full: true } })).content as { text: string }[])[0]!.text.length;
+  const padding = cap - (await textLength());
+
+  states[0]!.attributes.note = 'x'.repeat(padding);
+  assert.equal(await textLength(), cap);
+
+  // One character over, and still well under 80 kB in bytes.
+  states[0]!.attributes.note = 'x'.repeat(padding + 1);
+  const refused = await client.callTool({ name: 'ha_get_states', arguments: { full: true } });
   assert.equal(refused.isError, true);
-  assert.match(JSON.stringify(refused.content), /narrow the query/);
-  assert.equal(((await call('ha_get_states', { full: true, limit: 100 })).states as unknown[]).length, 100);
+  const message = (refused.content as { text: string }[])[0]!.text;
+  assert.match(message, /narrow the query/);
+  assert.match(message, /48000 characters/);
+  assert.doesNotMatch(message, /window/);
+});
+
+test("history's size refusal offers a shorter window", async (t) => {
+  const history = Array.from({ length: 300 }, (_, i) => ({ entity_id: 'sensor.bulk', state: String(i).padEnd(200, 'x'), when: ago(300 - i) }));
+  const { client } = await readerOn(t, { history });
+  const refused = await client.callTool({ name: 'ha_get_history', arguments: { entity_ids: ['sensor.bulk'], limit: 300 } });
+  assert.equal(refused.isError, true);
+  assert.match((refused.content as { text: string }[])[0]!.text, /narrow the query with .*a shorter window/);
 });
 
 for (const era of ERAS) {
