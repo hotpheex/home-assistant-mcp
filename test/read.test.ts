@@ -199,7 +199,17 @@ test('allowed reads are audited, naming the read kind and request, only with HAM
 });
 
 test('ha_get_registry lists each registry, filtered by a query', async (t) => {
-  const { call, sent } = await readerOn(t);
+  const device = {
+    id: 'dev_coffee',
+    name: 'Coffee Maker',
+    area_id: 'utility_room',
+    labels: [],
+    connections: [['mac', 'a4:c1:38:9f:22:0b']],
+    identifiers: [['zha', '0x00158d0001e4b2c7']],
+    config_entries: ['entry_1'],
+    config_entries_subentries: { entry_1: ['subentry_42'] },
+  };
+  const { call, sent } = await readerOn(t, { devices: [device] });
   const ids = { entity: 'entity_id', device: 'id', area: 'area_id', label: 'label_id', floor: 'floor_id' } as const;
   const expected = {
     entity: ['switch.coffee_maker', 'light.living_room', 'lock.front_door'],
@@ -219,4 +229,8 @@ test('ha_get_registry lists each registry, filtered by a query', async (t) => {
     { area_id: 'utility_room', name: 'Utility Room', floor_id: 'ground', aliases: [] },
   ]);
   assert.equal((await call('ha_get_registry', { registry: 'entity', limit: 2 })).has_more, true);
+  for (const query of ['38:9F:22', '0x00158d0001e4', 'subentry_4']) {
+    assert.deepEqual((await call('ha_get_registry', { registry: 'device', query })).entries, [device], query);
+  }
+  assert.equal((await call('ha_get_registry', { registry: 'device', query: 'zigbee' })).total, 0);
 });
