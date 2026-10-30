@@ -73,7 +73,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/services.test.ts`: area and label expansion, the service's domain filter, data-key merging, `entity_id: all`, delegating services and Denies on config entities.
 - `test/e2e.test.ts`: against real HA, child devices under a label, hidden and config entities outside an area, and an area Deny catching a config button.
 
-**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Config and trace reads mask values under secret-looking keys, URL userinfo and `Bearer` tokens. A config write carrying the mask marker is refused, so a masked secret is never written back.
+**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Every read, plain, config and trace, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config write carrying the mask marker is refused, so a masked secret is never written back.
 - `test/redaction.test.ts`: what is stripped and masked, and the expected leaks.
 - `test/read.test.ts`, `test/config.test.ts` and `test/write.test.ts`: Redaction in the read tools, and the marker refusal.
 - `test/e2e.test.ts`: no bearer token or secret from a real HA appears in any byte the ten tools return.

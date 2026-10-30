@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import type { FakeHaOptions } from './fake-ha.ts';
-import { body, connect, ERAS, fakeHa, newKey, policyOf, startServer } from './harness.ts';
+import { body, connect, ERAS, fakeHa, HOUSE, newKey, policyOf, startServer } from './harness.ts';
 
 const reader = newKey();
 const readerPolicy = policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n');
@@ -150,14 +150,20 @@ test('read: plain lists the five read tools; ha_get_states filters, matches alia
   assert.match(JSON.stringify(tooMany.content), /limit/);
 });
 
-test('every read strips camera, image and media_player bearer tokens', async (t) => {
-  const { client } = await readerOn(t);
+test('every read masks secrets and strips camera, image and media_player bearer tokens', async (t) => {
+  const { client, call } = await readerOn(t, {
+    states: [...HOUSE, { entity_id: 'sensor.router', state: 'ok', attributes: { friendly_name: 'Router', api_key: 'KEYSECRET' } }],
+    devices: [{ id: 'd1', name: 'Router', configuration_url: 'http://admin:PWSECRET@192.168.1.1/' }],
+  });
   const result = await client.callTool({ name: 'ha_get_states', arguments: { full: true } });
   assert.doesNotMatch(JSON.stringify(result), /SECRET/);
   const states = (body(result) as { states: { entity_id: string; attributes: Record<string, unknown> }[] }).states;
   const attributes = (id: string) => states.find((s) => s.entity_id === id)?.attributes;
   assert.deepEqual(attributes('camera.porch'), { friendly_name: 'Porch', entity_picture: '/api/camera_proxy/camera.porch' });
   assert.deepEqual(attributes('media_player.den'), { friendly_name: 'Den Speaker', entity_picture: '/api/media_player_proxy/media_player.den?cache=42' });
+  assert.deepEqual(attributes('sensor.router'), { friendly_name: 'Router', api_key: '**REDACTED**' });
+  const [device] = (await call('ha_get_registry', { registry: 'device' })).entries as Record<string, unknown>[];
+  assert.equal(device?.configuration_url, 'http://**REDACTED**@192.168.1.1/');
 });
 
 test('a read over the byte cap is refused with "narrow the query", never cut off', async (t) => {

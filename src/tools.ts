@@ -147,8 +147,9 @@ function writeResult(value: unknown): CallToolResult {
   return { content: [{ type: 'text', text: kept + marker }] };
 }
 
-const plainRead = <T>(ctx: Context, command: Command) => send<T>(ctx, ctx.allowed, command);
-const configRead = async <T>(ctx: Context, command: Command) => maskSecrets(await send(ctx, ctx.allowed, command)) as T;
+/** Every read masks secrets, so Redaction means one thing on every read; a write's lookup uses `send`, unmasked, to merge. */
+const plainRead = async <T>(ctx: Context, command: Command) => maskSecrets(await send(ctx, ctx.allowed, command)) as T;
+const configRead = plainRead;
 
 /** Sends a config REST request; HA's error statuses become failures, except a 404 on GET, which means no such item. */
 async function rest(ctx: Context, allowed: Allowed | undefined, request: RestRequest): Promise<unknown> {
@@ -211,7 +212,7 @@ const getStates = defineTool({
     'Lists the current state of Home Assistant entities, sorted by entity_id, with each entity_id, friendly name and state.',
     'Filter by `domain` (such as `light`), by exact `state` (such as `on`), and by `query`, a case-insensitive substring of the entity_id, friendly name, aliases, or area and label names.',
     'Filter by `area` or `label` id to get what a Home Assistant service call targeting that area or label acts on.',
-    'Attributes are left out unless `full` is true; bearer tokens in camera, image and media_player attributes are always removed.',
+    'Attributes are left out unless `full` is true; bearer tokens in camera, image and media_player attributes are always removed, and secret-looking values come back as **REDACTED**, best-effort.',
     PAGED,
     'Example: {"domain": "light", "query": "kitchen", "state": "on"} lists the kitchen lights that are on.',
   ].join(' '),
@@ -410,7 +411,13 @@ const getConfig = defineTool({
     })
     .superRefine(({ kind, entity_id, id }, ctx) => {
       const byEntity = kind === 'automation' || kind === 'script';
+      const a = kind === 'automation' ? 'an' : 'a';
+      const [taken, other] = byEntity ? (['entity_id', 'id'] as const) : (['id', 'entity_id'] as const);
+      if ({ entity_id, id }[other] !== undefined) ctx.addIssue({ code: 'custom', path: [other], message: `is not taken for ${a} ${kind}, which takes only ${taken}` });
       if (byEntity && entity_id === undefined) ctx.addIssue({ code: 'custom', path: ['entity_id'], message: `is required for an ${kind}` });
+      if (byEntity && entity_id?.startsWith(`${kind}.`) === false) {
+        ctx.addIssue({ code: 'custom', path: ['entity_id'], message: `its domain must match kind: ${a} ${kind} takes ${kind}.<id>` });
+      }
       if (!byEntity && id === undefined) ctx.addIssue({ code: 'custom', path: ['id'], message: `is required for a ${kind}` });
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
     }),
@@ -627,9 +634,14 @@ const writeConfig = defineTool({
       ctx.audit({ kind, action, id, decision: 'deny', reason: 'config carries a redacted value' });
       throw new ToolFailure(`config carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
     }
-    if (kind !== 'helper' && action !== 'delete') {
+    // A new helper takes its id from its name, so only a helper update has a stored item to look up.
+    if (action === 'update' || (kind !== 'helper' && action === 'create')) {
       const lookup = decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed;
-      const stored = (await rest(ctx, lookup, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
+      const [domain, item] = splitHelperId(id);
+      const stored =
+        kind === 'helper'
+          ? (await send<Record<string, unknown>[]>(ctx, lookup, { type: `${domain}/list` })).find((h) => h.id === item)
+          : ((await rest(ctx, lookup, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined);
       if (action === 'create' && stored) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
       if (action === 'update' && !stored) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
       if (stored) allowed = mergedUpdate(allowed, stored);
