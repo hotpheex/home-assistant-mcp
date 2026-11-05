@@ -65,6 +65,10 @@ export interface FakeHaOptions {
   traces?: FakeTrace[];
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
+  /** HA's system log entries, oldest first, in `system_log/list`'s shape. */
+  systemLog?: Record<string, unknown>[];
+  /** Stored (UI) zones. */
+  zones?: Record<string, unknown>[];
   /** Installed blueprints by domain and path, each as `blueprint/list` gives it: `{metadata}` or `{error}`. */
   blueprints?: Record<string, Record<string, Record<string, unknown>>>;
 }
@@ -232,6 +236,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     options.users[token]?.is_admin ? handler(token, msg, conn) : haError('unauthorized', 'Unauthorized');
   const configs = structuredClone(options.configs ?? {});
   const helpers = structuredClone(options.helpers ?? {});
+  const zones = structuredClone(options.zones ?? []);
   const blueprints = structuredClone(options.blueprints ?? {});
   const configOf = adminOnly((_, msg) => {
     const config = configs[msg.entity_id as string];
@@ -314,6 +319,8 @@ export async function startFakeHa(options: FakeHaOptions) {
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
+    // HA lists its deduplicated log newest first.
+    'system_log/list': adminOnly(() => [...(options.systemLog ?? [])].reverse()),
     'blueprint/list': adminOnly((_, msg) => blueprints[msg.domain as string] ?? {}),
     // HA appends `.yaml` to a saved path, but deletes the path exactly as given.
     'blueprint/save': adminOnly((_, msg) => {
@@ -365,6 +372,28 @@ export async function startFakeHa(options: FakeHaOptions) {
       return null;
     });
   }
+  // HA 2026.10's zone collection: a create fills radius and passive, and an update validates only the keys it sends and merges them.
+  const ZONE_KEYS = ['name', 'latitude', 'longitude', 'radius', 'passive', 'icon'];
+  const zoneFields = (msg: Message) => {
+    const fields = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'zone_id'].includes(k)));
+    const extra = Object.keys(fields).find((k) => !ZONE_KEYS.includes(k));
+    return extra ? haError('invalid_format', `extra keys not allowed @ data['${extra}']`) : fields;
+  };
+  const zoneOf = (msg: Message) => zones.find((z) => z.id === msg.zone_id) ?? haError('not_found', `Unable to find zone_id ${String(msg.zone_id)}`);
+  handlers['zone/list'] = () => zones;
+  handlers['zone/create'] = adminOnly((_, msg) => {
+    const fields = zoneFields(msg);
+    const missing = ['name', 'latitude', 'longitude'].find((k) => !(k in fields));
+    if (missing) haError('invalid_format', `required key not provided @ data['${missing}']. Got None`);
+    const zone = { id: String(fields.name).toLowerCase().replace(/[^a-z0-9]+/g, '_'), radius: 100, passive: false, ...fields };
+    zones.push(zone);
+    return zone;
+  });
+  handlers['zone/update'] = adminOnly((_, msg) => Object.assign(zoneOf(msg), zoneFields(msg)));
+  handlers['zone/delete'] = adminOnly((_, msg) => {
+    zones.splice(zones.indexOf(zoneOf(msg)), 1);
+    return null;
+  });
 
   /** HA's config REST API: automation and scene entries by config id, scripts by object key. */
   const entityOf = (kind: string, id: string) =>
@@ -470,6 +499,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     received,
     configs,
     helpers,
+    zones,
     blueprints,
     /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
     drop,
