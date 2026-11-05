@@ -6,6 +6,8 @@ import {
   callable,
   collectionOf,
   configPath,
+  dashboardDelete,
+  dashboardPath,
   decideConfigRead,
   decideConfigWrite,
   decideHelperFlow,
@@ -47,6 +49,7 @@ export const TOOL_KIND = {
   ha_get_statistics: 'plain_read',
   ha_render_template: 'plain_read',
   ha_get_logs: 'config_read',
+  ha_get_dashboard: 'plain_read',
   ha_list_blueprints: 'config_read',
   ha_write_blueprint: 'config_write',
   ha_helper_flow: 'config_write',
@@ -151,7 +154,10 @@ const text = (value: unknown): CallToolResult => ({ content: [{ type: 'text', te
 const failure = (message: string): CallToolResult => ({ isError: true, content: [{ type: 'text', text: message }] });
 
 /** A failure the Caller can act on, returned as an isError result. */
-class ToolFailure extends Error {}
+class ToolFailure extends Error {
+  /** HA's error code, when HA refused the request. */
+  code?: string;
+}
 
 /** The gate's outage errors as failures the Caller can act on; anything else unchanged. */
 function outage(e: unknown): unknown {
@@ -172,7 +178,7 @@ async function answered(request: Promise<unknown>): Promise<unknown> {
     const refusal = e as { code?: unknown; message?: unknown } | null;
     // HA's error results arrive as plain {code, message} objects, never as Errors.
     if (!(e instanceof Error) && typeof refusal?.code === 'string' && typeof refusal.message === 'string') {
-      throw new ToolFailure(`Home Assistant refused the request: ${refusal.message}`);
+      throw Object.assign(new ToolFailure(`Home Assistant refused the request: ${refusal.message}`), { code: refusal.code });
     }
     throw outage(e);
   }
@@ -221,6 +227,25 @@ async function stored(ctx: Context, allowed: Allowed | undefined, kind: ConfigWr
   if (!collection) return (await rest(ctx, allowed, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
   const [domain, item] = collection;
   return (await send<Record<string, unknown>[]>(ctx, allowed, { type: `${domain}/list` })).find((h) => h.id === item);
+}
+
+/** Only the list says whether a dashboard exists, so a listed one with no saved layout merges over nothing. */
+async function dashboardLookup(ctx: Context, { action, id }: ConfigWrite, allowed: Allowed): Promise<Allowed> {
+  const lookup = decideConfigRead(ctx.policy, ctx.auth.caller, 'dashboard').allowed;
+  const listed = id === 'lovelace' ? [{ url_path: id }] : await send<{ id?: string; url_path: string }[]>(ctx, lookup, { type: 'lovelace/dashboards/list' });
+  const item = listed.find((d) => d.url_path === id);
+  if (action === 'create' && item) throw new ToolFailure(`The dashboard ${id} already exists; update it instead.`);
+  if (action === 'create') return allowed;
+  if (!item) throw new ToolFailure(`The dashboard ${id} does not exist; create it instead.`);
+  if (action === 'update') {
+    const layout = await send<Record<string, unknown>>(ctx, lookup, { type: 'lovelace/config', ...dashboardPath(id) }).catch((e: unknown) => {
+      if (e instanceof ToolFailure && e.code === 'config_not_found') return {};
+      throw e;
+    });
+    return mergedUpdate(allowed, layout);
+  }
+  if (item.id === undefined) throw new ToolFailure(`The dashboard ${id} is defined in YAML, so only its YAML can remove it.`);
+  return dashboardDelete(allowed, item.id);
 }
 
 interface HaState {
@@ -538,6 +563,7 @@ const getConfig = defineTool({
       if (!byEntity && id === undefined) ctx.addIssue({ code: 'custom', path: ['id'], message: `is required for a ${kind}` });
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
       if (kind === 'entity_name') ctx.addIssue({ code: 'custom', path: ['kind'], message: "entity_name has no config to read; ha_get_registry lists each entity's name and icon" });
+      if (kind === 'dashboard') ctx.addIssue({ code: 'custom', path: ['kind'], message: 'a dashboard is read with the dashboard tool' });
       if (kind === 'helper_entry') ctx.addIssue({ code: 'custom', path: ['kind'], message: NOT_A_CONFIG });
     }),
   annotations: { readOnlyHint: true, destructiveHint: false },
@@ -758,11 +784,14 @@ const callService = defineTool({
   },
 });
 
+/** Sidebar settings after creation and HA's `allow_single_word` are out of reach. */
+const DASHBOARD_SIDEBAR = ['title', 'icon', 'show_in_sidebar', 'require_admin'];
+
 const writeConfig = defineTool({
   title: 'Write config',
   description: [
-    'Creates, updates or deletes one automation, script, scene, helper (input_*, counter, timer or schedule) or zone; this is admin-equivalent, because an automation or script can do anything in Home Assistant.',
-    "Name the item by `kind` and `id`: an automation's, scene's or zone's config `id`, a script's object id (the part after `script.`), or a helper's `<domain>.<id>`, such as input_boolean.guest_mode.",
+    'Creates, updates or deletes one automation, script, scene, helper (input_*, counter, timer or schedule), zone or dashboard; this is admin-equivalent, because an automation or script can do anything in Home Assistant.',
+    "Name the item by `kind` and `id`: an automation's, scene's or zone's config `id`, a script's object id (the part after `script.`), a helper's `<domain>.<id>`, such as input_boolean.guest_mode, or a dashboard's URL path, where `lovelace`, the default dashboard, can only be updated; a new dashboard takes only its sidebar settings (`title`, `icon`, `show_in_sidebar`, `require_admin`).",
     'An update sends only the top-level keys it changes and keeps the rest; creating an automation, script or scene refuses an id that exists, and a new helper or zone takes its id from its `name`, which the result returns.',
     'A config that carries **REDACTED** from a config read is refused, so put the real value in its place first.',
     'Example: {"kind": "automation", "action": "update", "id": "porch_light_1", "config": {"alias": "Porch light at dusk"}}.',
@@ -770,9 +799,9 @@ const writeConfig = defineTool({
   ].join(' '),
   input: z
     .strictObject({
-      kind: configKind.describe('automation, script, scene, helper, zone or entity_name.'),
+      kind: configKind.describe('automation, script, scene, helper, zone, entity_name or dashboard.'),
       action: z.enum(['create', 'update', 'delete']).describe('create, update or delete.'),
-      id: z.string().min(1).describe("An automation's, scene's or zone's config id, a script's object id, a helper's <domain>.<id>, or an entity_name's entity_id."),
+      id: z.string().min(1).describe("An automation's, scene's or zone's config id, a script's object id, a helper's <domain>.<id>, an entity_name's entity_id, or a dashboard's URL path."),
       config: z.record(z.string(), z.unknown()).optional().describe('The config to create, or the top-level keys to change; omitted for delete.'),
     })
     .superRefine(({ kind, action, id, config }, ctx) => {
@@ -784,6 +813,10 @@ const writeConfig = defineTool({
       for (const key of kind === 'entity_name' ? Object.keys(config ?? {}) : []) {
         const allowed = (ENTITY_NAME_FIELDS as readonly string[]).includes(key);
         if (!allowed) ctx.addIssue({ code: 'custom', path: ['config', key], message: 'entity_name changes only name, icon and aliases' });
+      }
+      if (kind === 'dashboard' && id === 'lovelace' && action !== 'update') ctx.addIssue({ code: 'custom', path: ['id'], message: 'the default dashboard lovelace can only be updated' });
+      if (kind === 'dashboard' && action === 'create' && Object.keys(config ?? {}).some((k) => !DASHBOARD_SIDEBAR.includes(k))) {
+        ctx.addIssue({ code: 'custom', path: ['config'], message: 'a new dashboard takes only title, icon, show_in_sidebar and require_admin' });
       }
       if (kind === 'helper_entry') ctx.addIssue({ code: 'custom', path: ['kind'], message: NOT_A_CONFIG });
     }),
@@ -804,8 +837,9 @@ const writeConfig = defineTool({
     }
     // Recorded before the lookup, so a write refused by its lookup, failed, or of unknown outcome still leaves a record.
     if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
+    if (kind === 'dashboard') allowed = await dashboardLookup(ctx, change, allowed);
     // A new helper or zone takes its id from its name, so only a collection update has a stored item to look up; HA's registry update is partial.
-    if (kind !== 'entity_name' && (action === 'update' || (!collectionOf(kind, id) && action === 'create'))) {
+    else if (kind !== 'entity_name' && (action === 'update' || (!collectionOf(kind, id) && action === 'create'))) {
       const item = await stored(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, kind, id);
       if (action === 'create' && item) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
       if (action === 'update' && !item) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
@@ -844,6 +878,25 @@ const renderTemplate = defineTool({
     const event = (await answered(ctx.gate.subscribeOnce(ctx.allowed, command))) as { error?: string };
     if (event.error !== undefined) throw new ToolFailure(`Home Assistant could not render the template: ${event.error}`);
     return text(maskSecrets(event));
+  },
+});
+
+const getDashboard = defineTool({
+  title: 'Get dashboard',
+  description: [
+    'Without `dashboard`, lists the dashboards stored in Home Assistant, each with its URL path, title and sidebar settings.',
+    'With `dashboard`, returns that dashboard\'s stored layout; `lovelace` names the default dashboard.',
+    'A dashboard whose layout Home Assistant generates has no stored layout, so reading it is refused.',
+    MASKED,
+    'Example: {"dashboard": "kitchen-wall"}.',
+  ].join(' '),
+  input: z.strictObject({
+    dashboard: z.string().min(1).optional().describe('A dashboard URL path, such as kitchen-wall; lovelace is the default dashboard.'),
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  async run({ dashboard }, ctx) {
+    if (dashboard === undefined) return text({ dashboards: await read(ctx, { type: 'lovelace/dashboards/list' }) });
+    return text({ dashboard, config: await read(ctx, { type: 'lovelace/config', ...dashboardPath(dashboard) }) });
   },
 });
 
@@ -1015,6 +1068,7 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_statistics: getStatistics,
   ha_render_template: renderTemplate,
   ha_get_logs: getLogs,
+  ha_get_dashboard: getDashboard,
   ha_list_blueprints: listBlueprints,
   ha_write_blueprint: writeBlueprint,
   ha_helper_flow: helperFlow,

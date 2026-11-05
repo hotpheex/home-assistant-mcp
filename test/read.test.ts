@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import type { FakeHaOptions, FakeStatistic } from './fake-ha.ts';
-import { body, connect, ERAS, fakeHa, HOUSE, newKey, policyOf, startServer, until, USERS_TOKEN, withoutId } from './harness.ts';
+import { REDACTED as M } from '../src/redaction.ts';
+import { body, connect, DASHBOARDS, ERAS, fakeHa, HOUSE, newKey, policyOf, startServer, until, USERS_TOKEN, withoutId } from './harness.ts';
 
 const reader = newKey();
 const readerPolicy = policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n');
@@ -118,7 +119,7 @@ test('ha_get_logbook reads the last hour by default, optionally for one entity',
 test('read: plain lists the seven read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
   const { call, client } = await readerOn(t);
   const listed = await client.listTools();
-  assert.deepEqual(listed.tools.map((tool) => tool.name), ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services', 'ha_get_statistics', 'ha_render_template']);
+  assert.deepEqual(listed.tools.map((tool) => tool.name), ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services', 'ha_get_statistics', 'ha_render_template', 'ha_get_dashboard']);
   assert.equal(listed.cacheScope, 'private');
 
   const ids = async (args: Record<string, unknown>) => ((await call('ha_get_states', args)).states as { entity_id: string }[]).map((s) => s.entity_id);
@@ -383,4 +384,20 @@ test('ha_render_template returns HA\'s template error, a render over its timeout
   await new Promise((resolve) => setTimeout(resolve, 50));
   t.mock.timers.tick(30_000);
   assert.equal(await stalled, 'HA unavailable: Home Assistant did not answer. Try again later.');
+});
+
+test('ha_get_dashboard lists the dashboards, and reads a stored layout masked, naming the default lovelace by no url_path', async (t) => {
+  const { call, client, sent } = await readerOn(t);
+  assert.deepEqual(await call('ha_get_dashboard', {}), { dashboards: DASHBOARDS.dashboards });
+  assert.deepEqual(await call('ha_get_dashboard', { dashboard: 'lovelace' }), { dashboard: 'lovelace', config: DASHBOARDS.layouts!.lovelace });
+  assert.deepEqual(await call('ha_get_dashboard', { dashboard: 'kitchen-wall' }), {
+    dashboard: 'kitchen-wall',
+    config: { views: [{ title: 'Wall', cards: [{ type: 'iframe', url: `https://${M}@cam.local/live` }] }] },
+  });
+  assert.deepEqual(sent('lovelace/config').map((m) => Object.hasOwn(m, 'url_path') ? m.url_path : 'default'), ['default', 'kitchen-wall']);
+  for (const [dashboard, refusal] of [['nope', /Unknown config specified: nope/], ['spare-room', /No config found/]] as const) {
+    const failed = await client.callTool({ name: 'ha_get_dashboard', arguments: { dashboard } });
+    assert.equal(failed.isError, true);
+    assert.match(JSON.stringify(failed.content), refusal);
+  }
 });

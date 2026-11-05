@@ -19,6 +19,7 @@ export const CONFIG_KINDS = [
   'helper',
   'entity_name',
   'zone',
+  'dashboard',
   'helper_entry',
 ] as const;
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decideRead, decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type ConfigKind, type Operation } from '../src/evaluator.ts';
+import { decideConfigRead, decideConfigWrite, decideRead, decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type ConfigKind, type Operation } from '../src/evaluator.ts';
 import { openGate } from '../src/gate.ts';
 import { parsePolicy } from '../src/policy.ts';
 import { TOOL_KIND, type ToolName } from '../src/tools.ts';
@@ -101,6 +101,7 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_get_statistics: { statistic_ids: ['sensor.kitchen_temperature'] },
   ha_render_template: { template: "{{ states('light.kitchen') }}" },
   ha_get_logs: {},
+  ha_get_dashboard: { dashboard: 'lovelace' },
   ha_list_blueprints: { domain: 'automation' },
   ha_write_blueprint: { domain: 'automation', action: 'create', path: 'mine/dusk', yaml: 'blueprint:\n  name: Dusk\n  domain: automation\n' },
   ha_helper_flow: { action: 'start', handler: 'template' },
@@ -128,6 +129,8 @@ const PURE_READS = new Set([
   'recorder/list_statistic_ids',
   'recorder/statistics_during_period',
   'system_log/list',
+  'lovelace/dashboards/list',
+  'lovelace/config',
   'blueprint/list',
 ]);
 test('the gate sends only an Allowed the evaluator issued, as issued: a forged, spread or altered one sends nothing', async (t) => {
@@ -218,12 +221,16 @@ for (const era of ERAS) {
   }
 }
 
-/** A config-write kind that only its own Grant gives, with a seeded house and a sample config read and update of it. */
-const KIND_SAMPLES: Partial<Record<ConfigKind, { seed: Partial<FakeHaOptions>; read: Record<string, unknown>; write: Record<string, unknown> }>> = {
+/** A config-write kind that only its own Grant gives, with a seeded house, a sample update of it, and a config read where ha_get_config serves the kind. */
+const KIND_SAMPLES: Partial<Record<ConfigKind, { seed: Partial<FakeHaOptions>; read?: Record<string, unknown>; write: Record<string, unknown> }>> = {
   zone: {
     seed: { zones: [{ id: 'office', name: 'Office', latitude: -33.86, longitude: 151.2, radius: 250, passive: false }] },
     read: { kind: 'zone', id: 'office' },
     write: { kind: 'zone', action: 'update', id: 'office', config: { radius: 100 } },
+  },
+  dashboard: {
+    seed: {},
+    write: { kind: 'dashboard', action: 'update', id: 'kitchen-wall', config: { title: 'Wall' } },
   },
 };
 for (const [kind, sample] of Object.entries(KIND_SAMPLES) as [ConfigKind, NonNullable<(typeof KIND_SAMPLES)[ConfigKind]>][]) {
@@ -233,7 +240,7 @@ for (const [kind, sample] of Object.entries(KIND_SAMPLES) as [ConfigKind, NonNul
     const ha = await fakeHa(t, sample.seed);
     const grants = `grants:\n  - caller: holder\n    config_write: ${kind}\n  - caller: other\n    config_write: automation\n`;
     const server = await startServer(t, policyOf({ holder, other }, grants), ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
-    const calls = [['ha_get_config', sample.read, 'config_read'], ['ha_write_config', sample.write, 'config_write']] as const;
+    const calls = ([['ha_get_config', sample.read, 'config_read'], ['ha_write_config', sample.write, 'config_write']] as const).filter(([, args]) => args !== undefined);
     const holding = await connect(t, server.url, holder.key, 'modern');
     for (const [tool, args] of calls) {
       const before = ha.received.length;
@@ -250,3 +257,20 @@ for (const [kind, sample] of Object.entries(KIND_SAMPLES) as [ConfigKind, NonNul
     );
   });
 }
+
+test('no Allowed a dashboard Grant gives can reach dashboard resources, which load JavaScript into every browser', async (t) => {
+  const ha = await fakeHa(t);
+  const gate = openGate(ha.url, new Map([['users', USERS_TOKEN], ['admin', ADMIN_TOKEN]] as const), () => {}, (reason) => assert.fail(reason));
+  t.after(() => gate.close());
+  await gate.connected;
+  const policy = parsePolicy(`version: 1\ncallers: { agent: { keys: [] } }\ngrants:\n  - caller: agent\n    config_write: dashboard\n`);
+  const allowed = [
+    decideRead(policy, 'agent', 'plain_read').allowed,
+    decideConfigRead(policy, 'agent', 'dashboard').allowed,
+    ...(['create', 'update', 'delete'] as const).map((action) => decideConfigWrite(policy, 'agent', { kind: 'dashboard', action, id: 'hall-tablet', config: action === 'delete' ? undefined : {} }).allowed),
+  ];
+  for (const type of ['lovelace/resources', 'lovelace/resources/create', 'lovelace/resources/update', 'lovelace/resources/delete', 'lovelace/dashboards/update']) {
+    for (const a of allowed) await assert.rejects(gate.send(a!, { type, res_type: 'module', url: '/local/x.js' }), /may not send/);
+  }
+  assert.deepEqual(ha.received.filter((r) => r.message.type.startsWith('lovelace/')), []);
+});

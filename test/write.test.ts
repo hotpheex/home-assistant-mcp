@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import { REDACTED as M } from '../src/redaction.ts';
-import { ADMIN_TOKEN, adminCaller, body, connect, fakeHa, newKey, policyOf, REGISTRIES, startServer, until } from './harness.ts';
+import { ADMIN_TOKEN, adminCaller, body, connect, DASHBOARDS, fakeHa, newKey, policyOf, REGISTRIES, startServer, until } from './harness.ts';
 
-const keys = Object.fromEntries(['auditor', 'automator', 'scripter', 'scener', 'helperer'].map((name) => [name, newKey()]));
+const keys = Object.fromEntries(['auditor', 'automator', 'scripter', 'scener', 'helperer', 'dasher'].map((name) => [name, newKey()]));
 const policy = policyOf(
   keys,
   `grants:
@@ -18,6 +18,8 @@ const policy = policyOf(
     config_write: scene
   - caller: helperer
     config_write: helper
+  - caller: dasher
+    config_write: dashboard
 `,
 );
 
@@ -453,4 +455,60 @@ test('a blueprint write is refused with nothing sent for the other domain, anoth
     ],
   );
   assert.doesNotMatch(JSON.stringify(server.audits()), /Ping|sequence|REDACTED/);
+});
+
+test('dashboard writes: create from sidebar settings, update merged over the stored layout, delete by HA\'s collection id; audited by path', async (t) => {
+  const { ha, server, as } = await house(t);
+  const { call } = await as('dasher');
+  const list = { type: 'lovelace/dashboards/list' };
+  const sidebar = { title: 'Hall tablet', icon: 'mdi:tablet' };
+  const created = await call('ha_write_config', { kind: 'dashboard', action: 'create', id: 'hall-tablet', config: sidebar });
+  assert.deepEqual(created.sent, [list, { type: 'lovelace/dashboards/create', url_path: 'hall-tablet', ...sidebar }]);
+  const item = { id: 'hall_tablet', url_path: 'hall-tablet', ...sidebar, show_in_sidebar: true, require_admin: false, mode: 'storage' };
+  assert.deepEqual(body(created.result), { kind: 'dashboard', action: 'create', id: 'hall-tablet', result: item });
+  const taken = await call('ha_write_config', { kind: 'dashboard', action: 'create', id: 'kitchen-wall', config: sidebar });
+  assert.match(JSON.stringify(taken.result.content), /The dashboard kitchen-wall already exists/);
+  assert.deepEqual(taken.sent, [list]);
+
+  const views = [{ title: 'Hall', cards: [] }];
+  const updated = await call('ha_write_config', { kind: 'dashboard', action: 'update', id: 'kitchen-wall', config: { title: 'Wall' } });
+  const wall = { ...DASHBOARDS.layouts!['kitchen-wall'], title: 'Wall' };
+  assert.deepEqual(updated.sent, [list, { type: 'lovelace/config', url_path: 'kitchen-wall' }, { type: 'lovelace/config/save', url_path: 'kitchen-wall', config: wall }]);
+  assert.deepEqual(ha.layouts['kitchen-wall'], wall);
+  const home = await call('ha_write_config', { kind: 'dashboard', action: 'update', id: 'lovelace', config: { views } });
+  assert.deepEqual(home.sent, [{ type: 'lovelace/config' }, { type: 'lovelace/config/save', config: { title: 'Home', views } }]);
+  const unsaved = await call('ha_write_config', { kind: 'dashboard', action: 'update', id: 'spare-room', config: { views } });
+  assert.deepEqual(unsaved.sent.at(-1), { type: 'lovelace/config/save', url_path: 'spare-room', config: { views } });
+  const missing = await call('ha_write_config', { kind: 'dashboard', action: 'update', id: 'nope', config: { views } });
+  assert.match(JSON.stringify(missing.result.content), /The dashboard nope does not exist/);
+  assert.deepEqual(missing.sent, [list]);
+
+  const deleted = await call('ha_write_config', { kind: 'dashboard', action: 'delete', id: 'spare-room' });
+  assert.deepEqual(deleted.sent, [list, { type: 'lovelace/dashboards/delete', dashboard_id: 'spare_room_2' }]);
+  assert.deepEqual(ha.dashboards.map((d) => d.url_path), ['kitchen-wall', 'hall-tablet']);
+
+  for (const [args, refusal] of [
+    [{ action: 'create', id: 'lovelace', config: sidebar }, /id: the default dashboard lovelace can only be updated/],
+    [{ action: 'delete', id: 'lovelace' }, /id: the default dashboard lovelace can only be updated/],
+    [{ action: 'create', id: 'hall', config: { ...sidebar, allow_single_word: true } }, /config: a new dashboard takes only title, icon, show_in_sidebar and require_admin/],
+    [{ action: 'update', id: 'kitchen-wall', config: { views: [{ cards: [{ type: 'iframe', url: `https://${M}@cam.local/live` }] }] } }, /config carries a redacted value at views\[0\]\.cards\[0\]\.url/],
+  ] as const) {
+    const refused = await call('ha_write_config', { kind: 'dashboard', ...args });
+    assert.equal(refused.result.isError, true);
+    assert.match(JSON.stringify(refused.result.content), refusal);
+    assert.deepEqual(refused.sent, []);
+  }
+  const read = await call('ha_get_config', { kind: 'dashboard', id: 'kitchen-wall' });
+  assert.match(JSON.stringify(read.result.content), /kind: a dashboard is read with the dashboard tool/);
+  assert.deepEqual(read.sent, []);
+  assert.deepEqual(
+    server.audits().map((a) => [a.action, a.id, a.decision ?? a.outcome]),
+    [
+      ['create', 'hall-tablet', 'allow'], ['create', 'hall-tablet', 'done'], ['create', 'kitchen-wall', 'allow'],
+      ['update', 'kitchen-wall', 'allow'], ['update', 'kitchen-wall', 'done'], ['update', 'lovelace', 'allow'], ['update', 'lovelace', 'done'],
+      ['update', 'spare-room', 'allow'], ['update', 'spare-room', 'done'], ['update', 'nope', 'allow'],
+      ['delete', 'spare-room', 'allow'], ['delete', 'spare-room', 'done'], ['update', 'kitchen-wall', 'deny'],
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(server.audits()), /Hall tablet|views|SECRET/, 'audit lines carry paths, never layouts');
 });

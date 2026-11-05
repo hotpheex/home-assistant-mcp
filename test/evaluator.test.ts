@@ -215,6 +215,23 @@ test('property: a zone write and zone config read need a zone Grant, which write
   );
 });
 
+test('property: a dashboard write or config read is decided by a dashboard Grant alone, and is a lovelace WebSocket command', () => {
+  const grant = fc.record({ caller: fc.constantFrom('agent', 'other'), config_write: fc.constantFrom(...CONFIG_KINDS) });
+  const write = fc.record({ action: fc.constantFrom('create', 'update', 'delete' as const), id: fc.constantFrom('lovelace', 'kitchen-wall', 'map') });
+  fc.assert(
+    fc.property(fc.array(grant), write, fc.constantFrom(...CONFIG_KINDS), (grants, { action, id }, other) => {
+      const policy = asPolicy(grants as unknown as Rule[], []);
+      const holds = (kind: string) => grants.some((g) => g.caller === 'agent' && g.config_write === kind);
+      const { allowed } = decideConfigWrite(policy, 'agent', { kind: 'dashboard', action, id, config: action === 'delete' ? undefined : { title: 'x' } });
+      assert.equal(allowed !== undefined, holds('dashboard'));
+      assert.equal(decideConfigRead(policy, 'agent', 'dashboard').allowed !== undefined, holds('dashboard'));
+      if (other !== 'dashboard' && !holds(other)) assert.equal(decideConfigWrite(policy, 'agent', { kind: other, action: 'delete', id: 'x' }).allowed, undefined);
+      if (allowed?.write.via !== 'websocket') return allowed === undefined;
+      return /^lovelace\/(dashboards\/(create|delete)|config\/save)$/.test(allowed.write.command.type);
+    }),
+  );
+});
+
 test("property: a flow is allowed only for an integration in HA's helper list, and only within HA's flow API", () => {
   fc.assert(
     fc.property(flow, fc.constantFrom('template', 'hue'), (f, integration) => {

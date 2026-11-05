@@ -205,10 +205,21 @@ export interface ConfigWrite {
   config?: Record<string, unknown>;
 }
 
+/** HA names the default dashboard by omitting `url_path`, which also finds it once HA has migrated it to `lovelace`. */
+export const dashboardPath = (id: string) => (id === 'lovelace' ? {} : { url_path: id });
+
+/** A delete names the URL path until `dashboardDelete` reissues it with HA's collection id. */
+function dashboardCommand(action: ConfigWrite['action'], id: string, config: Record<string, unknown>): Command {
+  if (action === 'create') return { ...config, type: 'lovelace/dashboards/create', url_path: id };
+  if (action === 'update') return { type: 'lovelace/config/save', config, ...dashboardPath(id) };
+  return { type: 'lovelace/dashboards/delete', url_path: id };
+}
+
 /** HA's config REST for automations, scripts and scenes; the collection's own WebSocket commands for a helper or zone; the entity registry for entity_name. */
 function writeOf({ kind, action, id, config = {} }: ConfigWrite): Write {
   const rest = (request: RestRequest) => ({ via: 'rest', request }) as const;
   if (kind === 'entity_name') return { via: 'websocket', command: { ...pick(config, ENTITY_NAME_FIELDS), type: 'config/entity_registry/update', entity_id: id } };
+  if (kind === 'dashboard') return { via: 'websocket', command: dashboardCommand(action, id, config) };
   const collection = collectionOf(kind, id);
   if (!collection) return rest(action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config });
   const [domain, item] = collection;
@@ -226,7 +237,10 @@ export function decideConfigWrite(policy: Policy, caller: string, write: ConfigW
   return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: writeOf(write) }), grants };
 }
 
-/** HA replaces a whole entry on update, so an allowed update is reissued over the stored config it changes; a helper's update schema takes no `id`. */
+/**
+ * HA replaces a whole entry on update, and saves a dashboard layout whole, so an allowed update is reissued over the
+ * stored config it changes; a helper's update schema takes no `id`.
+ */
 export function mergedUpdate(allowed: Allowed, stored: Record<string, unknown>): Allowed & { write: Write } {
   const { write } = allowed;
   if (isIssued(allowed) && write?.via === 'rest' && write.request.method === 'POST') {
@@ -236,7 +250,19 @@ export function mergedUpdate(allowed: Allowed, stored: Record<string, unknown>):
     const item = Object.fromEntries(Object.entries(stored).filter(([k]) => k !== 'id'));
     return issue({ ...allowed, write: { via: 'websocket', command: { ...item, ...write.command } } });
   }
+  if (isIssued(allowed) && write?.via === 'websocket' && write.command.type === 'lovelace/config/save') {
+    return issue({ ...allowed, write: { via: 'websocket', command: { ...write.command, config: { ...stored, ...(write.command.config as object) } } } });
+  }
   throw new Error('only an issued config update merges');
+}
+
+/** HA deletes a dashboard by its collection id, which only a lookup of its URL path gives, so the allowed delete is reissued with it. */
+export function dashboardDelete(allowed: Allowed, dashboardId: string): Allowed & { write: Write } {
+  const { write } = allowed;
+  if (isIssued(allowed) && write?.via === 'websocket' && write.command.type === 'lovelace/dashboards/delete') {
+    return issue({ ...allowed, write: { via: 'websocket', command: { type: 'lovelace/dashboards/delete', dashboard_id: dashboardId } } });
+  }
+  throw new Error('only an issued dashboard delete takes a collection id');
 }
 
 export interface BlueprintWrite {

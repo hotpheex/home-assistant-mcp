@@ -22,12 +22,13 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 
 | Grant | Tools | Gives |
 |---|---|---|
-| `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services`, `ha_get_statistics`, `ha_render_template` | States, history, logbook, registries, the service list and long-term statistics of the **whole house**, and template rendering over all of it, at the users tier. |
+| `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services`, `ha_get_statistics`, `ha_render_template`, `ha_get_dashboard` | States, history, logbook, registries, the service list, long-term statistics and every dashboard's layout of the **whole house**, and template rendering over all of it, at the users tier. |
 | `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace`, `ha_get_logs` | The config and traces of every automation and script, and HA's system log, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
 | `config_write: entity_name` | `ha_write_config` (update only), plus config read and plain read | An entity's name, icon and aliases, at the admin tier, and no other registry field. No other Grant gives it. |
 | `config_write: zone` | `ha_write_config`, plus config read and plain read | Create, update and delete zones, at the admin tier. Also zone config. |
+| `config_write: dashboard` | `ha_write_config` with `kind: dashboard`, plus config read and plain read | Create and delete dashboards, and save the layout of any dashboard, the default `lovelace` included, at the admin tier. Never dashboard resources (custom JavaScript), nor a dashboard's sidebar settings once it exists. |
 | Blueprints | `ha_list_blueprints` with `read: config`; `ha_write_blueprint` with `config_write: automation` or `script` | The list of every automation and script blueprint, at the admin tier. Saving, overwriting and deleting blueprints of the written kind's domain from the Caller's YAML, at the admin tier; this adds no reach, because that kind is already full control. HA's blueprint import is never sent, so no Caller can make HA fetch a URL. |
 | `config_write: helper_entry` | `ha_helper_flow`, plus config read and plain read | Set up wizard helpers through HA's own setup forms, at the admin tier. Only integrations in HA's live helper list are served: a setup, step or abort of any other integration, a discovery included, is refused. |
 
@@ -59,6 +60,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 **Default deny.** A Caller can do only what its Grants give. A tool whose kind the Caller lacks is not listed, and calling it anyway is refused and audited with nothing sent to HA. A service that no Grant of the Caller names is refused before any request to HA.
 - `test/serve.test.ts`: the coverage matrix, every tool for a Caller holding and lacking its kind.
 - `test/evaluator.test.ts`: the property that a Caller with no Grant is refused every service.
+- `test/serve.test.ts`: the kind matrix, a dashboard write for a Caller holding and lacking the `dashboard` kind; `test/evaluator.test.ts`: the property that a dashboard write or config read is decided by a dashboard Grant alone.
 - `test/services.test.ts`: a service no Grant names, and a Deny without targets, refused before any outbound message.
 - `test/serve.test.ts`: the kind matrix, zone config read and write for a Caller holding and lacking the `zone` kind; `test/evaluator.test.ts`: the property that only a zone Grant writes or reads zones.
 - `test/write.test.ts`: a tool that serves only some config-write kinds, such as the blueprint write, is hidden from and refused to a Caller that writes another kind.
@@ -71,6 +73,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/serve.test.ts`: in the coverage matrix, a read tool sends only read-only commands, and startup sends nothing beyond name lookups.
 - `test/serve.test.ts`: the gate subscribes only for a plain-read template render, and never sends one as a plain command.
 - `test/read.test.ts`: a template render unsubscribes after its first event, and one HA leaves unanswered is abandoned.
+- `test/serve.test.ts`: no decision a dashboard Grant gives can send a dashboard resources command.
 
 **Tiers and the admin pin.** Only config read and config write run with the admin token. Plain read and service calls run with the users-tier token, so HA refuses admin-only services. The server exits if the users-tier token belongs to an HA admin, and never reads a token no Grant needs.
 - `test/serve.test.ts`: in the coverage matrix, config read and config write reach HA with the admin token only, and every other tool with the users-tier token only.
@@ -130,5 +133,6 @@ These are accepted and documented, not fixed:
 - **The system log can carry anything.** An integration may log a request, a response or a secret in a message or its exception text, just as a trace can hold any variable. Redaction masks only what it recognises.
 - **Zones move presence.** A zone change changes who counts as home and what location automations do, so a `config_write: zone` Grant can trigger any automation that keys on presence.
 - **Template output can carry camera, image and media_player tokens.** A template such as `{{ state_attr('camera.door', 'access_token') }}` prints a live token, which opens that camera's images and stream until HA rotates it. The server does not search rendered output for tokens, so plain read reaches this since v0.3.0.
+- **A dashboard card acts as whoever taps it.** A card's tap action can call any service, and HA runs it as the person who taps it, often an admin, so a `dashboard` Grant can set a trap for a person to spring. A markdown or iframe card can also show content from anywhere.
 - **Wizard helpers can hide entities.** switch_as_x hides the switch it wraps, and a group can hide its members. A hidden entity escapes area and label Denies, and the wrapper, such as switch_as_x's light, falls under its own domain's Grants.
 - **Reading a user-started flow re-runs its step.** HA lists a discovery's handler without running it, but a flow a user started is read through HA's flow REST, which re-runs its current step with no input, before the helper check.
