@@ -349,7 +349,7 @@ denies:
     assert.equal((await list()).some((b) => b.path === 'e2e/dusk.yaml'), false);
   });
 
-  e2e("wizard helpers are set up through HA's own flows: a template sensor end to end, and a switch_as_x light that hides its switch", async (t) => {
+  e2e("wizard helpers are set up, edited and deleted through HA's own flows: a template sensor end to end, and a switch_as_x light that hides its switch", async (t) => {
     const client = await connect(t, server.url(), operator.key, 'modern');
     const flow = async (args: Record<string, unknown>) => {
       const result = await client.callTool({ name: 'ha_helper_flow', arguments: args });
@@ -365,7 +365,8 @@ denies:
     const rejected = await client.callTool({ name: 'ha_helper_flow', arguments: step({ name: 'E2E minutes' }) });
     assert.ok(rejected.isError);
     assert.match(JSON.stringify(rejected.content), /refused the input: .*state.*still open/);
-    assert.equal((await flow(step({ name: 'E2E minutes', state: '{{ 6 * 7 }}' }))).type, 'create_entry');
+    const sensor = await flow(step({ name: 'E2E minutes', state: '{{ 6 * 7 }}' }));
+    assert.equal(sensor.type, 'create_entry');
     await eventually(async () => (await states()).some((s) => s.entity_id === 'sensor.e2e_minutes' && s.state === '42'), 'the template sensor', 30_000);
 
     const wrap = await flow({ action: 'start', handler: 'switch_as_x' });
@@ -381,5 +382,14 @@ denies:
     assert.deepEqual((entries as { domain: string }[]).map((e) => e.domain).sort(), ['switch_as_x', 'template']);
     const refused = await client.callTool({ name: 'ha_helper_flow', arguments: { action: 'start', handler: 'hamcp_house' } });
     assert.match(JSON.stringify(refused.content), /does not list hamcp_house as a helper integration/);
+
+    // The template's options form skips its empty first step to the sensor's own form.
+    const sensorEntry = (sensor.result as { entry_id: string }).entry_id;
+    const options = await flow({ action: 'edit', entry_id: sensorEntry });
+    assert.deepEqual([options.type, options.step_id], ['form', 'sensor']);
+    assert.equal((await flow({ action: 'step', flow_id: options.flow_id, input: { state: '{{ 6 * 8 }}' } })).type, 'create_entry');
+    await eventually(async () => (await states()).some((s) => s.entity_id === 'sensor.e2e_minutes' && s.state === '48'), 'the edited template sensor', 30_000);
+    assert.deepEqual(await flow({ action: 'delete', entry_id: sensorEntry }), { require_restart: false });
+    assert.equal(((await flow({ action: 'list' })).entries as { entry_id: string }[]).some((e) => e.entry_id === sensorEntry), false);
   });
 });

@@ -184,6 +184,8 @@ const flow: fc.Arbitrary<HelperFlow> = fc.oneof(
   fc.record({ action: fc.constant('start' as const), handler: fc.constantFrom('template', 'hue') }),
   fc.record({ action: fc.constant('step' as const), flow_id: fc.oneof(fc.constant('9f2c4e1a7b3d4c8e'), fc.constant('../../automation/config/x'), fc.string()), input: fc.constant({}) }),
   fc.record({ action: fc.constant('abort' as const), flow_id: fc.oneof(fc.constant('9f2c4e1a7b3d4c8e'), fc.constant('../../automation/config/x'), fc.string()) }),
+  fc.record({ action: fc.constantFrom('step', 'abort' as const), flow_id: fc.constantFrom('9f2c4e1a7b3d4c8e', '../x'), input: fc.constant({}), options: fc.boolean() }),
+  fc.record({ action: fc.constantFrom('edit', 'delete' as const), entry_id: fc.oneof(fc.constant('01K9W1ZARDTEMP1ATESENS0R01'), fc.constant('../../automation/config/x'), fc.string()) }),
 );
 const holds = (grants: { caller: string; config_write: string }[], kind: string) => grants.some((g) => g.caller === 'agent' && g.config_write === kind);
 
@@ -239,7 +241,8 @@ test("property: a flow is allowed only for an integration in HA's helper list, a
       const { allowed } = decideHelperFlow(policy, 'agent', f, integration, ['template']);
       if (allowed?.write.via !== 'rest') return allowed === undefined;
       const { path } = allowed.write.request;
-      return integration === 'template' && new URL(path, 'http://ha').pathname.startsWith('/api/config/config_entries/flow') && !path.includes('..');
+      const api = /^\/api\/config\/config_entries\/((options\/)?flow|entry\/)/.test(new URL(path, 'http://ha').pathname);
+      return integration === 'template' && api && !path.includes('..') && (f.action !== 'delete' || allowed.write.request.method === 'DELETE');
     }),
   );
 });

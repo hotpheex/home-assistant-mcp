@@ -101,7 +101,7 @@ Each Grant gives one kind of access:
 | `config_write: zone` | Create, update and delete zones, which moves presence: who counts as home and what location automations do. Includes both reads. |
 | `config_write: dashboard` | Create and delete dashboards, and save the layout of any dashboard, the default one included. A card's action runs as whoever taps it. Includes both reads. |
 | Blueprints | `read: config` lists the installed automation and script blueprints. `config_write: automation` or `script` also saves and deletes blueprints of that domain from YAML the Caller supplies. HA's import of a blueprint from a URL is not offered. |
-| `config_write: helper_entry` | Set up wizard helpers, such as template sensors, groups, thresholds and switch_as_x, through HA's own setup forms, only for integrations HA lists as helpers. Full control of the house, as a template switch can run any action. Includes both reads. |
+| `config_write: helper_entry` | Set up, edit and delete wizard helpers, such as template sensors, groups, thresholds and switch_as_x, through HA's own setup and options forms, only for integrations HA lists as helpers. Full control of the house, as a template switch can run any action. Includes both reads. |
 
 Two Grants deserve care. Plain read is not scoped: a Caller that can read sees every entity, including people's locations, and a template it renders can print a camera's live access token. A config write is full control of the house, since an automation can call any service. [SECURITY.md](SECURITY.md) explains exactly what each Grant reveals and how calls are checked.
 

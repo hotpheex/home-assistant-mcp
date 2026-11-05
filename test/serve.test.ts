@@ -4,7 +4,7 @@ import { decideConfigRead, decideConfigWrite, decideRead, decideServiceCall, NAM
 import { openGate } from '../src/gate.ts';
 import { parsePolicy } from '../src/policy.ts';
 import { TOOL_KIND, type ToolName } from '../src/tools.ts';
-import { ADMIN_TOKEN, connect, ERAS, fakeHa, newKey, policyOf, startServer, STARTUP_COMMANDS, USERS_TOKEN } from './harness.ts';
+import { ADMIN_TOKEN, connect, ERAS, fakeHa, newKey, policyOf, startServer, STARTUP_COMMANDS, TEMPLATE_ENTRY, USERS_TOKEN, WIZARD_ENTRIES } from './harness.ts';
 import type { FakeHaOptions } from './fake-ha.ts';
 
 const reader = newKey();
@@ -106,6 +106,10 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_write_blueprint: { domain: 'automation', action: 'create', path: 'mine/dusk', yaml: 'blueprint:\n  name: Dusk\n  domain: automation\n' },
   ha_helper_flow: { action: 'start', handler: 'template' },
 };
+/** Further holder calls, for the actions a tool's sample leaves out. */
+const MORE_ARGS: Partial<Record<ToolName, Record<string, unknown>[]>> = {
+  ha_helper_flow: [{ action: 'edit', entry_id: TEMPLATE_ENTRY }, { action: 'delete', entry_id: TEMPLATE_ENTRY }],
+};
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
   'get_states',
@@ -175,7 +179,7 @@ for (const era of ERAS) {
     test(`matrix: ${tool} for a Caller holding or lacking ${kind} (${era})`, async (t) => {
       const holder = newKey();
       const idle = newKey();
-      const ha = await fakeHa(t);
+      const ha = await fakeHa(t, WIZARD_ENTRIES);
       const server = await startServer(t, policyOf({ holder, idle }, `grants:\n  - caller: holder\n    ${HOLDER_GRANT[tool] ?? GRANT_FOR[kind]}\n`), ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
 
       const holding = await connect(t, server.url, holder.key, era);
@@ -188,8 +192,10 @@ for (const era of ERAS) {
       assert.doesNotMatch(definition.description ?? '', /\bha_/, 'a description points to no other tool');
       assert.deepEqual(ha.received.map((r) => r.message.type).filter((type) => !STARTUP_COMMANDS.includes(type)), []);
       const before = ha.received.length;
-      const allowed = await holding.callTool({ name: tool, arguments: SAMPLE_ARGS[tool] });
-      assert.equal(allowed.isError, undefined);
+      for (const args of [SAMPLE_ARGS[tool], ...(MORE_ARGS[tool] ?? [])]) {
+        const allowed = await holding.callTool({ name: tool, arguments: args });
+        assert.equal(allowed.isError, undefined, JSON.stringify(args));
+      }
       const sent = ha.received.slice(before);
       assert.ok(sent.length > 0);
       // The admin pin, written out here rather than read from the code it pins.

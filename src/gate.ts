@@ -49,6 +49,7 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'lovelace/config',
     'blueprint/list',
     'config_entries/flow/progress',
+    'config_entries/get_single',
   ]),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
@@ -62,6 +63,7 @@ const CONFIG_PATHS = [
   /^\/api\/config\/config_entries\/flow_handlers\?type=helper$/,
   /^\/api\/config\/config_entries\/entry\?type=helper$/,
   /^\/api\/config\/config_entries\/flow\/[0-9A-Za-z]+$/,
+  /^\/api\/config\/config_entries\/options\/flow\/[0-9A-Za-z]+$/,
 ];
 
 export type Command = { type: string } & Record<string, unknown>;

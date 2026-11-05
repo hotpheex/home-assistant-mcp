@@ -284,29 +284,35 @@ export function decideBlueprintWrite(policy: Policy, caller: string, { domain, a
   return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: { via: 'websocket', command } }), grants };
 }
 
-/** HA names a flow by a random hex id; anything else could walk the REST path out of the flow API. */
+/** HA names a flow by a random hex id and an entry by a ULID; anything else could walk the REST path out of the flow API. */
 export const FLOW_ID = /^[0-9A-Za-z]+$/;
 
-/** One request to HA's setup flow for a wizard helper. */
+/** One request to HA's setup or options flow for a wizard helper, or the removal of its entry; `options` marks an options flow. */
 export type HelperFlow =
   | { action: 'start'; handler: string }
-  | { action: 'step'; flow_id: string; input: Record<string, unknown> }
-  | { action: 'abort'; flow_id: string };
+  | { action: 'step'; flow_id: string; input: Record<string, unknown>; options?: boolean }
+  | { action: 'abort'; flow_id: string; options?: boolean }
+  | { action: 'edit'; entry_id: string }
+  | { action: 'delete'; entry_id: string };
 
 const FLOW_PATH = '/api/config/config_entries/flow';
+const OPTIONS_PATH = '/api/config/config_entries/options/flow';
 function flowRequest(flow: HelperFlow): RestRequest {
   if (flow.action === 'start') return { method: 'POST', path: FLOW_PATH, body: { handler: flow.handler } };
-  const path = `${FLOW_PATH}/${flow.flow_id}`;
+  // HA names an options flow's handler by the entry it edits.
+  if (flow.action === 'edit') return { method: 'POST', path: OPTIONS_PATH, body: { handler: flow.entry_id } };
+  if (flow.action === 'delete') return { method: 'DELETE', path: `/api/config/config_entries/entry/${flow.entry_id}` };
+  const path = `${flow.options ? OPTIONS_PATH : FLOW_PATH}/${flow.flow_id}`;
   return flow.action === 'step' ? { method: 'POST', path, body: flow.input } : { method: 'DELETE', path };
 }
 
 /**
- * A flow is driven only for an integration in HA's own live helper list, so `helper_entry` never adds an
- * integration or drives a discovery; `integration` is the flow's handler as HA reports it.
+ * A flow is driven, or an entry removed, only for an integration in HA's own live helper list, so `helper_entry` never
+ * adds, changes or removes another integration or drives a discovery; `integration` is the flow's or entry's as HA reports it.
  */
 export function decideHelperFlow(policy: Policy, caller: string, flow: HelperFlow, integration: string, helpers: readonly string[]): ConfigWriteDecision {
   const grants = writersOf(policy, caller, 'helper_entry');
-  const helper = helpers.includes(integration) && (flow.action === 'start' ? flow.handler === integration : FLOW_ID.test(flow.flow_id));
+  const helper = helpers.includes(integration) && (flow.action === 'start' ? flow.handler === integration : FLOW_ID.test('entry_id' in flow ? flow.entry_id : flow.flow_id));
   if (grants.length === 0 || !helper) return { allowed: undefined, grants: [] };
   return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: { via: 'rest', request: flowRequest(flow) } }), grants };
 }

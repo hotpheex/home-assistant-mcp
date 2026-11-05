@@ -229,3 +229,13 @@ export function runImage(image: string, policy: string, env: Record<string, stri
   const logged = (msg: string, ms = 60_000) => until(() => records.some((r) => r.msg === msg), msg, ms);
   return { name, records, exited, logged, url: () => `http://${String(records.find((r) => r.msg === 'listening')?.address)}/mcp` };
 }
+
+/** A template sensor set up through its wizard, and a Hue bridge, an integration no helper_entry call may change; ids are HA's ULIDs. */
+export const TEMPLATE_ENTRY = '01K9W1ZARDTEMP1ATESENS0R01';
+export const HUE_ENTRY = '01K9HUEBR1DGE0000000000001';
+export const WIZARD_ENTRIES: Partial<FakeHaOptions> = {
+  entries: [
+    { entry_id: TEMPLATE_ENTRY, domain: 'template', title: 'Door open minutes', source: 'user', options: { template_type: 'sensor', name: 'Door open minutes', state: '{{ 3 }}' } },
+    { entry_id: HUE_ENTRY, domain: 'hue', title: 'Hue bridge', source: 'zeroconf', options: {} },
+  ],
+};

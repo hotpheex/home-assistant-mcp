@@ -83,6 +83,8 @@ export interface FakeHaOptions {
   entries?: FakeConfigEntry[];
   /** Config flows already in progress, such as a discovery HA started. */
   flows?: FakeFlow[];
+  /** Options flows in progress; each one's `handler` is its entry's id. */
+  optionsFlows?: FakeFlow[];
 }
 
 /** A config entry, with the fields HA's entry list serves that the tools read. */
@@ -112,6 +114,11 @@ const FLOW_STEPS: Record<string, Record<string, FlowStep>> = {
   switch_as_x: { user: { fields: { entity_id: true, invert: false, target_domain: true }, title: 'entity_id' } },
   // An integration, not a helper: no helper_entry call may ever drive it.
   hue: { user: { fields: { host: true }, title: 'host' } },
+};
+/** Each integration's options form, cut to one step: HA's template options skip their empty `init` to the entry's own type. */
+const OPTIONS_FORMS: Record<string, { step_id: string; fields: Record<string, boolean> }> = {
+  template: { step_id: 'sensor', fields: { state: true, unit_of_measurement: false } },
+  hue: { step_id: 'init', fields: { allow_hue_groups: false } },
 };
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
@@ -303,6 +310,7 @@ export async function startFakeHa(options: FakeHaOptions) {
   const configs = structuredClone(options.configs ?? {});
   const entries = structuredClone(options.entries ?? []);
   const flows = structuredClone(options.flows ?? []);
+  const optionsFlows = structuredClone(options.optionsFlows ?? []);
   const helpers = structuredClone(options.helpers ?? {});
   const zones = structuredClone(options.zones ?? []);
   const blueprints = structuredClone(options.blueprints ?? {});
@@ -405,6 +413,10 @@ export async function startFakeHa(options: FakeHaOptions) {
     'config_entries/flow/progress': adminOnly(() =>
       flows.filter((f) => !['user', 'reconfigure'].includes(f.source)).map((f) => ({ flow_id: f.flow_id, handler: f.handler, step_id: f.step_id, context: { source: f.source } })),
     ),
+    'config_entries/get_single': adminOnly((_, msg) => {
+      const entry = entries.find((e) => e.entry_id === msg.entry_id);
+      return entry ? { config_entry: served(entry) } : haError('not_found', 'Config entry not found');
+    }),
     'logbook/get_events': (_, msg) =>
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
@@ -581,8 +593,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     json(200, { result: 'ok' });
   }
   /** A flow's current step as HA's flow REST answers it, with HA's keys. */
-  function stepOf(flow: FakeFlow) {
-    const step = FLOW_STEPS[flow.handler]![flow.step_id]!;
+  function stepOf(flow: FakeFlow, step: { menu: string[] } | { fields: Record<string, boolean> } = FLOW_STEPS[flow.handler]![flow.step_id]!) {
     const common = { flow_id: flow.flow_id, handler: flow.handler, step_id: flow.step_id, description_placeholders: null };
     if ('menu' in step) return { type: 'menu', ...common, menu_options: step.menu };
     const data_schema = Object.entries(step.fields).map(([name, required]) => ({ name, required, selector: { text: {} } }));
@@ -609,6 +620,21 @@ export async function startFakeHa(options: FakeHaOptions) {
     entries.push(entry);
     json(200, { type: 'create_entry', flow_id: flow.flow_id, handler: flow.handler, title: entry.title, description: null, description_placeholders: null, options: input, version: 1, minor_version: 1, result: served(entry) });
   }
+  /** An options flow's one form: a step that passes it saves the input over the entry's options. */
+  function optionsRoute([, id]: RegExpExecArray, method: string | undefined, body: Record<string, unknown> | undefined, json: Json) {
+    const flow = optionsFlows.find((f) => f.flow_id === id);
+    if (!flow) return json(404, { message: 'Invalid flow specified' });
+    const entry = entries.find((e) => e.entry_id === flow.handler)!;
+    const form = OPTIONS_FORMS[entry.domain]!;
+    if (method === 'GET') return json(200, stepOf(flow, form));
+    const input = body ?? {};
+    const missing = Object.keys(form.fields).filter((k) => form.fields[k] && !(k in input));
+    if (method === 'POST' && missing.length > 0) return json(400, { errors: Object.fromEntries(missing.map((k) => [k, 'required key not provided'])) });
+    optionsFlows.splice(optionsFlows.indexOf(flow), 1);
+    if (method === 'DELETE') return json(200, { message: 'Flow aborted' });
+    entry.options = { ...entry.options, ...input };
+    json(200, { type: 'create_entry', flow_id: flow.flow_id, handler: flow.handler, title: '', description: null, description_placeholders: null, version: 1, minor_version: 1 });
+  }
   /** An entry as HA serves it: its options stay in HA. */
   const served = ({ entry_id, domain, title, source }: FakeConfigEntry) => ({ entry_id, domain, title, source, state: 'loaded' });
   const newFlowId = () => randomBytes(16).toString('hex');
@@ -631,6 +657,26 @@ export async function startFakeHa(options: FakeHaOptions) {
       },
     ],
     [/^\/api\/config\/config_entries\/flow\/([^/]+)$/, flowRoute],
+    [
+      /^\/api\/config\/config_entries\/options\/flow$/,
+      (_, _m, body, json) => {
+        const entry = entries.find((e) => e.entry_id === body?.handler);
+        if (!entry || !(entry.domain in OPTIONS_FORMS)) return json(404, { message: 'Invalid handler specified' });
+        const flow = { flow_id: newFlowId(), handler: entry.entry_id, source: 'user', step_id: OPTIONS_FORMS[entry.domain]!.step_id };
+        optionsFlows.push(flow);
+        json(200, stepOf(flow, OPTIONS_FORMS[entry.domain]));
+      },
+    ],
+    [/^\/api\/config\/config_entries\/options\/flow\/([^/]+)$/, optionsRoute],
+    [
+      /^\/api\/config\/config_entries\/entry\/([^/?]+)$/,
+      ([, id], method, _b, json) => {
+        const entry = entries.find((e) => e.entry_id === id);
+        if (method !== 'DELETE' || !entry) return json(method === 'DELETE' ? 404 : 405, { message: 'Invalid entry specified' });
+        entries.splice(entries.indexOf(entry), 1);
+        json(200, { require_restart: false });
+      },
+    ],
   ];
   function rest(req: IncomingMessage, res: ServerResponse, raw: string) {
     const json: Json = (status, value) => void res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
@@ -717,6 +763,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     layouts,
     entries,
     flows,
+    optionsFlows,
     /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
     drop,
     /** Command types recorded and never answered while pings still are, as HA does with a script called directly until it ends. */

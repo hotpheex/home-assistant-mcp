@@ -978,39 +978,53 @@ const writeBlueprint = defineTool({
 
 const HELPER_LIST = '/api/config/config_entries/flow_handlers?type=helper';
 /** The arguments each action takes; any other is refused. */
-const FLOW_ARGS = { list: [], start: ['handler'], step: ['flow_id', 'input'], abort: ['flow_id'] } as const;
+const FLOW_ARGS = { list: [], start: ['handler'], edit: ['entry_id'], step: ['flow_id', 'input'], abort: ['flow_id'], delete: ['entry_id'] } as const;
+
+/** An entry's integration, by a lookup that runs nothing. */
+async function entryDomain(ctx: Context, entryId: string): Promise<string> {
+  try {
+    return (await send<{ config_entry: { domain: string } }>(ctx, ctx.allowed, { type: 'config_entries/get_single', entry_id: entryId })).config_entry.domain;
+  } catch (e) {
+    if ((e as { code?: unknown }).code === 'not_found') throw new ToolFailure(`No entry ${entryId} exists; list the wizard helpers for their entry ids.`);
+    throw e;
+  }
+}
 
 /**
- * A flow's integration as HA reports it. The progress list names a discovery flow without running it; a flow
- * a user started is not listed, and reading it re-runs its current step with no input.
+ * A flow's integration as HA reports it, and for an options flow the entry it edits. The progress list names a discovery
+ * without running it; HA lists no other flow, and reading one re-runs its current step with no input.
  */
-async function flowHandler(ctx: Context, flowId: string): Promise<string> {
+async function flowOf(ctx: Context, flowId: string): Promise<{ integration: string; entry_id?: string }> {
   const listed = (await send<{ flow_id: string; handler: string }[]>(ctx, ctx.allowed, { type: 'config_entries/flow/progress' })).find((f) => f.flow_id === flowId);
-  const flow = listed ?? ((await rest(ctx, ctx.allowed, { method: 'GET', path: `/api/config/config_entries/flow/${flowId}` })) as { handler: string } | undefined);
-  if (!flow) throw new ToolFailure(`No setup flow ${flowId} is in progress; start one.`);
-  return flow.handler;
+  const read = async (path: string) => (await rest(ctx, ctx.allowed, { method: 'GET', path: `${path}/${flowId}` })) as { handler: string } | undefined;
+  const flow = listed ?? (await read('/api/config/config_entries/flow'));
+  if (flow) return { integration: flow.handler };
+  const options = await read('/api/config/config_entries/options/flow');
+  if (!options) throw new ToolFailure(`No setup or options flow ${flowId} is in progress; start or edit one.`);
+  return { integration: await entryDomain(ctx, options.handler), entry_id: options.handler };
 }
 
 const helperFlow = defineTool({
-  title: 'Set up a wizard helper',
+  title: 'Set up, edit or delete a wizard helper',
   description: [
-    "Sets up a wizard helper, such as a template sensor, a light group, a threshold or a switch shown as a light (switch_as_x), by driving Home Assistant's own setup form one step at a time; this is admin-equivalent, because a template switch or button can run any action.",
-    '`list` returns the helper integrations Home Assistant offers and the wizard helpers that exist; `start` with a `handler` from that list begins a setup; `step` with its `flow_id` submits one step\'s `input`, answering a menu with {"next_step_id": "<option>"}; `abort` abandons a setup.',
+    "Sets up, edits or deletes a wizard helper, such as a template sensor, a light group, a threshold or a switch shown as a light (switch_as_x), by driving Home Assistant's own setup and options forms one step at a time; this is admin-equivalent, because a template switch or button can run any action.",
+    '`list` returns the helper integrations Home Assistant offers and the wizard helpers that exist, with their `entry_id`; `start` with a `handler` from that list begins a setup, and `edit` with an `entry_id` begins its options form; `step` with the `flow_id` either returned submits one step\'s `input`, answering a menu with {"next_step_id": "<option>"}; `abort` abandons the flow; `delete` with an `entry_id` removes the helper.',
     "Each step returns Home Assistant's answer as it stands: a `form` with its `data_schema` and any field `errors`, a `menu` with its `menu_options`, an `abort`, or a `create_entry` with the new entry in `result`; input Home Assistant rejects comes back with its field errors, and the same flow can be stepped again.",
-    'Only integrations Home Assistant lists as helpers are served, so any other setup is refused, and so is step input that carries **REDACTED** from a read.',
+    'Only integrations Home Assistant lists as helpers are served, so any other setup, edit or delete is refused, and so is step input that carries **REDACTED** from a read.',
     MASKED,
     'Example: {"action": "step", "flow_id": "9f2c4e1a7b3d4c8e9a1f2b3c4d5e6f70", "input": {"next_step_id": "sensor"}} picks a sensor from the template menu.',
   ].join(' '),
   input: z
     .strictObject({
-      action: z.enum(['list', 'start', 'step', 'abort']).describe('list, start, step or abort.'),
+      action: z.enum(['list', 'start', 'edit', 'step', 'abort', 'delete']).describe('list, start, edit, step, abort or delete.'),
       handler: slug.optional().describe('For start: a helper integration from list, such as template.'),
-      flow_id: z.string().regex(FLOW_ID, 'must be the flow_id start returned').optional().describe('For step and abort: the flow_id start returned.'),
+      flow_id: z.string().regex(FLOW_ID, 'must be the flow_id start or edit returned').optional().describe('For step and abort: the flow_id start or edit returned.'),
+      entry_id: z.string().regex(FLOW_ID, 'must be an entry_id list returned').optional().describe('For edit and delete: a wizard helper\'s entry_id from list.'),
       input: z.record(z.string(), z.unknown()).optional().describe('For step: the form\'s fields, or {"next_step_id": "<option>"} for a menu.'),
     })
     .superRefine((args, ctx) => {
       const taken: readonly string[] = FLOW_ARGS[args.action];
-      for (const key of ['handler', 'flow_id', 'input'] as const) {
+      for (const key of ['handler', 'flow_id', 'input', 'entry_id'] as const) {
         if (taken.includes(key) && args[key] === undefined) ctx.addIssue({ code: 'custom', path: [key], message: `is required to ${args.action}` });
         if (!taken.includes(key) && args[key] !== undefined) ctx.addIssue({ code: 'custom', path: [key], message: `is not taken by ${args.action}` });
       }
@@ -1018,38 +1032,42 @@ const helperFlow = defineTool({
   annotations: { readOnlyHint: false, destructiveHint: true },
   kinds: ['helper_entry'],
   // The Allowed here is for the lookups; the write is decided once HA has named the flow's integration.
-  decide: ({ action, handler, flow_id }, policy, caller) => ({
+  decide: ({ action, handler, flow_id, entry_id }, policy, caller) => ({
     ...decideConfigRead(policy, caller, 'helper_entry'),
     lacking: 'config writes of helper_entry',
-    request: { kind: 'helper_entry', action, handler, flow_id },
+    request: { kind: 'helper_entry', action, handler, flow_id, entry_id },
   }),
-  async run({ action, handler, flow_id, input }, ctx) {
+  async run({ action, handler, flow_id, entry_id, input }, ctx) {
     const lookup = (path: string) => rest(ctx, ctx.allowed, { method: 'GET', path });
     if (action === 'list') {
       const [handlers, entries] = await Promise.all([lookup(HELPER_LIST), lookup('/api/config/config_entries/entry?type=helper')]);
       const named = (entries as { entry_id: string; domain: string; title: string }[]).map(({ entry_id, domain, title }) => ({ entry_id, domain, title }));
       return writeResult(maskSecrets({ handlers: (handlers as string[]).sort(), entries: named }));
     }
-    const names = { kind: 'helper_entry', action, flow_id };
+    const names = { kind: 'helper_entry', action, flow_id, entry_id };
     const marked = redactedPath(input);
     if (marked !== undefined) {
       ctx.audit({ ...names, decision: 'deny', reason: 'input carries a redacted value' });
       throw new ToolFailure(`input carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
     }
-    const integration = handler ?? (await flowHandler(ctx, flow_id!));
-    const flow = (action === 'start' ? { action, handler } : action === 'step' ? { action, flow_id, input } : { action, flow_id }) as HelperFlow;
+    const found = handler !== undefined ? { integration: handler } : entry_id !== undefined ? { integration: await entryDomain(ctx, entry_id), entry_id } : await flowOf(ctx, flow_id!);
+    const { integration } = found;
+    const options = found.entry_id !== undefined;
+    const flow = (
+      action === 'start' ? { action, handler } : action === 'step' ? { action, flow_id, input, options } : action === 'abort' ? { action, flow_id, options } : { action, entry_id }
+    ) as HelperFlow;
     const decision = decideHelperFlow(ctx.policy, ctx.auth.caller, flow, integration, (await lookup(HELPER_LIST)) as string[]);
-    const audit = (record: Record<string, unknown>) => ctx.audit({ ...names, handler: integration, ...record });
+    const audit = (record: Record<string, unknown>) => ctx.audit({ ...names, handler: integration, entry_id: found.entry_id, ...record });
     if (!decision.allowed) {
       audit({ decision: 'deny', grants: [], reason: 'not a helper integration' });
-      throw new ToolFailure(`Denied: Home Assistant does not list ${integration} as a helper integration, so this Caller may not drive its setup. Do not retry this call.`);
+      throw new ToolFailure(`Denied: Home Assistant does not list ${integration} as a helper integration, so this Caller may not drive its flows or delete its entries. Do not retry this call.`);
     }
     const { write } = decision.allowed;
     if (write.via !== 'rest') throw new Error('a helper flow is driven over REST');
     if (ctx.options.auditWrites) audit({ decision: 'allow', grants: decision.grants });
     const result = (await rest(ctx, decision.allowed, write.request)) as { flow_id?: string; type?: string; result?: { entry_id?: string } } | null;
-    const entry_id = result?.type === 'create_entry' ? result.result?.entry_id : undefined;
-    if (ctx.options.auditWrites) audit({ outcome: 'done', flow_id: flow_id ?? result?.flow_id, entry_id });
+    const created = result?.type === 'create_entry' ? result.result?.entry_id : undefined;
+    if (ctx.options.auditWrites) audit({ outcome: 'done', flow_id: flow_id ?? result?.flow_id, entry_id: found.entry_id ?? created });
     return writeResult(maskSecrets(result));
   },
 });

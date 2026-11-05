@@ -2,7 +2,8 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import { REDACTED as M } from '../src/redaction.ts';
-import { ADMIN_TOKEN, adminCaller, body, connect, fakeHa, newKey, policyOf, startServer } from './harness.ts';
+import type { FakeHaOptions } from './fake-ha.ts';
+import { ADMIN_TOKEN, adminCaller, body, connect, fakeHa, HUE_ENTRY, newKey, policyOf, startServer, TEMPLATE_ENTRY, WIZARD_ENTRIES } from './harness.ts';
 
 const keys = Object.fromEntries(['wizard', 'helperer', 'automator'].map((name) => [name, newKey()]));
 const policy = policyOf(
@@ -21,12 +22,13 @@ const policy = policyOf(
 const DISCOVERED = 'd15c0e2ed15c0e2ed15c0e2ed15c0e2e';
 const OPERATOR_STARTED = '0be2a7020be2a7020be2a7020be2a702';
 
-async function house(t: TestContext) {
+async function house(t: TestContext, seed: Partial<FakeHaOptions> = {}) {
   const ha = await fakeHa(t, {
     flows: [
       { flow_id: DISCOVERED, handler: 'hue', source: 'zeroconf', step_id: 'user' },
       { flow_id: OPERATOR_STARTED, handler: 'hue', source: 'user', step_id: 'user' },
     ],
+    ...seed,
   });
   const server = await startServer(t, policy, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN, HAMCP_AUDIT_WRITES: 'true' });
   const as = async (who: string) => {
@@ -129,9 +131,9 @@ test('a setup, step or abort of an integration HA does not list as a helper is r
   assert.doesNotMatch(JSON.stringify(server.audits()), /10\.0\.0\.9/);
 
   const gone = await call('ha_helper_flow', { action: 'abort', flow_id: 'deadbeefdeadbeef' });
-  assert.match(JSON.stringify(gone.result.content), /No setup flow deadbeefdeadbeef is in progress/);
+  assert.match(JSON.stringify(gone.result.content), /No setup or options flow deadbeefdeadbeef is in progress/);
   const walk = await call('ha_helper_flow', { action: 'abort', flow_id: '../../automation/config/porch_light_1' });
-  assert.match(JSON.stringify(walk.result.content), /flow_id: must be the flow_id start returned/);
+  assert.match(JSON.stringify(walk.result.content), /flow_id: must be the flow_id start or edit returned/);
   assert.deepEqual(walk.sent, []);
 });
 
@@ -167,4 +169,90 @@ test('a wizard helper is never read or written as a config: only its flow makes 
     assert.match(JSON.stringify(result.content), /kind: a wizard helper is set up through its flow, not as a config/);
     assert.deepEqual(sent, []);
   }
+});
+
+const progress = { type: 'config_entries/flow/progress' };
+const entryOf = (entry_id: string) => ({ type: 'config_entries/get_single', entry_id });
+
+test("a template sensor's state template is changed through its options form, and a wizard helper is deleted, each request with the admin token and audited by entry id", async (t) => {
+  const { ha, server, as } = await house(t, WIZARD_ENTRIES);
+  const { call } = await as('wizard');
+
+  const edit = await call('ha_helper_flow', { action: 'edit', entry_id: TEMPLATE_ENTRY });
+  const form = body(edit.result) as { type: string; flow_id: string; step_id: string; handler: string };
+  assert.deepEqual([form.type, form.step_id, form.handler], ['form', 'sensor', TEMPLATE_ENTRY]);
+  const { flow_id } = form;
+  assert.deepEqual(edit.sent, [entryOf(TEMPLATE_ENTRY), { type: HELPERS }, { type: 'POST /api/config/config_entries/options/flow', body: { handler: TEMPLATE_ENTRY } }]);
+
+  const step = await call('ha_helper_flow', { action: 'step', flow_id, input: { state: '{{ 4 }}' } });
+  assert.equal((body(step.result) as { type: string }).type, 'create_entry');
+  // A flow the Caller started is not in the progress list, and is not a config flow, so HA names its entry only when asked for it as an options flow.
+  assert.deepEqual(step.sent, [
+    progress,
+    { type: `GET /api/config/config_entries/flow/${flow_id}` },
+    { type: `GET /api/config/config_entries/options/flow/${flow_id}` },
+    entryOf(TEMPLATE_ENTRY),
+    { type: HELPERS },
+    { type: `POST /api/config/config_entries/options/flow/${flow_id}`, body: { state: '{{ 4 }}' } },
+  ]);
+  assert.equal(ha.entries.find((e) => e.entry_id === TEMPLATE_ENTRY)?.options.state, '{{ 4 }}');
+
+  const second = body((await call('ha_helper_flow', { action: 'edit', entry_id: TEMPLATE_ENTRY })).result) as { flow_id: string };
+  const aborted = await call('ha_helper_flow', { action: 'abort', flow_id: second.flow_id });
+  assert.equal(aborted.sent.at(-1)?.type, `DELETE /api/config/config_entries/options/flow/${second.flow_id}`);
+  assert.deepEqual(ha.optionsFlows, []);
+
+  const deleted = await call('ha_helper_flow', { action: 'delete', entry_id: TEMPLATE_ENTRY });
+  assert.deepEqual(body(deleted.result), { require_restart: false });
+  assert.deepEqual(deleted.sent, [entryOf(TEMPLATE_ENTRY), { type: HELPERS }, { type: `DELETE /api/config/config_entries/entry/${TEMPLATE_ENTRY}` }]);
+  assert.deepEqual(ha.entries.map((e) => e.entry_id), [HUE_ENTRY]);
+
+  const named = (a: Record<string, unknown>) => [a.action, a.handler, a.entry_id, a.flow_id, a.decision ?? a.outcome];
+  assert.deepEqual(server.audits().map(named), [
+    ['edit', 'template', TEMPLATE_ENTRY, undefined, 'allow'],
+    ['edit', 'template', TEMPLATE_ENTRY, flow_id, 'done'],
+    ['step', 'template', TEMPLATE_ENTRY, flow_id, 'allow'],
+    ['step', 'template', TEMPLATE_ENTRY, flow_id, 'done'],
+    ['edit', 'template', TEMPLATE_ENTRY, undefined, 'allow'],
+    ['edit', 'template', TEMPLATE_ENTRY, second.flow_id, 'done'],
+    ['abort', 'template', TEMPLATE_ENTRY, second.flow_id, 'allow'],
+    ['abort', 'template', TEMPLATE_ENTRY, second.flow_id, 'done'],
+    ['delete', 'template', TEMPLATE_ENTRY, undefined, 'allow'],
+    ['delete', 'template', TEMPLATE_ENTRY, undefined, 'done'],
+  ]);
+  assert.doesNotMatch(JSON.stringify(server.audits()), /\{\{/, 'audit lines carry names, never step input');
+});
+
+test('an edit, delete, step or abort on the entry of an integration HA does not list as a helper is refused and audited, with nothing sent beyond the lookups', async (t) => {
+  const HUE_OPTIONS = '0b7105f10b7105f10b7105f10b7105f1';
+  const { ha, server, as } = await house(t, { ...WIZARD_ENTRIES, optionsFlows: [{ flow_id: HUE_OPTIONS, handler: HUE_ENTRY, source: 'user', step_id: 'init' }] });
+  const { call } = await as('wizard');
+  const refused = async (args: Record<string, unknown>, lookups: Record<string, unknown>[]) => {
+    const { result, sent } = await call('ha_helper_flow', args);
+    assert.match(JSON.stringify(result.content), /does not list hue as a helper integration.*Do not retry/);
+    assert.deepEqual(sent, lookups);
+  };
+  await refused({ action: 'edit', entry_id: HUE_ENTRY }, [entryOf(HUE_ENTRY), { type: HELPERS }]);
+  await refused({ action: 'delete', entry_id: HUE_ENTRY }, [entryOf(HUE_ENTRY), { type: HELPERS }]);
+  const lookups = [progress, { type: `GET /api/config/config_entries/flow/${HUE_OPTIONS}` }, { type: `GET /api/config/config_entries/options/flow/${HUE_OPTIONS}` }, entryOf(HUE_ENTRY), { type: HELPERS }];
+  await refused({ action: 'step', flow_id: HUE_OPTIONS, input: { allow_hue_groups: true } }, lookups);
+  await refused({ action: 'abort', flow_id: HUE_OPTIONS }, lookups);
+  assert.deepEqual(ha.entries.map((e) => [e.entry_id, e.options]), [[TEMPLATE_ENTRY, WIZARD_ENTRIES.entries![0]!.options], [HUE_ENTRY, {}]]);
+  assert.deepEqual(ha.optionsFlows.map((f) => f.flow_id), [HUE_OPTIONS]);
+  assert.deepEqual(
+    server.audits().map((a) => [a.action, a.handler, a.entry_id, a.flow_id, a.decision, a.reason]),
+    [
+      ['edit', 'hue', HUE_ENTRY, undefined, 'deny', 'not a helper integration'],
+      ['delete', 'hue', HUE_ENTRY, undefined, 'deny', 'not a helper integration'],
+      ['step', 'hue', HUE_ENTRY, HUE_OPTIONS, 'deny', 'not a helper integration'],
+      ['abort', 'hue', HUE_ENTRY, HUE_OPTIONS, 'deny', 'not a helper integration'],
+    ],
+  );
+
+  const missing = await call('ha_helper_flow', { action: 'delete', entry_id: '01K9N0SUCHENTRY00000000000' });
+  assert.match(JSON.stringify(missing.result.content), /No entry 01K9N0SUCHENTRY00000000000 exists/);
+  assert.deepEqual(missing.sent, [entryOf('01K9N0SUCHENTRY00000000000')]);
+  const walk = await call('ha_helper_flow', { action: 'delete', entry_id: '../../automation/config/porch_light_1' });
+  assert.match(JSON.stringify(walk.result.content), /entry_id: must be an entry_id list returned/);
+  assert.deepEqual(walk.sent, []);
 });

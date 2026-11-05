@@ -30,7 +30,7 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 | `config_write: zone` | `ha_write_config`, plus config read and plain read | Create, update and delete zones, at the admin tier. Also zone config. |
 | `config_write: dashboard` | `ha_write_config` with `kind: dashboard`, plus config read and plain read | Create and delete dashboards, and save the layout of any dashboard, the default `lovelace` included, at the admin tier. Never dashboard resources (custom JavaScript), nor a dashboard's sidebar settings once it exists. |
 | Blueprints | `ha_list_blueprints` with `read: config`; `ha_write_blueprint` with `config_write: automation` or `script` | The list of every automation and script blueprint, at the admin tier. Saving, overwriting and deleting blueprints of the written kind's domain from the Caller's YAML, at the admin tier; this adds no reach, because that kind is already full control. HA's blueprint import is never sent, so no Caller can make HA fetch a URL. |
-| `config_write: helper_entry` | `ha_helper_flow`, plus config read and plain read | Set up wizard helpers through HA's own setup forms, at the admin tier. Only integrations in HA's live helper list are served: a setup, step or abort of any other integration, a discovery included, is refused. |
+| `config_write: helper_entry` | `ha_helper_flow`, plus config read and plain read | Set up, edit and delete wizard helpers through HA's own setup and options forms, at the admin tier. Only integrations in HA's live helper list are served: a setup, edit, step, abort or delete for any other integration's flow or entry, a discovery included, is refused. |
 
 **Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so no state gives a Caller a URL that opens their images or streams. A rendered template is the exception: it can print a live token (see Residual risks).
 
@@ -66,6 +66,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/write.test.ts`: a tool that serves only some config-write kinds, such as the blueprint write, is hidden from and refused to a Caller that writes another kind.
 - `test/evaluator.test.ts`: the properties that only `helper_entry` allows a wizard-helper flow, never `helper`, and only for an integration in HA's helper list.
 - `test/helper-flow.test.ts`: a setup, step or abort of an integration HA does not list as a helper, a discovery included, refused and audited with nothing sent beyond the lookups; a Caller holding `helper` is not shown the flow tool.
+- `test/helper-flow.test.ts`: an edit, delete, step or abort on the entry of an integration HA does not list as a helper, refused and audited with nothing sent beyond the lookups.
 
 **The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands. The one subscription, a plain-read template render, takes its first event and unsubscribes, and is abandoned at the same heartbeat timeout as every request.
 - `test/repo.test.ts`: lint fails on any import of the HA client or another network client, or any `fetch` or `WebSocket`, outside the gate, and on casting to `Allowed` outside the evaluator.
@@ -100,6 +101,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/serve.test.ts`: refused keys and Origins audited without the key, and in the coverage matrix, every refused tool call audited and allowed calls audited only on opt-in.
 - `test/services.test.ts` and `test/write.test.ts`: allowed writes audited by name before any request to HA, and their outcome once HA accepts them.
 - `test/read.test.ts`: an allowed template render audited without its template or variables.
+- `test/helper-flow.test.ts`: wizard-helper setups, edits and deletes audited by handler, flow id and entry id, never by step input.
 
 **Registry edits are cosmetic only.** An `entity_name` write sends HA only the name, icon and aliases of one entity. A write that names any other registry field, or asks to create or delete, is refused with nothing sent.
 - `test/write.test.ts`: area, labels, hiding, disabling and an entity_id rename refused with nothing sent, and a Caller holding another kind refused.
@@ -135,4 +137,4 @@ These are accepted and documented, not fixed:
 - **Template output can carry camera, image and media_player tokens.** A template such as `{{ state_attr('camera.door', 'access_token') }}` prints a live token, which opens that camera's images and stream until HA rotates it. The server does not search rendered output for tokens, so plain read reaches this since v0.3.0.
 - **A dashboard card acts as whoever taps it.** A card's tap action can call any service, and HA runs it as the person who taps it, often an admin, so a `dashboard` Grant can set a trap for a person to spring. A markdown or iframe card can also show content from anywhere.
 - **Wizard helpers can hide entities.** switch_as_x hides the switch it wraps, and a group can hide its members. A hidden entity escapes area and label Denies, and the wrapper, such as switch_as_x's light, falls under its own domain's Grants.
-- **Reading a user-started flow re-runs its step.** HA lists a discovery's handler without running it, but a flow a user started is read through HA's flow REST, which re-runs its current step with no input, before the helper check.
+- **Reading a user-started flow re-runs its step.** HA lists a discovery's handler without running it, but a flow a user started, and any options flow, is read through HA's flow REST, which re-runs its current step with no input, before the helper check.
