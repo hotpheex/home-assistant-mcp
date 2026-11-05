@@ -163,6 +163,20 @@ test('property: adding a Grant never turns an allow into a deny', () => {
   fc.assert(fc.property(scenario, (s) => !decide(s) || decide(s, [...s.grants, s.extra])));
 });
 
+test('property: a zone write and zone config read need a zone Grant, which writes nothing but zones', () => {
+  const kinds = fc.uniqueArray(fc.constantFrom(...CONFIG_KINDS));
+  fc.assert(
+    fc.property(kinds, fc.constantFrom(...CONFIG_KINDS), (held, kind) => {
+      const policy = { grants: held.map((config_write) => ({ caller: 'agent', config_write })), denies: [] } as unknown as Policy;
+      const write = decideConfigWrite(policy, 'agent', { kind, action: 'delete', id: 'office' }).allowed?.write;
+      const command = write?.via === 'websocket' ? write.command.type : undefined;
+      assert.equal(write !== undefined, held.includes(kind));
+      assert.equal(command?.startsWith('zone/') ?? false, kind === 'zone' && held.includes('zone'));
+      if (kind === 'zone') assert.equal(decideConfigRead(policy, 'agent', kind).allowed !== undefined, held.includes('zone'));
+    }),
+  );
+});
+
 test('property: a dashboard write or config read is decided by a dashboard Grant alone, and is a lovelace WebSocket command', () => {
   const grant = fc.record({ caller: fc.constantFrom('agent', 'other'), config_write: fc.constantFrom(...CONFIG_KINDS) });
   const write = fc.record({ action: fc.constantFrom('create', 'update', 'delete' as const), id: fc.constantFrom('lovelace', 'kitchen-wall', 'map') });

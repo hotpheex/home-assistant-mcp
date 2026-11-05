@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decideConfigRead, decideConfigWrite, decideRead, decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type Operation } from '../src/evaluator.ts';
+import { decideConfigRead, decideConfigWrite, decideRead, decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type ConfigKind, type Operation } from '../src/evaluator.ts';
 import { openGate } from '../src/gate.ts';
 import { parsePolicy } from '../src/policy.ts';
 import { TOOL_KIND, type ToolName } from '../src/tools.ts';
 import { ADMIN_TOKEN, connect, ERAS, fakeHa, newKey, policyOf, startServer, STARTUP_COMMANDS, USERS_TOKEN } from './harness.ts';
+import type { FakeHaOptions } from './fake-ha.ts';
 
 const reader = newKey();
 const readerPolicy = policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n');
@@ -95,7 +96,11 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_write_config: { kind: 'automation', action: 'update', id: 'porch_light_1', config: { alias: 'Porch light at dusk' } },
   ha_list_services: {},
   ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
+  ha_get_statistics: { statistic_ids: ['sensor.kitchen_temperature'] },
+  ha_get_logs: {},
   ha_get_dashboard: { dashboard: 'lovelace' },
+  ha_list_blueprints: { domain: 'automation' },
+  ha_write_blueprint: { domain: 'automation', action: 'create', path: 'mine/dusk', yaml: 'blueprint:\n  name: Dusk\n  domain: automation\n' },
 };
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
@@ -115,8 +120,12 @@ const PURE_READS = new Set([
   'trace/list',
   'trace/get',
   ...['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'].map((d) => `${d}/list`),
+  'recorder/list_statistic_ids',
+  'recorder/statistics_during_period',
+  'system_log/list',
   'lovelace/dashboards/list',
   'lovelace/config',
+  'blueprint/list',
 ]);
 test('the gate sends only an Allowed the evaluator issued, as issued: a forged, spread or altered one sends nothing', async (t) => {
   const ha = await fakeHa(t);
@@ -197,6 +206,43 @@ for (const era of ERAS) {
       }
     });
   }
+}
+
+/** A config-write kind that only its own Grant gives, with a seeded house, a sample update of it, and a config read where ha_get_config serves the kind. */
+const KIND_SAMPLES: Partial<Record<ConfigKind, { seed: Partial<FakeHaOptions>; read?: Record<string, unknown>; write: Record<string, unknown> }>> = {
+  zone: {
+    seed: { zones: [{ id: 'office', name: 'Office', latitude: -33.86, longitude: 151.2, radius: 250, passive: false }] },
+    read: { kind: 'zone', id: 'office' },
+    write: { kind: 'zone', action: 'update', id: 'office', config: { radius: 100 } },
+  },
+  dashboard: {
+    seed: {},
+    write: { kind: 'dashboard', action: 'update', id: 'kitchen-wall', config: { title: 'Wall' } },
+  },
+};
+for (const [kind, sample] of Object.entries(KIND_SAMPLES) as [ConfigKind, NonNullable<(typeof KIND_SAMPLES)[ConfigKind]>][]) {
+  test(`matrix: ${kind} config read and write for a Caller holding or lacking config_write: ${kind}`, async (t) => {
+    const holder = newKey();
+    const other = newKey();
+    const ha = await fakeHa(t, sample.seed);
+    const grants = `grants:\n  - caller: holder\n    config_write: ${kind}\n  - caller: other\n    config_write: automation\n`;
+    const server = await startServer(t, policyOf({ holder, other }, grants), ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
+    const calls = ([['ha_get_config', sample.read, 'config_read'], ['ha_write_config', sample.write, 'config_write']] as const).filter(([, args]) => args !== undefined);
+    const holding = await connect(t, server.url, holder.key, 'modern');
+    for (const [tool, args] of calls) {
+      const before = ha.received.length;
+      assert.equal((await holding.callTool({ name: tool, arguments: args })).isError, undefined);
+      assert.deepEqual(new Set(ha.received.slice(before).map((r) => r.token)), new Set([ADMIN_TOKEN]));
+    }
+    const lacking = await connect(t, server.url, other.key, 'modern');
+    const quiet = ha.received.length;
+    for (const [tool, args] of calls) assert.match(JSON.stringify((await lacking.callTool({ name: tool, arguments: args })).content), /Do not retry/);
+    assert.equal(ha.received.length, quiet);
+    assert.deepEqual(
+      server.audits().map((a) => [a.caller, a.operation, a.tool, a.kind, a.decision]),
+      calls.map(([tool, , operation]) => ['other', operation, tool, kind, 'deny']),
+    );
+  });
 }
 
 test('no Allowed a dashboard Grant gives can reach dashboard resources, which load JavaScript into every browser', async (t) => {

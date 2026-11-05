@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer } from 'ws';
+import { parse } from 'yaml';
 
 export interface FakeState {
   entity_id: string;
@@ -64,6 +65,13 @@ export interface FakeHaOptions {
   traces?: FakeTrace[];
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
+  statistics?: FakeStatistic[];
+  /** HA's system log entries, oldest first, in `system_log/list`'s shape. */
+  systemLog?: Record<string, unknown>[];
+  /** Stored (UI) zones. */
+  zones?: Record<string, unknown>[];
+  /** Installed blueprints by domain and path, each as `blueprint/list` gives it: `{metadata}` or `{error}`. */
+  blueprints?: Record<string, Record<string, Record<string, unknown>>>;
   /** Dashboard collection items, as `lovelace/dashboards/list` serves them. */
   dashboards?: Record<string, unknown>[];
   /** Saved layouts by url_path; `lovelace` is the default dashboard, which HA reaches by omitting url_path. */
@@ -86,6 +94,17 @@ const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<stri
 };
 /** HA validates the whole body of a config POST, so a partial one is refused. */
 const REQUIRED_KEYS: Record<string, string[]> = { automation: ['triggers', 'actions'], script: ['sequence'], scene: ['name', 'entities'] };
+
+/** A long-term statistic's metadata, and its rows per period, each with an ISO `start` and its type values. */
+export interface FakeStatistic {
+  statistic_id: string;
+  name: string | null;
+  source: string;
+  unit_of_measurement: string | null;
+  has_sum: boolean;
+  mean_type: number;
+  periods: Partial<Record<'5minute' | 'hour' | 'day' | 'week' | 'month', ({ start: string } & Partial<Record<'min' | 'max' | 'mean' | 'sum' | 'state' | 'change', number>>)[]>>;
+}
 
 /** A stored run: summary fields plus the sections only trace/get returns. */
 export interface FakeTrace extends Record<string, unknown> {
@@ -233,6 +252,8 @@ export async function startFakeHa(options: FakeHaOptions) {
     options.users[token]?.is_admin ? handler(token, msg, conn) : haError('unauthorized', 'Unauthorized');
   const configs = structuredClone(options.configs ?? {});
   const helpers = structuredClone(options.helpers ?? {});
+  const zones = structuredClone(options.zones ?? []);
+  const blueprints = structuredClone(options.blueprints ?? {});
   const dashboards = structuredClone(options.dashboards ?? []);
   const layouts = structuredClone(options.layouts ?? {});
   /** HA's `_handle_errors`: no url_path is the default dashboard, and any other must be a listed one. */
@@ -323,6 +344,55 @@ export async function startFakeHa(options: FakeHaOptions) {
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
+    'recorder/list_statistic_ids': () =>
+      (options.statistics ?? []).map(({ statistic_id, name, source, unit_of_measurement, has_sum, mean_type }) => ({
+        statistic_id,
+        display_unit_of_measurement: unit_of_measurement,
+        has_mean: mean_type === 1,
+        mean_type,
+        has_sum,
+        name,
+        source,
+        statistics_unit_of_measurement: unit_of_measurement,
+        unit_class: null,
+      })),
+    'recorder/statistics_during_period': (_, msg) => {
+      const period = msg.period as keyof FakeStatistic['periods'];
+      const ms = { '5minute': 300_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000, month: 2_592_000_000 }[period];
+      if (ms === undefined || !Array.isArray(msg.statistic_ids) || msg.statistic_ids.length === 0) return haError('invalid_format', 'Invalid statistics request');
+      const types = msg.types as string[];
+      const [from, to] = [Date.parse(msg.start_time as string), msg.end_time === undefined ? Date.now() : Date.parse(msg.end_time as string)];
+      const out: Record<string, Record<string, number | null>[]> = {};
+      for (const s of (options.statistics ?? []).filter((x) => (msg.statistic_ids as string[]).includes(x.statistic_id))) {
+        const rows = (s.periods[period] ?? [])
+          .filter((r) => from <= Date.parse(r.start) && Date.parse(r.start) < to)
+          .map((r) => ({ start: Date.parse(r.start), end: Date.parse(r.start) + ms, ...Object.fromEntries(types.map((k) => [k, new Map(Object.entries(r)).get(k) ?? null])) }));
+        if (rows.length > 0) out[s.statistic_id] = rows;
+      }
+      return out;
+    },
+    // HA lists its deduplicated log newest first.
+    'system_log/list': adminOnly(() => [...(options.systemLog ?? [])].reverse()),
+    'blueprint/list': adminOnly((_, msg) => blueprints[msg.domain as string] ?? {}),
+    // HA appends `.yaml` to a saved path, but deletes the path exactly as given.
+    'blueprint/save': adminOnly((_, msg) => {
+      const domain = msg.domain as string;
+      const metadata = (parse(msg.yaml as string) as { blueprint?: { domain?: string } } | null)?.blueprint;
+      if (metadata?.domain !== domain) haError('invalid_format', `Invalid blueprint: Found incorrect blueprint type ${metadata?.domain}, expected ${domain}`);
+      const path = (msg.path as string).endsWith('.yaml') ? (msg.path as string) : `${msg.path as string}.yaml`;
+      const stored = (blueprints[domain] ??= {});
+      const exists = path in stored;
+      if (exists && msg.allow_override !== true) haError('already_exists', 'File already exists');
+      stored[path] = { metadata };
+      return { overrides_existing: exists };
+    }),
+    'blueprint/delete': adminOnly((_, msg) => {
+      const stored = blueprints[msg.domain as string] ?? {};
+      const path = msg.path as string;
+      if (!(path in stored)) haError('unknown_error', `[Errno 2] No such file or directory: '${path}'`);
+      delete stored[path];
+      return null;
+    }),
     'lovelace/dashboards/list': () => dashboards,
     'lovelace/config': (_, msg) => layouts[layoutKey(msg)] ?? haError('config_not_found', 'No config found.'),
     'lovelace/config/save': adminOnly((_, msg) => {
@@ -382,6 +452,28 @@ export async function startFakeHa(options: FakeHaOptions) {
       return null;
     });
   }
+  // HA 2026.10's zone collection: a create fills radius and passive, and an update validates only the keys it sends and merges them.
+  const ZONE_KEYS = ['name', 'latitude', 'longitude', 'radius', 'passive', 'icon'];
+  const zoneFields = (msg: Message) => {
+    const fields = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'zone_id'].includes(k)));
+    const extra = Object.keys(fields).find((k) => !ZONE_KEYS.includes(k));
+    return extra ? haError('invalid_format', `extra keys not allowed @ data['${extra}']`) : fields;
+  };
+  const zoneOf = (msg: Message) => zones.find((z) => z.id === msg.zone_id) ?? haError('not_found', `Unable to find zone_id ${String(msg.zone_id)}`);
+  handlers['zone/list'] = () => zones;
+  handlers['zone/create'] = adminOnly((_, msg) => {
+    const fields = zoneFields(msg);
+    const missing = ['name', 'latitude', 'longitude'].find((k) => !(k in fields));
+    if (missing) haError('invalid_format', `required key not provided @ data['${missing}']. Got None`);
+    const zone = { id: String(fields.name).toLowerCase().replace(/[^a-z0-9]+/g, '_'), radius: 100, passive: false, ...fields };
+    zones.push(zone);
+    return zone;
+  });
+  handlers['zone/update'] = adminOnly((_, msg) => Object.assign(zoneOf(msg), zoneFields(msg)));
+  handlers['zone/delete'] = adminOnly((_, msg) => {
+    zones.splice(zones.indexOf(zoneOf(msg)), 1);
+    return null;
+  });
 
   /** HA's config REST API: automation and scene entries by config id, scripts by object key. */
   const entityOf = (kind: string, id: string) =>
@@ -487,6 +579,8 @@ export async function startFakeHa(options: FakeHaOptions) {
     received,
     configs,
     helpers,
+    zones,
+    blueprints,
     dashboards,
     layouts,
     /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */

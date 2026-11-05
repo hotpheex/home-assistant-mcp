@@ -40,7 +40,7 @@ test('a config-write Grant lists ha_write_config, described as admin-equivalent;
   const listed = (await (await as('automator')).client.listTools()).tools;
   assert.match(listed.find((d) => d.name === 'ha_write_config')?.description ?? '', /admin-equivalent/);
   const auditing = (await (await as('auditor')).client.listTools()).tools;
-  assert.deepEqual(auditing.map((d) => d.name), ['ha_get_config', 'ha_list_traces', 'ha_get_trace']);
+  assert.deepEqual(auditing.map((d) => d.name), ['ha_get_config', 'ha_list_traces', 'ha_get_trace', 'ha_get_logs', 'ha_list_blueprints']);
 });
 
 test('an automation create posts the config to HA, and the allowed write is audited by name only', async (t) => {
@@ -265,6 +265,128 @@ test('a config write dropped or left unanswered after it was sent reports outcom
   assert.match(JSON.stringify((await deleted).content), /Outcome unknown/);
   assert.equal(((await updated).content as { text: string }[])[0]?.text, 'HA unavailable: Home Assistant did not answer. Try again later.');
   assert.ok(!types().includes('POST /api/config/script/config/morning'));
+});
+
+test('zone writes share the helper path: zone WebSocket commands, an update merged over the stored zone, config served only to a zone writer', async (t) => {
+  const people = { zoner: newKey(), helperer: newKey() };
+  const ha = await fakeHa(t);
+  const zonePolicy = policyOf(people, 'grants:\n  - caller: zoner\n    config_write: zone\n  - caller: helperer\n    config_write: helper\n');
+  const server = await startServer(t, zonePolicy, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN, HAMCP_AUDIT_WRITES: 'true' });
+  const call = adminCaller(ha, await connect(t, server.url, people.zoner.key, 'modern'));
+  const office = { name: 'Office', latitude: -33.86, longitude: 151.2, radius: 250, passive: false, icon: 'mdi:briefcase' };
+  const created = await call('ha_write_config', { kind: 'zone', action: 'create', id: 'office', config: office });
+  assert.deepEqual(created.sent, [{ type: 'zone/create', ...office }]);
+  assert.deepEqual(body(created.result), { kind: 'zone', action: 'create', id: 'office', result: { id: 'office', ...office } });
+
+  const moved = await call('ha_write_config', { kind: 'zone', action: 'update', id: 'office', config: { radius: 100 } });
+  assert.deepEqual(moved.sent, [{ type: 'zone/list' }, { type: 'zone/update', ...office, radius: 100, zone_id: 'office' }]);
+  assert.deepEqual(ha.zones, [{ id: 'office', ...office, radius: 100 }]);
+  const read = await call('ha_get_config', { kind: 'zone', id: 'office' });
+  assert.deepEqual(read.sent, [{ type: 'zone/list' }]);
+  assert.deepEqual(body(read.result), { config: { id: 'office', ...office, radius: 100 } });
+  const marked = await call('ha_write_config', { kind: 'zone', action: 'update', id: 'office', config: { name: M } });
+  assert.match(JSON.stringify(marked.result.content), /config carries a redacted value at name/);
+  assert.deepEqual(marked.sent, []);
+
+  const deleted = await call('ha_write_config', { kind: 'zone', action: 'delete', id: 'office' });
+  assert.deepEqual(deleted.sent, [{ type: 'zone/delete', zone_id: 'office' }]);
+  assert.deepEqual(ha.zones, []);
+  const gone = await call('ha_get_config', { kind: 'zone', id: 'office' });
+  assert.match(JSON.stringify(gone.result.content), /Zone office not found/);
+
+  // A helper Grant writes no zone, and a zone Grant no helper.
+  const helperer = adminCaller(ha, await connect(t, server.url, people.helperer.key, 'modern'));
+  for (const [who, args] of [
+    [helperer, { kind: 'zone', action: 'create', id: 'office', config: office }],
+    [helperer, { kind: 'zone', id: 'office' }],
+    [call, { kind: 'helper', action: 'create', id: 'input_boolean.guest_mode', config: { name: 'Guest mode' } }],
+  ] as const) {
+    const denied = await who('action' in args ? 'ha_write_config' : 'ha_get_config', args);
+    assert.match(JSON.stringify(denied.result.content), /no Grant for (config writes of zone|zone config|config writes of helper)\. Do not retry/);
+    assert.deepEqual(denied.sent, []);
+  }
+  assert.deepEqual(
+    server.audits().map((a) => [a.caller, a.operation, a.kind, a.action, a.decision ?? a.outcome]),
+    [
+      ['zoner', 'config_write', 'zone', 'create', 'allow'], ['zoner', 'config_write', 'zone', 'create', 'done'],
+      ['zoner', 'config_write', 'zone', 'update', 'allow'], ['zoner', 'config_write', 'zone', 'update', 'done'],
+      ['zoner', 'config_write', 'zone', 'update', 'deny'],
+      ['zoner', 'config_write', 'zone', 'delete', 'allow'], ['zoner', 'config_write', 'zone', 'delete', 'done'],
+      ['helperer', 'config_write', 'zone', 'create', 'deny'], ['helperer', 'config_read', 'zone', undefined, 'deny'],
+      ['zoner', 'config_write', 'helper', 'create', 'deny'],
+    ],
+  );
+});
+
+const PORCH_BLUEPRINT = 'blueprint:\n  name: Porch at dusk\n  domain: automation\ntriggers:\n  - trigger: sun\n    event: sunset\nactions:\n  - action: light.turn_on\n';
+
+test('an automation writer saves, overwrites and deletes an automation blueprint, audited by domain and path only', async (t) => {
+  const { ha, server, as } = await house(t);
+  const { call } = await as('automator');
+  const save = { type: 'blueprint/save', domain: 'automation', path: 'mine/porch.yaml', yaml: PORCH_BLUEPRINT };
+  const created = await call('ha_write_blueprint', { domain: 'automation', action: 'create', path: 'mine/porch', yaml: PORCH_BLUEPRINT });
+  assert.deepEqual(created.sent, [save]);
+  assert.deepEqual(body(created.result), { domain: 'automation', action: 'create', path: 'mine/porch.yaml', result: { overrides_existing: false } });
+  assert.equal((ha.blueprints.automation?.['mine/porch.yaml']?.metadata as { name?: string }).name, 'Porch at dusk');
+
+  const again = await call('ha_write_blueprint', { domain: 'automation', action: 'create', path: 'mine/porch.yaml', yaml: PORCH_BLUEPRINT });
+  assert.match(JSON.stringify(again.result.content), /Home Assistant refused the request: File already exists/);
+  const updated = await call('ha_write_blueprint', { domain: 'automation', action: 'update', path: 'mine/porch.yaml', yaml: PORCH_BLUEPRINT.replace('Porch at dusk', 'Porch') });
+  assert.equal(updated.sent[0]?.allow_override, true);
+  assert.deepEqual(body(updated.result), { domain: 'automation', action: 'update', path: 'mine/porch.yaml', result: { overrides_existing: true } });
+  const deleted = await call('ha_write_blueprint', { domain: 'automation', action: 'delete', path: 'mine/porch' });
+  assert.deepEqual(deleted.sent, [{ type: 'blueprint/delete', domain: 'automation', path: 'mine/porch.yaml' }]);
+  assert.equal(ha.blueprints.automation?.['mine/porch.yaml'], undefined);
+
+  assert.deepEqual(
+    server.audits().map((a) => [a.tool, a.domain, a.action, a.path, a.decision ?? a.outcome]),
+    [
+      ['ha_write_blueprint', 'automation', 'create', 'mine/porch.yaml', 'allow'],
+      ['ha_write_blueprint', 'automation', 'create', 'mine/porch.yaml', 'done'],
+      ['ha_write_blueprint', 'automation', 'create', 'mine/porch.yaml', 'allow'],
+      ['ha_write_blueprint', 'automation', 'update', 'mine/porch.yaml', 'allow'],
+      ['ha_write_blueprint', 'automation', 'update', 'mine/porch.yaml', 'done'],
+      ['ha_write_blueprint', 'automation', 'delete', 'mine/porch.yaml', 'allow'],
+      ['ha_write_blueprint', 'automation', 'delete', 'mine/porch.yaml', 'done'],
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(server.audits()), /Porch|sunset/, 'audit lines carry names, never YAML');
+});
+
+test('a blueprint write is refused with nothing sent for the other domain, another kind, a redacted value or a URL to import', async (t) => {
+  const { server, as } = await house(t);
+  const scriptBlueprint = 'blueprint:\n  name: Ping\n  domain: script\nsequence: []\n';
+  const scripter = await as('scripter');
+  assert.equal((await scripter.call('ha_write_blueprint', { domain: 'script', action: 'create', path: 'ping', yaml: scriptBlueprint })).result.isError, undefined);
+  const crossed = [
+    await scripter.call('ha_write_blueprint', { domain: 'automation', action: 'create', path: 'porch', yaml: PORCH_BLUEPRINT }),
+    await (await as('automator')).call('ha_write_blueprint', { domain: 'script', action: 'delete', path: 'ping' }),
+  ];
+  assert.match(JSON.stringify(crossed[0]!.result.content), /no Grant for config writes of automation\. Do not retry/);
+  assert.match(JSON.stringify(crossed[1]!.result.content), /no Grant for config writes of script\. Do not retry/);
+
+  // A scene writer holds config writes, but not of a kind blueprints serve, so the tool is hidden and refused.
+  const scener = await as('scener');
+  assert.equal((await scener.client.listTools()).tools.some((d) => d.name === 'ha_write_blueprint'), false);
+  const hidden = await scener.call('ha_write_blueprint', { domain: 'automation', action: 'delete', path: 'porch' });
+  assert.match(JSON.stringify(hidden.result.content), /no Grant for config writes of automation or script\. Do not retry/);
+
+  const marked = await scripter.call('ha_write_blueprint', { domain: 'script', action: 'update', path: 'ping', yaml: `${scriptBlueprint}variables:\n  key: ${M}\n` });
+  assert.match(JSON.stringify(marked.result.content), /yaml carries a redacted value: put the real value in its place\. Nothing was sent/);
+  const imported = await scripter.call('ha_write_blueprint', { domain: 'script', action: 'create', path: 'ping2', url: 'https://example.com/b.yaml' });
+  assert.match(JSON.stringify(imported.result.content), /Input validation error/);
+  for (const refused of [...crossed, hidden, marked, imported]) assert.deepEqual(refused.sent, []);
+
+  assert.deepEqual(
+    server.audits().filter((a) => a.decision === 'deny').map((a) => [a.caller, a.tool, a.domain, a.action, a.path, a.reason]),
+    [
+      ['scripter', 'ha_write_blueprint', 'automation', 'create', 'porch.yaml', undefined],
+      ['automator', 'ha_write_blueprint', 'script', 'delete', 'ping.yaml', undefined],
+      ['scener', 'ha_write_blueprint', undefined, undefined, undefined, undefined],
+      ['scripter', 'ha_write_blueprint', 'script', 'update', 'ping.yaml', 'yaml carries a redacted value'],
+    ],
+  );
+  assert.doesNotMatch(JSON.stringify(server.audits()), /Ping|sequence|REDACTED/);
 });
 
 test('dashboard writes: create from sidebar settings, update merged over the stored layout, delete by HA\'s collection id; audited by path', async (t) => {

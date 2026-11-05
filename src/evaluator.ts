@@ -184,6 +184,8 @@ export const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 
 export const configPath = (kind: ConfigKind, id: string) => `/api/config/${kind}/config/${encodeURIComponent(id)}`;
 /** A helper's config id is unique only within its domain, so the server names it `<domain>.<id>`. */
 export const splitHelperId = (id: string) => [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)] as const;
+/** Helpers and zones are HA storage collections, written by `<domain>/<action>` and found by `<domain>/list`; undefined for config-REST kinds. */
+export const collectionOf = (kind: ConfigKind, id: string) => (kind === 'helper' ? splitHelperId(id) : kind === 'zone' ? (['zone', id] as const) : undefined);
 
 export const writersOf = (policy: Policy, caller: string, kind: ConfigKind) => indicesOf(policy.grants, (g) => g.caller === caller && g.config_write === kind);
 
@@ -194,7 +196,7 @@ export const decideConfigRead = (policy: Policy, caller: string, kind: ConfigKin
 export interface ConfigWrite {
   kind: ConfigKind;
   action: 'create' | 'update' | 'delete';
-  /** A config id or script key; for a helper, `<domain>.<id>`. */
+  /** A config id or script key; for a helper, `<domain>.<id>`; for a zone, its stored id. */
   id: string;
   config?: Record<string, unknown>;
 }
@@ -209,12 +211,13 @@ function dashboardCommand(action: ConfigWrite['action'], id: string, config: Rec
   return { type: 'lovelace/dashboards/delete', url_path: id };
 }
 
-/** HA's config REST for automations, scripts and scenes; the helper domain's own WebSocket commands for a helper. */
+/** HA's config REST for automations, scripts and scenes; the collection's own WebSocket commands for a helper or zone. */
 function writeOf({ kind, action, id, config = {} }: ConfigWrite): Write {
   const rest = (request: RestRequest) => ({ via: 'rest', request }) as const;
   if (kind === 'dashboard') return { via: 'websocket', command: dashboardCommand(action, id, config) };
-  if (kind !== 'helper') return rest(action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config });
-  const [domain, item] = splitHelperId(id);
+  const collection = collectionOf(kind, id);
+  if (!collection) return rest(action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config });
+  const [domain, item] = collection;
   if (action === 'create') return { via: 'websocket', command: { ...config, type: `${domain}/create` } };
   return { via: 'websocket', command: { ...(action === 'update' && config), type: `${domain}/${action}`, [`${domain}_id`]: item } };
 }
@@ -254,4 +257,23 @@ export function dashboardDelete(allowed: Allowed, dashboardId: string): Allowed 
     return issue({ ...allowed, write: { via: 'websocket', command: { type: 'lovelace/dashboards/delete', dashboard_id: dashboardId } } });
   }
   throw new Error('only an issued dashboard delete takes a collection id');
+}
+
+export interface BlueprintWrite {
+  domain: 'automation' | 'script';
+  action: 'create' | 'update' | 'delete';
+  /** Ends in `.yaml`: HA appends it on save but not on delete. */
+  path: string;
+  yaml?: string;
+}
+
+/**
+ * A blueprint is written under the config-write kind of its domain, which is already admin-equivalent, so it adds no reach.
+ * Only save and delete are issued: HA's URL import would have HA fetch any URL from inside the network.
+ */
+export function decideBlueprintWrite(policy: Policy, caller: string, { domain, action, path, yaml }: BlueprintWrite): ConfigWriteDecision {
+  const grants = writersOf(policy, caller, domain);
+  if (grants.length === 0) return { allowed: undefined, grants: [] };
+  const command = action === 'delete' ? { type: 'blueprint/delete', domain, path } : { type: 'blueprint/save', domain, path, yaml, ...(action === 'update' && { allow_override: true }) };
+  return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: { via: 'websocket', command } }), grants };
 }

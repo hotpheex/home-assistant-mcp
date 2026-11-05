@@ -303,4 +303,18 @@ denies:
     assert.equal(await running.exited, 1);
     assert.ok(running.records.some((r) => r.level === 'error' && /rejected the users-tier token/.test(String(r.msg))));
   });
+
+  e2e('a blueprint saved from YAML is listed under its path with .yaml added, and a delete by that path removes it', async (t) => {
+    const client = await connect(t, server.url(), operator.key, 'modern');
+    const yaml = 'blueprint:\n  name: E2E dusk\n  domain: automation\n  input:\n    lamp:\n      name: Lamp\ntriggers:\n  - trigger: sun\n    event: sunset\nactions:\n  - action: light.turn_on\n    target:\n      entity_id: !input lamp\n';
+    const saved = await client.callTool({ name: 'ha_write_blueprint', arguments: { domain: 'automation', action: 'create', path: 'e2e/dusk', yaml } });
+    assert.ok(!saved.isError, JSON.stringify(saved.content));
+    type Listed = { path: string; name?: string; inputs?: Record<string, { name?: string }> };
+    const list = async () => (body(await client.callTool({ name: 'ha_list_blueprints', arguments: { domain: 'automation', limit: 500 } })) as { blueprints: Listed[] }).blueprints;
+    const dusk = (await list()).find((b) => b.path === 'e2e/dusk.yaml');
+    assert.deepEqual([dusk?.name, dusk?.inputs?.lamp?.name], ['E2E dusk', 'Lamp']);
+    const deleted = await client.callTool({ name: 'ha_write_blueprint', arguments: { domain: 'automation', action: 'delete', path: 'e2e/dusk' } });
+    assert.ok(!deleted.isError, JSON.stringify(deleted.content));
+    assert.equal((await list()).some((b) => b.path === 'e2e/dusk.yaml'), false);
+  });
 });

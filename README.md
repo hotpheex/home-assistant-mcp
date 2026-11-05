@@ -93,11 +93,13 @@ Each Grant gives one kind of access:
 
 | Grant | Gives |
 |---|---|
-| `read: plain` | States, history, logbook, registries, the service list and the dashboards of the whole house. |
-| `read: config` | The config and traces of every automation and script. |
+| `read: plain` | States, history, logbook, registries, the service list, long-term statistics and the dashboards of the whole house. |
+| `read: config` | The config and traces of every automation and script, and HA's system log. |
 | `services: [...]` with `targets` | Those services on entities in the named domains, areas (`area_id`) or labels (`label_id`). Omit `targets` for services that take none. Includes plain read. |
 | `config_write: automation \| script \| scene \| helper` | Create, update and delete items of that kind (`helper` covers `input_*`, `counter`, `timer` and `schedule`). Includes both reads. |
+| `config_write: zone` | Create, update and delete zones, which moves presence: who counts as home and what location automations do. Includes both reads. |
 | `config_write: dashboard` | Create and delete dashboards, and save the layout of any dashboard, the default one included. A card's action runs as whoever taps it. Includes both reads. |
+| Blueprints | `read: config` lists the installed automation and script blueprints. `config_write: automation` or `script` also saves and deletes blueprints of that domain from YAML the Caller supplies. HA's import of a blueprint from a URL is not offered. |
 
 Two Grants deserve care. Plain read is not scoped: a Caller that can read sees every entity, including people's locations. A config write is full control of the house, since an automation can call any service. [SECURITY.md](SECURITY.md) explains exactly what each Grant reveals and how calls are checked.
 

@@ -81,6 +81,8 @@ grants:
   - caller: reader
     config_write: helper
   - caller: reader
+    config_write: zone
+  - caller: reader
     config_write: dashboard
 denies:
   - caller: reader
