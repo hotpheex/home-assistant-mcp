@@ -12,6 +12,7 @@ import {
   decideConfigWrite,
   decideRead,
   decideServiceCall,
+  ENTITY_NAME_FIELDS,
   grantsFor,
   HELPER_DOMAINS,
   mergedUpdate,
@@ -43,6 +44,7 @@ export const TOOL_KIND = {
   ha_write_config: 'config_write',
   ha_call_service: 'service_call',
   ha_get_statistics: 'plain_read',
+  ha_render_template: 'plain_read',
   ha_get_logs: 'config_read',
   ha_get_dashboard: 'plain_read',
   ha_list_blueprints: 'config_read',
@@ -83,6 +85,8 @@ interface ToolSpec<Input extends z.ZodType> {
   kinds?: readonly ConfigKind[];
   /** For a decision that needs the arguments, not just the tool's kind. */
   decide?(args: z.output<Input>, policy: Policy, caller: string): Decided;
+  /** The arguments an allowed read's audit names, for a tool whose input is more than names. */
+  auditable?(args: z.output<Input>): Record<string, unknown>;
   run(args: z.output<Input>, ctx: Context): Promise<CallToolResult>;
 }
 
@@ -135,6 +139,7 @@ const NARROWING: Partial<Record<ToolName, string>> = {
   ha_list_traces: 'a smaller limit',
   ha_get_trace: 'fewer sections',
   ha_get_statistics: 'a query, fewer statistic_ids, a shorter window, a longer period, fewer types or a smaller limit',
+  ha_render_template: 'a template that renders less',
   ha_get_logs: 'a level, a query or a smaller limit',
   ha_list_blueprints: 'a domain or a smaller limit',
 };
@@ -161,11 +166,10 @@ function outage(e: unknown): unknown {
   return e;
 }
 
-/** Sends over WebSocket; HA's refusals and outages become failures the Caller can act on. */
-async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Command): Promise<T> {
-  if (!allowed) throw new Error('sent without an Allowed');
+/** HA's refusals and outages become failures the Caller can act on. */
+async function answered(request: Promise<unknown>): Promise<unknown> {
   try {
-    return stripBearerTokens(await ctx.gate.send(allowed, command)) as T;
+    return stripBearerTokens(await request);
   } catch (e) {
     const refusal = e as { code?: unknown; message?: unknown } | null;
     // HA's error results arrive as plain {code, message} objects, never as Errors.
@@ -174,6 +178,12 @@ async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Comm
     }
     throw outage(e);
   }
+}
+
+/** Sends over WebSocket. */
+async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Command): Promise<T> {
+  if (!allowed) throw new Error('sent without an Allowed');
+  return (await answered(ctx.gate.send(allowed, command))) as T;
 }
 
 /** A write has already run, so an oversize response is cut with a visible marker rather than refused. */
@@ -542,6 +552,7 @@ const getConfig = defineTool({
       }
       if (!byEntity && id === undefined) ctx.addIssue({ code: 'custom', path: ['id'], message: `is required for a ${kind}` });
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
+      if (kind === 'entity_name') ctx.addIssue({ code: 'custom', path: ['kind'], message: "entity_name has no config to read; ha_get_registry lists each entity's name and icon" });
       if (kind === 'dashboard') ctx.addIssue({ code: 'custom', path: ['kind'], message: 'a dashboard is read with the dashboard tool' });
     }),
   annotations: { readOnlyHint: true, destructiveHint: false },
@@ -769,23 +780,29 @@ const writeConfig = defineTool({
   title: 'Write config',
   description: [
     'Creates, updates or deletes one automation, script, scene, helper (input_*, counter, timer or schedule), zone or dashboard; this is admin-equivalent, because an automation or script can do anything in Home Assistant.',
-    "Name the item by `kind` and `id`: an automation's, scene's or zone's config `id`, a script's object id (the part after `script.`), a helper's `<domain>.<id>`, such as input_boolean.guest_mode, or a dashboard's URL path, where `lovelace`, the default dashboard, can only be updated.",
-    'A new dashboard takes only its sidebar settings (`title`, `icon`, `show_in_sidebar`, `require_admin`), and an update changes top-level layout keys such as `views`.',
+    "Name the item by `kind` and `id`: an automation's, scene's or zone's config `id`, a script's object id (the part after `script.`), a helper's `<domain>.<id>`, such as input_boolean.guest_mode, or a dashboard's URL path, where `lovelace`, the default dashboard, can only be updated; a new dashboard takes only its sidebar settings (`title`, `icon`, `show_in_sidebar`, `require_admin`).",
     'An update sends only the top-level keys it changes and keeps the rest; creating an automation, script or scene refuses an id that exists, and a new helper or zone takes its id from its `name`, which the result returns.',
     'A config that carries **REDACTED** from a config read is refused, so put the real value in its place first.',
     'Example: {"kind": "automation", "action": "update", "id": "porch_light_1", "config": {"alias": "Porch light at dusk"}}.',
+    'Kind `entity_name` only updates the `name`, `icon` or `aliases` of the entity whose entity_id is `id`; voice assistants match its aliases.',
   ].join(' '),
   input: z
     .strictObject({
-      kind: configKind.describe('automation, script, scene, helper, zone or dashboard.'),
+      kind: configKind.describe('automation, script, scene, helper, zone, entity_name or dashboard.'),
       action: z.enum(['create', 'update', 'delete']).describe('create, update or delete.'),
-      id: z.string().min(1).describe("An automation's, scene's or zone's config id, a script's object id, a helper's <domain>.<id>, or a dashboard's URL path."),
+      id: z.string().min(1).describe("An automation's, scene's or zone's config id, a script's object id, a helper's <domain>.<id>, an entity_name's entity_id, or a dashboard's URL path."),
       config: z.record(z.string(), z.unknown()).optional().describe('The config to create, or the top-level keys to change; omitted for delete.'),
     })
     .superRefine(({ kind, action, id, config }, ctx) => {
       if (kind === 'helper' && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
       if (action !== 'delete' && config === undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: `is required to ${action}` });
       if (action === 'delete' && config !== undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: 'is not taken by delete' });
+      if (kind === 'entity_name' && action !== 'update') ctx.addIssue({ code: 'custom', path: ['action'], message: 'entity_name takes only update' });
+      if (kind === 'entity_name' && !entityId.safeParse(id).success) ctx.addIssue({ code: 'custom', path: ['id'], message: 'must be an entity_id such as light.kitchen' });
+      for (const key of kind === 'entity_name' ? Object.keys(config ?? {}) : []) {
+        const allowed = (ENTITY_NAME_FIELDS as readonly string[]).includes(key);
+        if (!allowed) ctx.addIssue({ code: 'custom', path: ['config', key], message: 'entity_name changes only name, icon and aliases' });
+      }
       if (kind === 'dashboard' && id === 'lovelace' && action !== 'update') ctx.addIssue({ code: 'custom', path: ['id'], message: 'the default dashboard lovelace can only be updated' });
       if (kind === 'dashboard' && action === 'create' && Object.keys(config ?? {}).some((k) => !DASHBOARD_SIDEBAR.includes(k))) {
         ctx.addIssue({ code: 'custom', path: ['config'], message: 'a new dashboard takes only title, icon, show_in_sidebar and require_admin' });
@@ -809,8 +826,8 @@ const writeConfig = defineTool({
     // Recorded before the lookup, so a write refused by its lookup, failed, or of unknown outcome still leaves a record.
     if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
     if (kind === 'dashboard') allowed = await dashboardLookup(ctx, change, allowed);
-    // A new helper or zone takes its id from its name, so only a collection update has a stored item to look up.
-    else if (action === 'update' || (!collectionOf(kind, id) && action === 'create')) {
+    // A new helper or zone takes its id from its name, so only a collection update has a stored item to look up; HA's registry update is partial.
+    else if (kind !== 'entity_name' && (action === 'update' || (!collectionOf(kind, id) && action === 'create'))) {
       const item = await stored(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, kind, id);
       if (action === 'create' && item) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
       if (action === 'update' && !item) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
@@ -822,6 +839,33 @@ const writeConfig = defineTool({
     if (ctx.options.auditWrites) ctx.audit({ kind, action, id, outcome: 'done' });
     // A helper or zone write echoes the whole stored item, keys the Caller did not send included.
     return writeResult({ kind, action, id, result: maskSecrets(stripBearerTokens(result)) });
+  },
+});
+
+const renderTemplate = defineTool({
+  title: 'Render template',
+  description: [
+    'Renders one Home Assistant template, such as one meant for an automation, and returns its `result` and the `listeners` (entities, domains and time) that would render it again, or Home Assistant\'s template error.',
+    'Undefined names are errors, as in Home Assistant\'s template editor, so give the values of the template\'s own names in `variables`.',
+    'A render that takes longer than `timeout` seconds (default 5, at most 30) fails.',
+    MASKED,
+    'Example: {"template": "{{ states(\'sensor.kitchen_temperature\') | float > 20 }}"} tells whether the kitchen is above 20 degrees.',
+  ].join(' '),
+  input: z.strictObject({
+    template: z.string().min(1).describe('The template, such as {{ states(\'light.kitchen\') }}.'),
+    variables: z.record(z.string(), z.unknown()).optional().describe('Values for names the template uses.'),
+    timeout: z.number().positive().max(30).default(5).describe('Seconds the render may take, at most 30.'),
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  // A template and its variables may carry anything, so the audit names only the timeout.
+  auditable: ({ timeout }) => ({ timeout }),
+  async run(args, ctx) {
+    if (!ctx.allowed) throw new Error('rendered without an Allowed');
+    // Strict, because otherwise an undefined name sends a warning event before the result; HA drops render errors unless reported.
+    const command = { type: 'render_template', template: args.template, ...(args.variables && { variables: args.variables }), timeout: args.timeout, strict: true, report_errors: true };
+    const event = (await answered(ctx.gate.subscribeOnce(ctx.allowed, command))) as { error?: string };
+    if (event.error !== undefined) throw new ToolFailure(`Home Assistant could not render the template: ${event.error}`);
+    return text(maskSecrets(event));
   },
 });
 
@@ -932,6 +976,7 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_write_config: writeConfig,
   ha_call_service: callService,
   ha_get_statistics: getStatistics,
+  ha_render_template: renderTemplate,
   ha_get_logs: getLogs,
   ha_get_dashboard: getDashboard,
   ha_list_blueprints: listBlueprints,
@@ -1010,7 +1055,7 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
       return failure(`Denied: this Caller holds no Grant for ${decided.lacking}. Do not retry this call.`);
     }
     if (options.auditReads && READS.has(operation)) {
-      audited({ decision: 'allow', grants: decided.grants, request: args.data });
+      audited({ decision: 'allow', grants: decided.grants, request: tool.auditable?.(args.data) ?? args.data });
     }
     try {
       const result = await tool.run(args.data, { ...decided, policy, auth, gate, audit: audited, options });

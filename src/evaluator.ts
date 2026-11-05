@@ -193,6 +193,10 @@ export const writersOf = (policy: Policy, caller: string, kind: ConfigKind) => i
 export const decideConfigRead = (policy: Policy, caller: string, kind: ConfigKind) =>
   readOf(kind === 'automation' || kind === 'script' ? grantsFor(policy, caller, 'config_read') : writersOf(policy, caller, kind), 'config_read');
 
+/** The registry fields `entity_name` may change; none of them moves an area or label selector (ADR 0010). */
+export const ENTITY_NAME_FIELDS = ['name', 'icon', 'aliases'] as const;
+const pick = (config: Record<string, unknown>, keys: readonly string[]) => Object.fromEntries(Object.entries(config).filter(([k]) => keys.includes(k)));
+
 export interface ConfigWrite {
   kind: ConfigKind;
   action: 'create' | 'update' | 'delete';
@@ -211,9 +215,10 @@ function dashboardCommand(action: ConfigWrite['action'], id: string, config: Rec
   return { type: 'lovelace/dashboards/delete', url_path: id };
 }
 
-/** HA's config REST for automations, scripts and scenes; the collection's own WebSocket commands for a helper or zone. */
+/** HA's config REST for automations, scripts and scenes; the collection's own WebSocket commands for a helper or zone; the entity registry for entity_name. */
 function writeOf({ kind, action, id, config = {} }: ConfigWrite): Write {
   const rest = (request: RestRequest) => ({ via: 'rest', request }) as const;
+  if (kind === 'entity_name') return { via: 'websocket', command: { ...pick(config, ENTITY_NAME_FIELDS), type: 'config/entity_registry/update', entity_id: id } };
   if (kind === 'dashboard') return { via: 'websocket', command: dashboardCommand(action, id, config) };
   const collection = collectionOf(kind, id);
   if (!collection) return rest(action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config });

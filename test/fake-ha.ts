@@ -66,6 +66,8 @@ export interface FakeHaOptions {
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
   statistics?: FakeStatistic[];
+  /** How each template renders; one not listed renders as its own text, as a static template does. */
+  templates?: Record<string, FakeTemplate>;
   /** HA's system log entries, oldest first, in `system_log/list`'s shape. */
   systemLog?: Record<string, unknown>[];
   /** Stored (UI) zones. */
@@ -79,6 +81,8 @@ export interface FakeHaOptions {
 }
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
+/** What HA's `config/entity_registry/update` schema takes besides `entity_id`. */
+const REGISTRY_UPDATE_KEYS = ['aliases', 'area_id', 'categories', 'device_class', 'icon', 'labels', 'name', 'new_entity_id', 'disabled_by', 'hidden_by', 'options_domain', 'options'];
 const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 /** Each helper's storage schema in HA 2026.10: its required keys, the defaults it fills, and its other keys besides `icon`. */
 const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<string, unknown>; optional: string[] }> = {
@@ -114,6 +118,17 @@ export interface FakeTrace extends Record<string, unknown> {
   timestamp: { start: string; finish: string };
 }
 const TRACE_SECTIONS = ['trace', 'config', 'blueprint_inputs', 'context'];
+
+/** A template's render: its result, needing `variable` if named, a compile or render error, or `seconds` of work. */
+export interface FakeTemplate {
+  result?: unknown;
+  variable?: string;
+  compileError?: string;
+  renderError?: string;
+  seconds?: number;
+}
+/** Python's str() of the float HA coerces a timeout to. */
+const pyFloat = (n: number) => (Number.isInteger(n) ? n.toFixed(1) : String(n));
 
 /** A command the server sent after authenticating, with the token of the connection it came on. */
 export interface Received {
@@ -234,7 +249,8 @@ export async function startFakeHa(options: FakeHaOptions) {
   let down = false;
   let hung = false;
   let refused = 0;
-  const entities = options.entities ?? [];
+  // A copy, since a registry update changes it and the seed is shared across tests.
+  const entities = structuredClone(options.entities ?? []);
   const entityEntry = (e: FakeEntity) => {
     const entry: Partial<FakeEntity> = { name: null, device_id: null, area_id: null, labels: [], hidden_by: null, disabled_by: null, entity_category: null, ...e };
     delete entry.aliases;
@@ -309,6 +325,15 @@ export async function startFakeHa(options: FakeHaOptions) {
           return [id, e ? { ...entityEntry(e), aliases: e.aliases ?? [] } : null];
         }),
       ),
+    'config/entity_registry/update': adminOnly((_, msg) => {
+      const entity = entities.find((e) => e.entity_id === msg.entity_id) ?? haError('not_found', 'Entity not found');
+      const changes = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'entity_id'].includes(k)));
+      const extra = Object.keys(changes).find((k) => !REGISTRY_UPDATE_KEYS.includes(k));
+      if (extra) haError('invalid_format', `extra keys not allowed @ data['${extra}']`);
+      const { new_entity_id, ...fields } = changes;
+      Object.assign(entity, fields, typeof new_entity_id === 'string' && { entity_id: new_entity_id });
+      return { entity_entry: { ...entityEntry(entity), aliases: entity.aliases ?? [] } };
+    }),
     'config/device_registry/list': () => options.devices ?? [],
     'config/area_registry/list': () => options.areas ?? [],
     'config/label_registry/list': () => options.labels ?? [],
@@ -370,6 +395,25 @@ export async function startFakeHa(options: FakeHaOptions) {
         if (rows.length > 0) out[s.statistic_id] = rows;
       }
       return out;
+    },
+    // HA 2026.10's handle_render_template: the timeout check, then a compile error as the result, then events.
+    render_template: (_, msg, conn) => {
+      const template = typeof msg.template === 'string' ? msg.template : haError('invalid_format', "required key not provided @ data['template']");
+      const render = options.templates?.[template] ?? { result: template };
+      const timeout = msg.timeout === undefined ? 0 : Number(msg.timeout);
+      if (timeout && (render.seconds ?? 0) > timeout) haError('template_error', `Exceeded maximum execution time of ${pyFloat(timeout)}s`);
+      if (render.compileError !== undefined) haError('template_error', render.compileError);
+      const report = msg.report_errors === true;
+      const missing = render.variable !== undefined && !Object.hasOwn((msg.variables as Record<string, unknown> | undefined) ?? {}, render.variable);
+      const renderError = render.renderError ?? (missing && msg.strict === true ? `UndefinedError: '${render.variable}' is undefined` : undefined);
+      if (renderError !== undefined) {
+        if (report) conn.emit({ error: renderError, level: 'ERROR' });
+        return null;
+      }
+      if (missing && report) conn.emit({ error: `'${render.variable}' is undefined`, level: 'WARNING' });
+      const entities = [...template.matchAll(/states\(['"]([\w.]+)['"]\)/g)].map((m) => m[1]);
+      conn.emit({ result: missing ? '' : render.result, listeners: { all: false, domains: [], entities, time: false } });
+      return null;
     },
     // HA lists its deduplicated log newest first.
     'system_log/list': adminOnly(() => [...(options.systemLog ?? [])].reverse()),
