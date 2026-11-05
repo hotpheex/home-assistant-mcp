@@ -66,6 +66,8 @@ export interface FakeHaOptions {
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
   statistics?: FakeStatistic[];
+  /** How each template renders; one not listed renders as its own text, as a static template does. */
+  templates?: Record<string, FakeTemplate>;
   /** HA's system log entries, oldest first, in `system_log/list`'s shape. */
   systemLog?: Record<string, unknown>[];
   /** Stored (UI) zones. */
@@ -110,6 +112,17 @@ export interface FakeTrace extends Record<string, unknown> {
   timestamp: { start: string; finish: string };
 }
 const TRACE_SECTIONS = ['trace', 'config', 'blueprint_inputs', 'context'];
+
+/** A template's render: its result, needing `variable` if named, a compile or render error, or `seconds` of work. */
+export interface FakeTemplate {
+  result?: unknown;
+  variable?: string;
+  compileError?: string;
+  renderError?: string;
+  seconds?: number;
+}
+/** Python's str() of the float HA coerces a timeout to. */
+const pyFloat = (n: number) => (Number.isInteger(n) ? n.toFixed(1) : String(n));
 
 /** A command the server sent after authenticating, with the token of the connection it came on. */
 export interface Received {
@@ -357,6 +370,25 @@ export async function startFakeHa(options: FakeHaOptions) {
         if (rows.length > 0) out[s.statistic_id] = rows;
       }
       return out;
+    },
+    // HA 2026.10's handle_render_template: the timeout check, then a compile error as the result, then events.
+    render_template: (_, msg, conn) => {
+      const template = typeof msg.template === 'string' ? msg.template : haError('invalid_format', "required key not provided @ data['template']");
+      const render = options.templates?.[template] ?? { result: template };
+      const timeout = msg.timeout === undefined ? 0 : Number(msg.timeout);
+      if (timeout && (render.seconds ?? 0) > timeout) haError('template_error', `Exceeded maximum execution time of ${pyFloat(timeout)}s`);
+      if (render.compileError !== undefined) haError('template_error', render.compileError);
+      const report = msg.report_errors === true;
+      const missing = render.variable !== undefined && !Object.hasOwn((msg.variables as Record<string, unknown> | undefined) ?? {}, render.variable);
+      const renderError = render.renderError ?? (missing && msg.strict === true ? `UndefinedError: '${render.variable}' is undefined` : undefined);
+      if (renderError !== undefined) {
+        if (report) conn.emit({ error: renderError, level: 'ERROR' });
+        return null;
+      }
+      if (missing && report) conn.emit({ error: `'${render.variable}' is undefined`, level: 'WARNING' });
+      const entities = [...template.matchAll(/states\(['"]([\w.]+)['"]\)/g)].map((m) => m[1]);
+      conn.emit({ result: missing ? '' : render.result, listeners: { all: false, domains: [], entities, time: false } });
+      return null;
     },
     // HA lists its deduplicated log newest first.
     'system_log/list': adminOnly(() => [...(options.systemLog ?? [])].reverse()),

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import type { FakeHaOptions, FakeStatistic } from './fake-ha.ts';
-import { body, connect, ERAS, fakeHa, HOUSE, newKey, policyOf, startServer } from './harness.ts';
+import { body, connect, ERAS, fakeHa, HOUSE, newKey, policyOf, startServer, until, USERS_TOKEN, withoutId } from './harness.ts';
 
 const reader = newKey();
 const readerPolicy = policyOf({ reader }, 'grants:\n  - caller: reader\n    read: plain\n');
@@ -115,10 +115,10 @@ test('ha_get_logbook reads the last hour by default, optionally for one entity',
   assert.deepEqual([typo.total, typo.not_current_entity_ids], [0, ['lock.front_dor']]);
 });
 
-test('read: plain lists the six read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
+test('read: plain lists the seven read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
   const { call, client } = await readerOn(t);
   const listed = await client.listTools();
-  assert.deepEqual(listed.tools.map((tool) => tool.name), ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services', 'ha_get_statistics']);
+  assert.deepEqual(listed.tools.map((tool) => tool.name), ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services', 'ha_get_statistics', 'ha_render_template']);
   assert.equal(listed.cacheScope, 'private');
 
   const ids = async (args: Record<string, unknown>) => ((await call('ha_get_states', args)).states as { entity_id: string }[]).map((s) => s.entity_id);
@@ -236,6 +236,9 @@ test('allowed reads are audited, naming the read kind and request, only with HAM
       request: { registry: 'area', query: 'utility', limit: 50, offset: 0 },
     },
   );
+  await call('ha_render_template', { template: '{{ code }}', variables: { code: 'VARSECRET' } });
+  assert.deepEqual(server.audits()[1]?.request, { timeout: 5 }, 'a template and its variables never reach the audit');
+  assert.doesNotMatch(server.lines.join('\n'), /VARSECRET|\{\{ code/);
 });
 
 test('ha_get_registry lists each registry, filtered by a query', async (t) => {
@@ -328,4 +331,56 @@ test('ha_get_statistics lists statistic ids by a query, and reads chosen types p
 
   statistics[0]!.periods.hour!.push(...Array.from({ length: 500 }, (_, i) => ({ start: ago(24 * 60 + i), mean: i, min: i, max: i })));
   await refused({ statistic_ids, limit: 500 }, /narrow the query with a query, fewer statistic_ids, a shorter window, a longer period/);
+});
+
+test('ha_render_template renders with its variables, strict, with a timeout, masked, then unsubscribes', async (t) => {
+  const greeting = "{{ states('light.kitchen') }} at {{ greeting }}";
+  const nas = "{{ states('input_text.nas_url') }}";
+  const templates = { [greeting]: { variable: 'greeting', result: 'on at dusk' }, [nas]: { result: 'https://bob:NASSECRET@nas.local' } };
+  const { call, sent, ha } = await readerOn(t, { templates });
+
+  assert.deepEqual(await call('ha_render_template', { template: greeting, variables: { greeting: 'dusk' } }), {
+    result: 'on at dusk',
+    listeners: { all: false, domains: [], entities: ['light.kitchen'], time: false },
+  });
+  const render = ha.received.find((r) => r.message.type === 'render_template')!;
+  assert.equal(render.token, USERS_TOKEN);
+  assert.deepEqual(withoutId(render), { type: 'render_template', template: greeting, variables: { greeting: 'dusk' }, timeout: 5, strict: true, report_errors: true });
+  assert.deepEqual(sent('unsubscribe_events')[0]?.subscription, render.message.id);
+
+  assert.equal((await call('ha_render_template', { template: nas })).result, 'https://**REDACTED**@nas.local');
+});
+
+test('ha_render_template returns HA\'s template error, a render over its timeout fails saying so, and an unanswered one is abandoned', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const templates = {
+    '{{ states(': { compileError: "TemplateSyntaxError: unexpected end of template, expected ')'." },
+    '{{ 1 / 0 }}': { renderError: 'ZeroDivisionError: division by zero' },
+    '{{ where }}': { variable: 'where', result: 'here' },
+    '{% for i in range(10**9) %}{% endfor %}': { seconds: 12, result: '' },
+  };
+  const { client, sent, ha } = await readerOn(t, { templates });
+  const render = async (args: Record<string, unknown>) => {
+    const result = await client.callTool({ name: 'ha_render_template', arguments: args });
+    assert.equal(result.isError, true);
+    return (result.content as { text: string }[])[0]?.text;
+  };
+  assert.equal(await render({ template: '{{ states(' }), "Home Assistant refused the request: TemplateSyntaxError: unexpected end of template, expected ')'.");
+  assert.equal(await render({ template: '{{ 1 / 0 }}' }), 'Home Assistant could not render the template: ZeroDivisionError: division by zero');
+  assert.equal(await render({ template: '{{ where }}' }), "Home Assistant could not render the template: UndefinedError: 'where' is undefined");
+  const slow = '{% for i in range(10**9) %}{% endfor %}';
+  assert.equal(await render({ template: slow }), 'Home Assistant refused the request: Exceeded maximum execution time of 5.0s');
+  assert.equal(await render({ template: slow, timeout: 10.5 }), 'Home Assistant refused the request: Exceeded maximum execution time of 10.5s');
+  assert.match((await render({ template: slow, timeout: 31 })) ?? '', /^Input validation error: timeout/);
+  assert.equal(sent('render_template').length, 5);
+  assert.equal(sent('unsubscribe_events').length, 2, 'only the two subscriptions HA opened are ended');
+
+  ha.stall.add('render_template');
+  const stalled = render({ template: '{{ where }}' });
+  await until(() => sent('render_template').length === 6, 'the render to reach HA');
+  t.mock.timers.tick(30_000);
+  await until(() => sent('ping').length > 0, 'a heartbeat ping');
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  t.mock.timers.tick(30_000);
+  assert.equal(await stalled, 'HA unavailable: Home Assistant did not answer. Try again later.');
 });

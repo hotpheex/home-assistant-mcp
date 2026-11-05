@@ -41,6 +41,7 @@ export const TOOL_KIND = {
   ha_write_config: 'config_write',
   ha_call_service: 'service_call',
   ha_get_statistics: 'plain_read',
+  ha_render_template: 'plain_read',
   ha_get_logs: 'config_read',
   ha_list_blueprints: 'config_read',
   ha_write_blueprint: 'config_write',
@@ -80,6 +81,8 @@ interface ToolSpec<Input extends z.ZodType> {
   kinds?: readonly ConfigKind[];
   /** For a decision that needs the arguments, not just the tool's kind. */
   decide?(args: z.output<Input>, policy: Policy, caller: string): Decided;
+  /** The arguments an allowed read's audit names, for a tool whose input is more than names. */
+  auditable?(args: z.output<Input>): Record<string, unknown>;
   run(args: z.output<Input>, ctx: Context): Promise<CallToolResult>;
 }
 
@@ -132,6 +135,7 @@ const NARROWING: Partial<Record<ToolName, string>> = {
   ha_list_traces: 'a smaller limit',
   ha_get_trace: 'fewer sections',
   ha_get_statistics: 'a query, fewer statistic_ids, a shorter window, a longer period, fewer types or a smaller limit',
+  ha_render_template: 'a template that renders less',
   ha_get_logs: 'a level, a query or a smaller limit',
   ha_list_blueprints: 'a domain or a smaller limit',
 };
@@ -155,11 +159,10 @@ function outage(e: unknown): unknown {
   return e;
 }
 
-/** Sends over WebSocket; HA's refusals and outages become failures the Caller can act on. */
-async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Command): Promise<T> {
-  if (!allowed) throw new Error('sent without an Allowed');
+/** HA's refusals and outages become failures the Caller can act on. */
+async function answered(request: Promise<unknown>): Promise<unknown> {
   try {
-    return stripBearerTokens(await ctx.gate.send(allowed, command)) as T;
+    return stripBearerTokens(await request);
   } catch (e) {
     const refusal = e as { code?: unknown; message?: unknown } | null;
     // HA's error results arrive as plain {code, message} objects, never as Errors.
@@ -168,6 +171,12 @@ async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Comm
     }
     throw outage(e);
   }
+}
+
+/** Sends over WebSocket. */
+async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Command): Promise<T> {
+  if (!allowed) throw new Error('sent without an Allowed');
+  return (await answered(ctx.gate.send(allowed, command))) as T;
 }
 
 /** A write has already run, so an oversize response is cut with a visible marker rather than refused. */
@@ -790,6 +799,33 @@ const writeConfig = defineTool({
   },
 });
 
+const renderTemplate = defineTool({
+  title: 'Render template',
+  description: [
+    'Renders one Home Assistant template, such as one meant for an automation, and returns its `result` and the `listeners` (entities, domains and time) that would render it again, or Home Assistant\'s template error.',
+    'Undefined names are errors, as in Home Assistant\'s template editor, so give the values of the template\'s own names in `variables`.',
+    'A render that takes longer than `timeout` seconds (default 5, at most 30) fails.',
+    MASKED,
+    'Example: {"template": "{{ states(\'sensor.kitchen_temperature\') | float > 20 }}"} tells whether the kitchen is above 20 degrees.',
+  ].join(' '),
+  input: z.strictObject({
+    template: z.string().min(1).describe('The template, such as {{ states(\'light.kitchen\') }}.'),
+    variables: z.record(z.string(), z.unknown()).optional().describe('Values for names the template uses.'),
+    timeout: z.number().positive().max(30).default(5).describe('Seconds the render may take, at most 30.'),
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  // A template and its variables may carry anything, so the audit names only the timeout.
+  auditable: ({ timeout }) => ({ timeout }),
+  async run(args, ctx) {
+    if (!ctx.allowed) throw new Error('rendered without an Allowed');
+    // Strict, because otherwise an undefined name sends a warning event before the result; HA drops render errors unless reported.
+    const command = { type: 'render_template', template: args.template, ...(args.variables && { variables: args.variables }), timeout: args.timeout, strict: true, report_errors: true };
+    const event = (await answered(ctx.gate.subscribeOnce(ctx.allowed, command))) as { error?: string };
+    if (event.error !== undefined) throw new ToolFailure(`Home Assistant could not render the template: ${event.error}`);
+    return text(maskSecrets(event));
+  },
+});
+
 type BlueprintEntry = { metadata: { name: string; description?: string; input?: unknown; source_url?: string } } | { error: string };
 
 const listBlueprints = defineTool({
@@ -878,6 +914,7 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_write_config: writeConfig,
   ha_call_service: callService,
   ha_get_statistics: getStatistics,
+  ha_render_template: renderTemplate,
   ha_get_logs: getLogs,
   ha_list_blueprints: listBlueprints,
   ha_write_blueprint: writeBlueprint,
@@ -955,7 +992,7 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
       return failure(`Denied: this Caller holds no Grant for ${decided.lacking}. Do not retry this call.`);
     }
     if (options.auditReads && READS.has(operation)) {
-      audited({ decision: 'allow', grants: decided.grants, request: args.data });
+      audited({ decision: 'allow', grants: decided.grants, request: tool.auditable?.(args.data) ?? args.data });
     }
     try {
       const result = await tool.run(args.data, { ...decided, policy, auth, gate, audit: audited, options });

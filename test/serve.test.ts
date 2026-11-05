@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type ConfigKind, type Operation } from '../src/evaluator.ts';
+import { decideRead, decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type ConfigKind, type Operation } from '../src/evaluator.ts';
 import { openGate } from '../src/gate.ts';
 import { parsePolicy } from '../src/policy.ts';
 import { TOOL_KIND, type ToolName } from '../src/tools.ts';
@@ -97,6 +97,7 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_list_services: {},
   ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
   ha_get_statistics: { statistic_ids: ['sensor.kitchen_temperature'] },
+  ha_render_template: { template: "{{ states('light.kitchen') }}" },
   ha_get_logs: {},
   ha_list_blueprints: { domain: 'automation' },
   ha_write_blueprint: { domain: 'automation', action: 'create', path: 'mine/dusk', yaml: 'blueprint:\n  name: Dusk\n  domain: automation\n' },
@@ -118,6 +119,8 @@ const PURE_READS = new Set([
   'script/config',
   'trace/list',
   'trace/get',
+  'render_template',
+  'unsubscribe_events',
   ...['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'].map((d) => `${d}/list`),
   'recorder/list_statistic_ids',
   'recorder/statistics_during_period',
@@ -138,8 +141,15 @@ test('the gate sends only an Allowed the evaluator issued, as issued: a forged, 
   ];
   await assert.rejects(gate.send(forged[0]!, unlock), /evaluator issued/);
   await assert.rejects(gate.rest(forged[1]!, post), /evaluator issued/);
+  await assert.rejects(gate.subscribeOnce(forged[0]!, { type: 'render_template', template: '{{ 1 }}' }), /evaluator issued/);
   assert.throws(() => Object.assign(NAME_LOOKUP, { operation: 'service_call', write: { via: 'websocket', command: unlock } }), TypeError);
   await assert.rejects(gate.send(NAME_LOOKUP, unlock), /may not send call_service/);
+  // Only a template render may subscribe, and it may not go as a plain send, which would leave its subscription open.
+  const render = { type: 'render_template', template: '{{ 1 }}' };
+  await assert.rejects(gate.subscribeOnce(NAME_LOOKUP, { type: 'subscribe_events', event_type: 'state_changed' }), /may not subscribe to subscribe_events/);
+  await assert.rejects(gate.subscribeOnce(decideRead(parsePolicy('version: 1\ncallers: { agent: { keys: [] } }\ngrants:\n  - caller: agent\n    read: config\n'), 'agent', 'config_read').allowed!, render), /config_read may not subscribe/);
+  await assert.rejects(gate.send(NAME_LOOKUP, render), /may not send render_template/);
+  assert.equal(await gate.subscribeOnce(NAME_LOOKUP, render).then((e) => (e as { result: unknown }).result), '{{ 1 }}');
 
   const policy = parsePolicy(`version: 1\ncallers: { agent: { keys: [] } }\ngrants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ domain: light }]\n`);
   const expansion = { targeted: true, entities: ['light.kitchen'], grantEntities: [], denyEntities: [] };
