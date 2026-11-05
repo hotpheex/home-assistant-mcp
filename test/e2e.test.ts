@@ -179,6 +179,8 @@ suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP
     services: [button.press]
     targets:
       - domain: button
+  - caller: operator
+    config_write: entity_name
 denies:
   - caller: expander
     services: [button.press]
@@ -287,6 +289,19 @@ denies:
     const { result, audit } = await call('button.press', { entity_id: 'button.e2e_plug_restart' });
     assert.ok(result.isError);
     assert.deepEqual([audit?.uncovered, audit?.denies], [[], [0]]);
+  });
+
+  e2e('an entity_name write renames and aliases an entity in HA, and HA keeps every other registry field', async (t) => {
+    const client = await connect(t, server.url(), operator.key, 'modern');
+    const entity_id = 'switch.e2e_hub_outlet_b';
+    const entry = async () => (await owner.sendMessagePromise<Record<string, Record<string, unknown>>>({ type: 'config/entity_registry/get_entries', entity_ids: [entity_id] }))[entity_id]!;
+    const before = await entry();
+    const config = { name: 'Kettle', icon: 'mdi:kettle', aliases: ['Tea maker'] };
+    const write = await client.callTool({ name: 'ha_write_config', arguments: { kind: 'entity_name', action: 'update', id: entity_id, config } });
+    assert.equal(write.isError, undefined, JSON.stringify(write.content));
+    const after = await entry();
+    assert.deepEqual([after.name, after.icon, after.aliases], [config.name, config.icon, config.aliases]);
+    for (const key of ['entity_id', 'area_id', 'labels', 'hidden_by', 'disabled_by', 'device_id']) assert.deepEqual(after[key], before[key], key);
   });
 
   e2e('startup refuses a users-tier token that belongs to an HA admin', async (t) => {

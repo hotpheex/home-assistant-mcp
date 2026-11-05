@@ -26,12 +26,13 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 | `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
+| `config_write: entity_name` | `ha_write_config` (update only), plus config read and plain read | An entity's name, icon and aliases, at the admin tier, and no other registry field. No other Grant gives it. |
 
 **Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so a Caller gets no URL that opens their images or streams.
 
 **A config write is full control of the house.** An automation or script can call any service, so a Caller that writes them can do anything HA can do. Grant it as you would an HA admin account.
 
-Running a script or triggering an automation is an ordinary service Grant, and it grants everything that script or automation does. Service calls run with the users-tier token, so HA itself refuses admin-only services. No tool edits areas, labels or registry names, so a Caller cannot move an entity into its own Grant.
+Running a script or triggering an automation is an ordinary service Grant, and it grants everything that script or automation does. Service calls run with the users-tier token, so HA itself refuses admin-only services. No tool edits areas, labels, hiding, disabling, devices or entity_ids, so a Caller cannot move an entity into its own Grant. `config_write: entity_name` changes only an entity's name, icon and aliases, and no area or label selector reads any of them.
 
 ## How a service call is checked
 
@@ -86,6 +87,11 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/serve.test.ts`: refused keys and Origins audited without the key, and in the coverage matrix, every refused tool call audited and allowed calls audited only on opt-in.
 - `test/services.test.ts` and `test/write.test.ts`: allowed writes audited by name before any request to HA, and their outcome once HA accepts them.
 
+**Registry edits are cosmetic only.** An `entity_name` write sends HA only the name, icon and aliases of one entity. A write that names any other registry field, or asks to create or delete, is refused with nothing sent.
+- `test/write.test.ts`: area, labels, hiding, disabling and an entity_id rename refused with nothing sent, and a Caller holding another kind refused.
+- `test/evaluator.test.ts`: the property that an `entity_name` write is decided by its own Grant only and its command carries only name, icon and aliases.
+- `test/e2e.test.ts`: against real HA, a rename and alias that leave every other registry field unchanged.
+
 ## Kill switch
 
 Use the first stop that is fast enough, in this order:
@@ -109,3 +115,4 @@ These are accepted and documented, not fixed:
 - **Groups and data-field entities ride on the Grant.** The server checks the target only. It does not expand groups or check entities named in other service data fields.
 - **Failed-auth log flooding.** Every failed authentication writes an audit line, and the server does not rate-limit. Rate-limit at the proxy.
 - **The process holds the admin token** next to network-facing code.
+- **Aliases steer voice control.** Voice assistants match spoken names against aliases, and the Policy cannot see that. A Caller with `config_write: entity_name` that aliases `lock.garage` as "front door" makes "unlock the front door" open the garage.

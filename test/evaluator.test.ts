@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fc from 'fast-check';
-import { decideServiceCall, planServiceCall, type Expansion, type Selectors } from '../src/evaluator.ts';
-import { parsePolicy, type Policy } from '../src/policy.ts';
+import { decideConfigWrite, decideServiceCall, planServiceCall, type Expansion, type Selectors } from '../src/evaluator.ts';
+import { CONFIG_KINDS, parsePolicy, type Policy } from '../src/policy.ts';
 
 const HASH = 'a'.repeat(64);
 const policyOf = (rules: string) => parsePolicy(`version: 1\ncallers:\n  agent:\n    keys: [{ sha256: ${HASH} }]\n${rules}`);
@@ -161,4 +161,20 @@ test('property: an allowed call has every entity covered by a Grant, so one unco
 
 test('property: adding a Grant never turns an allow into a deny', () => {
   fc.assert(fc.property(scenario, (s) => !decide(s) || decide(s, [...s.grants, s.extra])));
+});
+
+test('property: an entity_name write is decided by its own Grant only, and its command carries only name, icon and aliases', () => {
+  const grant = fc.record({ caller: fc.constantFrom('agent', 'other'), config_write: fc.constantFrom(...CONFIG_KINDS) });
+  const config = fc.dictionary(fc.constantFrom('name', 'icon', 'aliases', 'area_id', 'labels', 'hidden_by', 'disabled_by', 'new_entity_id'), fc.string());
+  fc.assert(
+    fc.property(fc.array(grant, { maxLength: 6 }), config, (grants, config) => {
+      const policy = { version: 1, callers: { agent: { keys: [] }, other: { keys: [] } }, grants, denies: [], sha256: '' } as unknown as Policy;
+      const { allowed } = decideConfigWrite(policy, 'agent', { kind: 'entity_name', action: 'update', id: 'lock.garage', config });
+      assert.equal(allowed !== undefined, grants.some((g) => g.caller === 'agent' && g.config_write === 'entity_name'));
+      if (allowed?.write.via !== 'websocket') return;
+      const { type, entity_id, ...fields } = allowed.write.command;
+      assert.deepEqual([type, entity_id], ['config/entity_registry/update', 'lock.garage']);
+      assert.deepEqual(Object.keys(fields).sort(), Object.keys(config).filter((k) => ['name', 'icon', 'aliases'].includes(k)).sort());
+    }),
+  );
 });
