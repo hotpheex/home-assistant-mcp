@@ -95,6 +95,7 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_write_config: { kind: 'automation', action: 'update', id: 'porch_light_1', config: { alias: 'Porch light at dusk' } },
   ha_list_services: {},
   ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
+  ha_get_logs: {},
 };
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
@@ -114,6 +115,7 @@ const PURE_READS = new Set([
   'trace/list',
   'trace/get',
   ...['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'].map((d) => `${d}/list`),
+  'system_log/list',
 ]);
 test('the gate sends only an Allowed the evaluator issued, as issued: a forged, spread or altered one sends nothing', async (t) => {
   const ha = await fakeHa(t);

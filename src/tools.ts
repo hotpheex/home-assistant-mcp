@@ -38,6 +38,7 @@ export const TOOL_KIND = {
   ha_get_trace: 'config_read',
   ha_write_config: 'config_write',
   ha_call_service: 'service_call',
+  ha_get_logs: 'config_read',
 } as const satisfies Record<string, Operation>;
 export type ToolName = keyof typeof TOOL_KIND;
 
@@ -125,6 +126,7 @@ const NARROWING: Partial<Record<ToolName, string>> = {
   ha_list_services: 'a domain or a smaller limit',
   ha_list_traces: 'a smaller limit',
   ha_get_trace: 'fewer sections',
+  ha_get_logs: 'a level, a query or a smaller limit',
 };
 const charsOf = (result: CallToolResult) => result.content.reduce((n, c) => n + (c.type === 'text' ? c.text.length : 0), 0);
 const READS: ReadonlySet<Operation> = new Set(['plain_read', 'config_read']);
@@ -526,6 +528,36 @@ const getTrace = defineTool({
   },
 });
 
+const LOG_LEVELS = ['debug', 'info', 'warning', 'error', 'critical'] as const;
+type LogEntry = { name: string; level: string; message: string[]; source: unknown[]; timestamp: number; first_occurred: number };
+
+const getLogs = defineTool({
+  title: 'Get system log',
+  description: [
+    "Lists Home Assistant's system log, newest first: the warnings and errors that integrations and automations logged, each with its logger name, level, messages, source file and line, exception text, count, and the first and last times it occurred.",
+    'Filter by minimum `level` (debug, info, warning, error or critical) and by `query`, a case-insensitive substring of the logger name, the source or a message.',
+    MASKED,
+    PAGED,
+    'Example: {"level": "error", "query": "automation"} lists the errors automations logged.',
+  ].join(' '),
+  input: z.strictObject({
+    level: z.enum(LOG_LEVELS).optional().describe('The lowest level to list.'),
+    query: z.string().min(1).optional().describe('Case-insensitive substring of the logger name, the source or a message.'),
+    ...page,
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  // The query matches the masked text, so it cannot probe for a secret.
+  async run({ level, query, ...paging }, ctx) {
+    const entries = await read<LogEntry[]>(ctx, { type: 'system_log/list' });
+    const rank = (name: string) => LOG_LEVELS.findIndex((l) => l === name.toLowerCase());
+    const shown = entries
+      .filter((e) => level === undefined || rank(e.level) >= rank(level))
+      .filter((e) => query === undefined || [e.name, e.source.join(':'), ...e.message].some((v) => v.toLowerCase().includes(query.toLowerCase())))
+      .map((e) => ({ ...e, timestamp: isoOf(e.timestamp), first_occurred: isoOf(e.first_occurred) }));
+    return text(pageOf('entries', shown, paging));
+  },
+});
+
 const targetIds = z.union([z.string(), z.array(z.string())]).optional();
 
 interface HaService {
@@ -707,6 +739,7 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_trace: getTrace,
   ha_write_config: writeConfig,
   ha_call_service: callService,
+  ha_get_logs: getLogs,
 };
 
 /** Built once, so each tool's definition is identical for every Caller. */

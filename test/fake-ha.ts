@@ -64,6 +64,8 @@ export interface FakeHaOptions {
   traces?: FakeTrace[];
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
+  /** HA's system log entries, oldest first, in `system_log/list`'s shape. */
+  systemLog?: Record<string, unknown>[];
 }
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
@@ -310,6 +312,8 @@ export async function startFakeHa(options: FakeHaOptions) {
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
+    // HA lists its deduplicated log newest first.
+    'system_log/list': adminOnly(() => [...(options.systemLog ?? [])].reverse()),
   };
   for (const domain of HELPER_DOMAINS) {
     const items = () => (helpers[domain] ??= []);

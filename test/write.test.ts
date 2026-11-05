@@ -38,7 +38,7 @@ test('a config-write Grant lists ha_write_config, described as admin-equivalent;
   const listed = (await (await as('automator')).client.listTools()).tools;
   assert.match(listed.find((d) => d.name === 'ha_write_config')?.description ?? '', /admin-equivalent/);
   const auditing = (await (await as('auditor')).client.listTools()).tools;
-  assert.deepEqual(auditing.map((d) => d.name), ['ha_get_config', 'ha_list_traces', 'ha_get_trace']);
+  assert.deepEqual(auditing.map((d) => d.name), ['ha_get_config', 'ha_list_traces', 'ha_get_trace', 'ha_get_logs']);
 });
 
 test('an automation create posts the config to HA, and the allowed write is audited by name only', async (t) => {

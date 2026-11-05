@@ -94,7 +94,7 @@ Each Grant gives one kind of access:
 | Grant | Gives |
 |---|---|
 | `read: plain` | States, history, logbook, registries and the service list of the whole house. |
-| `read: config` | The config and traces of every automation and script. |
+| `read: config` | The config and traces of every automation and script, and HA's system log. |
 | `services: [...]` with `targets` | Those services on entities in the named domains, areas (`area_id`) or labels (`label_id`). Omit `targets` for services that take none. Includes plain read. |
 | `config_write: automation \| script \| scene \| helper` | Create, update and delete items of that kind (`helper` covers `input_*`, `counter`, `timer` and `schedule`). Includes both reads. |
 

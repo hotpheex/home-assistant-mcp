@@ -23,7 +23,7 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 | Grant | Tools | Gives |
 |---|---|---|
 | `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services` | States, history, logbook, registries and the service list of the **whole house**, at the users tier. |
-| `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
+| `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace`, `ha_get_logs` | The config and traces of every automation and script, and HA's system log, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
 
@@ -109,3 +109,4 @@ These are accepted and documented, not fixed:
 - **Groups and data-field entities ride on the Grant.** The server checks the target only. It does not expand groups or check entities named in other service data fields.
 - **Failed-auth log flooding.** Every failed authentication writes an audit line, and the server does not rate-limit. Rate-limit at the proxy.
 - **The process holds the admin token** next to network-facing code.
+- **The system log can carry anything.** An integration may log a request, a response or a secret in a message or its exception text, just as a trace can hold any variable. Redaction masks only what it recognises.
