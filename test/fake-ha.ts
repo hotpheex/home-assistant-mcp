@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer } from 'ws';
+import { parse } from 'yaml';
 
 export interface FakeState {
   entity_id: string;
@@ -64,6 +65,8 @@ export interface FakeHaOptions {
   traces?: FakeTrace[];
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
+  /** Installed blueprints by domain and path, each as `blueprint/list` gives it: `{metadata}` or `{error}`. */
+  blueprints?: Record<string, Record<string, Record<string, unknown>>>;
 }
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
@@ -229,6 +232,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     options.users[token]?.is_admin ? handler(token, msg, conn) : haError('unauthorized', 'Unauthorized');
   const configs = structuredClone(options.configs ?? {});
   const helpers = structuredClone(options.helpers ?? {});
+  const blueprints = structuredClone(options.blueprints ?? {});
   const configOf = adminOnly((_, msg) => {
     const config = configs[msg.entity_id as string];
     return config && (msg.entity_id as string).startsWith(`${msg.type.split('/')[0]}.`) ? { config } : haError('not_found', 'Entity not found');
@@ -310,6 +314,26 @@ export async function startFakeHa(options: FakeHaOptions) {
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
+    'blueprint/list': adminOnly((_, msg) => blueprints[msg.domain as string] ?? {}),
+    // HA appends `.yaml` to a saved path, but deletes the path exactly as given.
+    'blueprint/save': adminOnly((_, msg) => {
+      const domain = msg.domain as string;
+      const metadata = (parse(msg.yaml as string) as { blueprint?: { domain?: string } } | null)?.blueprint;
+      if (metadata?.domain !== domain) haError('invalid_format', `Invalid blueprint: Found incorrect blueprint type ${metadata?.domain}, expected ${domain}`);
+      const path = (msg.path as string).endsWith('.yaml') ? (msg.path as string) : `${msg.path as string}.yaml`;
+      const stored = (blueprints[domain] ??= {});
+      const exists = path in stored;
+      if (exists && msg.allow_override !== true) haError('already_exists', 'File already exists');
+      stored[path] = { metadata };
+      return { overrides_existing: exists };
+    }),
+    'blueprint/delete': adminOnly((_, msg) => {
+      const stored = blueprints[msg.domain as string] ?? {};
+      const path = msg.path as string;
+      if (!(path in stored)) haError('unknown_error', `[Errno 2] No such file or directory: '${path}'`);
+      delete stored[path];
+      return null;
+    }),
   };
   for (const domain of HELPER_DOMAINS) {
     const items = () => (helpers[domain] ??= []);
@@ -446,6 +470,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     received,
     configs,
     helpers,
+    blueprints,
     /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
     drop,
     /** Command types recorded and never answered while pings still are, as HA does with a script called directly until it ends. */
