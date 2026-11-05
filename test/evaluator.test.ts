@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fc from 'fast-check';
-import { decideConfigWrite, decideServiceCall, planServiceCall, type Expansion, type Selectors } from '../src/evaluator.ts';
+import { decideConfigRead, decideConfigWrite, decideServiceCall, planServiceCall, type Expansion, type Selectors } from '../src/evaluator.ts';
 import { CONFIG_KINDS, parsePolicy, type Policy } from '../src/policy.ts';
 
 const HASH = 'a'.repeat(64);
@@ -175,6 +175,20 @@ test('property: an entity_name write is decided by its own Grant only, and its c
       const { type, entity_id, ...fields } = allowed.write.command;
       assert.deepEqual([type, entity_id], ['config/entity_registry/update', 'lock.garage']);
       assert.deepEqual(Object.keys(fields).sort(), Object.keys(config).filter((k) => ['name', 'icon', 'aliases'].includes(k)).sort());
+    }),
+  );
+});
+
+test('property: a zone write and zone config read need a zone Grant, which writes nothing but zones', () => {
+  const kinds = fc.uniqueArray(fc.constantFrom(...CONFIG_KINDS));
+  fc.assert(
+    fc.property(kinds, fc.constantFrom(...CONFIG_KINDS), (held, kind) => {
+      const policy = { grants: held.map((config_write) => ({ caller: 'agent', config_write })), denies: [] } as unknown as Policy;
+      const write = decideConfigWrite(policy, 'agent', { kind, action: 'delete', id: 'office' }).allowed?.write;
+      const command = write?.via === 'websocket' ? write.command.type : undefined;
+      assert.equal(write !== undefined, held.includes(kind));
+      assert.equal(command?.startsWith('zone/') ?? false, kind === 'zone' && held.includes('zone'));
+      if (kind === 'zone') assert.equal(decideConfigRead(policy, 'agent', kind).allowed !== undefined, held.includes('zone'));
     }),
   );
 });

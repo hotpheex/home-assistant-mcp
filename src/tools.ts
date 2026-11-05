@@ -4,6 +4,7 @@ import pkg from '../package.json' with { type: 'json' };
 import type { Authenticated } from './auth.ts';
 import {
   callable,
+  collectionOf,
   configPath,
   decideConfigRead,
   decideConfigWrite,
@@ -14,7 +15,6 @@ import {
   HELPER_DOMAINS,
   mergedUpdate,
   planServiceCall,
-  splitHelperId,
   writersOf,
   type Allowed,
   type ConfigKind,
@@ -39,6 +39,7 @@ export const TOOL_KIND = {
   ha_get_trace: 'config_read',
   ha_write_config: 'config_write',
   ha_call_service: 'service_call',
+  ha_get_logs: 'config_read',
 } as const satisfies Record<string, Operation>;
 export type ToolName = keyof typeof TOOL_KIND;
 
@@ -126,6 +127,7 @@ const NARROWING: Partial<Record<ToolName, string>> = {
   ha_list_services: 'a domain or a smaller limit',
   ha_list_traces: 'a smaller limit',
   ha_get_trace: 'fewer sections',
+  ha_get_logs: 'a level, a query or a smaller limit',
 };
 const charsOf = (result: CallToolResult) => result.content.reduce((n, c) => n + (c.type === 'text' ? c.text.length : 0), 0);
 const READS: ReadonlySet<Operation> = new Set(['plain_read', 'config_read']);
@@ -188,10 +190,11 @@ async function rest(ctx: Context, allowed: Allowed | undefined, request: RestReq
   return answer.body;
 }
 
-/** A stored scene, automation, script or helper by its write id, unmasked, so a write can merge it; undefined if there is none. */
+/** A stored scene, automation, script, helper or zone by its write id, unmasked, so a write can merge it; undefined if there is none. */
 async function stored(ctx: Context, allowed: Allowed | undefined, kind: ConfigWrite['kind'], id: string): Promise<Record<string, unknown> | undefined> {
-  if (kind !== 'helper') return (await rest(ctx, allowed, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
-  const [domain, item] = splitHelperId(id);
+  const collection = collectionOf(kind, id);
+  if (!collection) return (await rest(ctx, allowed, { method: 'GET', path: configPath(kind, id) })) as Record<string, unknown> | undefined;
+  const [domain, item] = collection;
   return (await send<Record<string, unknown>[]>(ctx, allowed, { type: `${domain}/list` })).find((h) => h.id === item);
 }
 
@@ -431,17 +434,17 @@ const HELPER_ID_RULE = 'must be <helper domain>.<id>, such as input_boolean.gues
 const getConfig = defineTool({
   title: 'Get config',
   description: [
-    'Returns the stored configuration of one automation, script, scene or helper (input_*, counter, timer or schedule).',
-    'Name an automation or script by `kind` and `entity_id`, such as automation.porch_light; a scene by its config `id`; and a helper by `id` as `<domain>.<id>`, such as input_boolean.guest_mode.',
-    'Scene and helper configs are served only to a Caller that may write that kind.',
+    'Returns the stored configuration of one automation, script, scene, helper (input_*, counter, timer or schedule) or zone.',
+    'Name an automation or script by `kind` and `entity_id`, such as automation.porch_light; a scene or zone by its config `id`; and a helper by `id` as `<domain>.<id>`, such as input_boolean.guest_mode.',
+    'Scene, helper and zone configs are served only to a Caller that may write that kind.',
     MASKED,
     'Example: {"kind": "automation", "entity_id": "automation.porch_light"}.',
   ].join(' '),
   input: z
     .strictObject({
-      kind: configKind.describe('automation, script, scene or helper.'),
+      kind: configKind.describe('automation, script, scene, helper or zone.'),
       entity_id: entityId.optional().describe('For an automation or script: its entity, such as automation.porch_light.'),
-      id: z.string().min(1).optional().describe('For a scene: its config id. For a helper: <domain>.<id>, such as input_boolean.guest_mode.'),
+      id: z.string().min(1).optional().describe('For a scene or zone: its config id. For a helper: <domain>.<id>, such as input_boolean.guest_mode.'),
     })
     .superRefine(({ kind, entity_id, id }, ctx) => {
       const byEntity = kind === 'automation' || kind === 'script';
@@ -461,7 +464,7 @@ const getConfig = defineTool({
   async run({ kind, entity_id, id }, ctx) {
     if (kind === 'automation' || kind === 'script') return text(await read(ctx, { type: `${kind}/config`, entity_id }));
     const config = await stored(ctx, ctx.allowed, kind, id!);
-    if (config === undefined) throw new ToolFailure(`${kind === 'scene' ? 'Scene' : 'Helper'} ${id} not found.`);
+    if (config === undefined) throw new ToolFailure(`${kind.charAt(0).toUpperCase()}${kind.slice(1)} ${id} not found.`);
     return text({ config: maskSecrets(stripBearerTokens(config)) });
   },
 });
@@ -525,6 +528,36 @@ const getTrace = defineTool({
     });
     const left = TRACE_SECTIONS.filter((s) => !sections.includes(s)) as string[];
     return text(Object.fromEntries(Object.entries(trace).filter(([key]) => !left.includes(key))));
+  },
+});
+
+const LOG_LEVELS = ['debug', 'info', 'warning', 'error', 'critical'] as const;
+type LogEntry = { name: string; level: string; message: string[]; source: unknown[]; timestamp: number; first_occurred: number };
+
+const getLogs = defineTool({
+  title: 'Get system log',
+  description: [
+    "Lists Home Assistant's system log, newest first: the warnings and errors that integrations and automations logged, each with its logger name, level, messages, source file and line, exception text, count, and the first and last times it occurred.",
+    'Filter by minimum `level` (debug, info, warning, error or critical) and by `query`, a case-insensitive substring of the logger name, the source or a message.',
+    MASKED,
+    PAGED,
+    'Example: {"level": "error", "query": "automation"} lists the errors automations logged.',
+  ].join(' '),
+  input: z.strictObject({
+    level: z.enum(LOG_LEVELS).optional().describe('The lowest level to list.'),
+    query: z.string().min(1).optional().describe('Case-insensitive substring of the logger name, the source or a message.'),
+    ...page,
+  }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  // The query matches the masked text, so it cannot probe for a secret.
+  async run({ level, query, ...paging }, ctx) {
+    const entries = await read<LogEntry[]>(ctx, { type: 'system_log/list' });
+    const rank = (name: string) => LOG_LEVELS.findIndex((l) => l === name.toLowerCase());
+    const shown = entries
+      .filter((e) => level === undefined || rank(e.level) >= rank(level))
+      .filter((e) => query === undefined || [e.name, e.source.join(':'), ...e.message].some((v) => v.toLowerCase().includes(query.toLowerCase())))
+      .map((e) => ({ ...e, timestamp: isoOf(e.timestamp), first_occurred: isoOf(e.first_occurred) }));
+    return text(pageOf('entries', shown, paging));
   },
 });
 
@@ -647,18 +680,18 @@ const callService = defineTool({
 const writeConfig = defineTool({
   title: 'Write config',
   description: [
-    'Creates, updates or deletes one automation, script, scene or helper (input_*, counter, timer or schedule); this is admin-equivalent, because an automation or script can do anything in Home Assistant.',
-    "Name the item by `kind` and `id`: an automation's or scene's config `id`, a script's object id (the part after `script.`), or a helper's `<domain>.<id>`, such as input_boolean.guest_mode.",
-    'An update sends only the top-level keys it changes and keeps the rest; creating an automation, script or scene refuses an id that exists, and a new helper takes its id from its `name`, which the result returns.',
+    'Creates, updates or deletes one automation, script, scene, helper (input_*, counter, timer or schedule) or zone; this is admin-equivalent, because an automation or script can do anything in Home Assistant.',
+    "Name the item by `kind` and `id`: an automation's, scene's or zone's config `id`, a script's object id (the part after `script.`), or a helper's `<domain>.<id>`, such as input_boolean.guest_mode.",
+    'An update sends only the top-level keys it changes and keeps the rest; creating an automation, script or scene refuses an id that exists, and a new helper or zone takes its id from its `name`, which the result returns.',
     'A config that carries **REDACTED** from a config read is refused, so put the real value in its place first.',
     'Example: {"kind": "automation", "action": "update", "id": "porch_light_1", "config": {"alias": "Porch light at dusk"}}.',
     'Kind `entity_name` only updates the `name`, `icon` or `aliases` of the entity whose entity_id is `id`; voice assistants match its aliases.',
   ].join(' '),
   input: z
     .strictObject({
-      kind: configKind.describe('automation, script, scene, helper or entity_name.'),
+      kind: configKind.describe('automation, script, scene, helper, zone or entity_name.'),
       action: z.enum(['create', 'update', 'delete']).describe('create, update or delete.'),
-      id: z.string().min(1).describe("An automation's or scene's config id, a script's object id, a helper's <domain>.<id>, or an entity_name's entity_id."),
+      id: z.string().min(1).describe("An automation's, scene's or zone's config id, a script's object id, a helper's <domain>.<id>, or an entity_name's entity_id."),
       config: z.record(z.string(), z.unknown()).optional().describe('The config to create, or the top-level keys to change; omitted for delete.'),
     })
     .superRefine(({ kind, action, id, config }, ctx) => {
@@ -689,8 +722,8 @@ const writeConfig = defineTool({
     }
     // Recorded before the lookup, so a write refused by its lookup, failed, or of unknown outcome still leaves a record.
     if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
-    // A new helper takes its id from its name, so only a helper update has a stored item to look up; HA's registry update is partial.
-    if (kind !== 'entity_name' && (action === 'update' || (kind !== 'helper' && action === 'create'))) {
+    // A new helper or zone takes its id from its name, so only a collection update has a stored item to look up; HA's registry update is partial.
+    if (kind !== 'entity_name' && (action === 'update' || (!collectionOf(kind, id) && action === 'create'))) {
       const item = await stored(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, kind, id);
       if (action === 'create' && item) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
       if (action === 'update' && !item) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
@@ -700,7 +733,7 @@ const writeConfig = defineTool({
     if (!write) throw new Error('config write sent without a write');
     const result = write.via === 'websocket' ? await send(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
     if (ctx.options.auditWrites) ctx.audit({ kind, action, id, outcome: 'done' });
-    // A helper write echoes the whole stored item, keys the Caller did not send included.
+    // A helper or zone write echoes the whole stored item, keys the Caller did not send included.
     return writeResult({ kind, action, id, result: maskSecrets(stripBearerTokens(result)) });
   },
 });
@@ -716,6 +749,7 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_trace: getTrace,
   ha_write_config: writeConfig,
   ha_call_service: callService,
+  ha_get_logs: getLogs,
 };
 
 /** Built once, so each tool's definition is identical for every Caller. */

@@ -18,6 +18,7 @@ export const CONFIG_KINDS = [
   'scene',
   'helper',
   'entity_name',
+  'zone',
 ] as const;
 
 const target = z

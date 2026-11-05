@@ -184,6 +184,8 @@ export const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 
 export const configPath = (kind: ConfigKind, id: string) => `/api/config/${kind}/config/${encodeURIComponent(id)}`;
 /** A helper's config id is unique only within its domain, so the server names it `<domain>.<id>`. */
 export const splitHelperId = (id: string) => [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)] as const;
+/** Helpers and zones are HA storage collections, written by `<domain>/<action>` and found by `<domain>/list`; undefined for config-REST kinds. */
+export const collectionOf = (kind: ConfigKind, id: string) => (kind === 'helper' ? splitHelperId(id) : kind === 'zone' ? (['zone', id] as const) : undefined);
 
 export const writersOf = (policy: Policy, caller: string, kind: ConfigKind) => indicesOf(policy.grants, (g) => g.caller === caller && g.config_write === kind);
 
@@ -198,17 +200,18 @@ const pick = (config: Record<string, unknown>, keys: readonly string[]) => Objec
 export interface ConfigWrite {
   kind: ConfigKind;
   action: 'create' | 'update' | 'delete';
-  /** A config id or script key; for a helper, `<domain>.<id>`. */
+  /** A config id or script key; for a helper, `<domain>.<id>`; for a zone, its stored id. */
   id: string;
   config?: Record<string, unknown>;
 }
 
-/** HA's config REST for automations, scripts and scenes; the helper domain's own WebSocket commands for a helper. */
+/** HA's config REST for automations, scripts and scenes; the collection's own WebSocket commands for a helper or zone; the entity registry for entity_name. */
 function writeOf({ kind, action, id, config = {} }: ConfigWrite): Write {
   const rest = (request: RestRequest) => ({ via: 'rest', request }) as const;
   if (kind === 'entity_name') return { via: 'websocket', command: { ...pick(config, ENTITY_NAME_FIELDS), type: 'config/entity_registry/update', entity_id: id } };
-  if (kind !== 'helper') return rest(action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config });
-  const [domain, item] = splitHelperId(id);
+  const collection = collectionOf(kind, id);
+  if (!collection) return rest(action === 'delete' ? { method: 'DELETE', path: configPath(kind, id) } : { method: 'POST', path: configPath(kind, id), body: config });
+  const [domain, item] = collection;
   if (action === 'create') return { via: 'websocket', command: { ...config, type: `${domain}/create` } };
   return { via: 'websocket', command: { ...(action === 'update' && config), type: `${domain}/${action}`, [`${domain}_id`]: item } };
 }
