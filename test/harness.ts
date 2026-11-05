@@ -68,6 +68,22 @@ export const CONFIGS: Partial<FakeHaOptions> = {
     },
   },
   helpers: { input_text: [{ id: 'nas_url', name: 'NAS URL', initial: 'https://bob:HELPERSECRET@nas.local' }] },
+  blueprints: {
+    automation: {
+      'homeassistant/motion_light.yaml': {
+        metadata: {
+          name: 'Motion-activated Light',
+          description: 'Turn on a light when motion is detected.',
+          domain: 'automation',
+          source_url: 'https://github.com/home-assistant/core/blob/dev/homeassistant/components/automation/blueprints/motion_light.yaml',
+          author: 'Home Assistant',
+          input: { motion_entity: { name: 'Motion Sensor' }, hook: { name: 'Webhook', default: { api_key: 'BPSECRET' } } },
+        },
+      },
+      'mine/broken.yaml': { error: 'Failed to load blueprint: Unable to read file mine/broken.yaml' },
+    },
+    script: { 'homeassistant/confirmable_notification.yaml': { metadata: { name: 'Confirmable Notification', domain: 'script', input: { notify_device: { name: 'Device' } } } } },
+  },
   traces: ['run_1', 'run_2', 'run_3'].map((run_id, i) => ({
     domain: 'automation' as const,
     item_id: 'porch_light_1',

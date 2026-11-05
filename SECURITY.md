@@ -22,17 +22,20 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 
 | Grant | Tools | Gives |
 |---|---|---|
-| `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services` | States, history, logbook, registries and the service list of the **whole house**, at the users tier. |
-| `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
+| `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services`, `ha_get_statistics`, `ha_render_template` | States, history, logbook, registries, the service list and long-term statistics of the **whole house**, and template rendering over all of it, at the users tier. |
+| `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace`, `ha_get_logs` | The config and traces of every automation and script, and HA's system log, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
+| `config_write: entity_name` | `ha_write_config` (update only), plus config read and plain read | An entity's name, icon and aliases, at the admin tier, and no other registry field. No other Grant gives it. |
+| `config_write: zone` | `ha_write_config`, plus config read and plain read | Create, update and delete zones, at the admin tier. Also zone config. |
+| Blueprints | `ha_list_blueprints` with `read: config`; `ha_write_blueprint` with `config_write: automation` or `script` | The list of every automation and script blueprint, at the admin tier. Saving, overwriting and deleting blueprints of the written kind's domain from the Caller's YAML, at the admin tier; this adds no reach, because that kind is already full control. HA's blueprint import is never sent, so no Caller can make HA fetch a URL. |
 | `config_write: helper_entry` | `ha_helper_flow`, plus config read and plain read | Set up wizard helpers through HA's own setup forms, at the admin tier. Only integrations in HA's live helper list are served: a setup, step or abort of any other integration, a discovery included, is refused. |
 
-**Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so a Caller gets no URL that opens their images or streams.
+**Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so no state gives a Caller a URL that opens their images or streams. A rendered template is the exception: it can print a live token (see Residual risks).
 
 **A config write is full control of the house.** An automation, a script or a wizard helper (`helper_entry`) can call any service, since a template switch or button runs any action, so a Caller that writes them can do anything HA can do. Grant it as you would an HA admin account.
 
-Running a script or triggering an automation is an ordinary service Grant, and it grants everything that script or automation does. Service calls run with the users-tier token, so HA itself refuses admin-only services. No tool edits areas, labels or registry names, so a Caller cannot move an entity into its own Grant.
+Running a script or triggering an automation is an ordinary service Grant, and it grants everything that script or automation does. Service calls run with the users-tier token, so HA itself refuses admin-only services. No tool edits areas, labels, hiding, disabling, devices or entity_ids, so a Caller cannot move an entity into its own Grant; the one exception is a wizard helper, which can hide what it wraps (see Residual risks). `config_write: entity_name` changes only an entity's name, icon and aliases, and no area or label selector reads any of them.
 
 ## How a service call is checked
 
@@ -57,13 +60,17 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/serve.test.ts`: the coverage matrix, every tool for a Caller holding and lacking its kind.
 - `test/evaluator.test.ts`: the property that a Caller with no Grant is refused every service.
 - `test/services.test.ts`: a service no Grant names, and a Deny without targets, refused before any outbound message.
+- `test/serve.test.ts`: the kind matrix, zone config read and write for a Caller holding and lacking the `zone` kind; `test/evaluator.test.ts`: the property that only a zone Grant writes or reads zones.
+- `test/write.test.ts`: a tool that serves only some config-write kinds, such as the blueprint write, is hidden from and refused to a Caller that writes another kind.
 - `test/evaluator.test.ts`: the properties that only `helper_entry` allows a wizard-helper flow, never `helper`, and only for an integration in HA's helper list.
 - `test/helper-flow.test.ts`: a setup, step or abort of an integration HA does not list as a helper, a discovery included, refused and audited with nothing sent beyond the lookups; a Caller holding `helper` is not shown the flow tool.
 
-**The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands.
+**The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands. The one subscription, a plain-read template render, takes its first event and unsubscribes, and is abandoned at the same heartbeat timeout as every request.
 - `test/repo.test.ts`: lint fails on any import of the HA client or another network client, or any `fetch` or `WebSocket`, outside the gate, and on casting to `Allowed` outside the evaluator.
 - `test/serve.test.ts`: a forged, spread or altered decision handed to the gate sends nothing.
 - `test/serve.test.ts`: in the coverage matrix, a read tool sends only read-only commands, and startup sends nothing beyond name lookups.
+- `test/serve.test.ts`: the gate subscribes only for a plain-read template render, and never sends one as a plain command.
+- `test/read.test.ts`: a template render unsubscribes after its first event, and one HA leaves unanswered is abandoned.
 
 **Tiers and the admin pin.** Only config read and config write run with the admin token. Plain read and service calls run with the users-tier token, so HA refuses admin-only services. The server exits if the users-tier token belongs to an HA admin, and never reads a token no Grant needs.
 - `test/serve.test.ts`: in the coverage matrix, config read and config write reach HA with the admin token only, and every other tool with the users-tier token only.
@@ -76,7 +83,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/services.test.ts`: area and label expansion, the service's domain filter, data-key merging, `entity_id: all`, delegating services and Denies on config entities.
 - `test/e2e.test.ts`: against real HA, child devices under a label, hidden and config entities outside an area, and an area Deny catching a config button.
 
-**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Every read, plain, config and trace, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config write carrying the mask marker is refused, so a masked secret is never written back.
+**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Rendered template output is outside this promise: a template can print a bearer token, and the server does not search for one. Every read, plain, config, trace and template output, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config or blueprint write carrying the mask marker is refused, so a masked secret is never written back.
 - `test/redaction.test.ts`: what is stripped and masked, and the expected leaks.
 - `test/read.test.ts`, `test/config.test.ts` and `test/write.test.ts`: Redaction in the read tools, and the marker refusal.
 - `test/helper-flow.test.ts`: the marker refusal for setup step input.
@@ -86,9 +93,15 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/read.test.ts`: a read at the cap returned whole, and one character over refused with the tool's narrowing.
 - `test/services.test.ts`: an oversize service response cut with a marker.
 
-**Audit.** The server writes one JSON object per line to stdout; audit records carry `"audit": true`. Every refusal is recorded, failed authentication included. Allowed calls are recorded only with `HAMCP_AUDIT_WRITES` or `HAMCP_AUDIT_READS`. An allowed write records `allow` before any request to HA and `outcome: done` once HA accepts it, so an `allow` with no `done` is a write that failed or whose outcome is unknown. Records hold names only: never service data, config bodies, responses or keys.
+**Audit.** The server writes one JSON object per line to stdout; audit records carry `"audit": true`. Every refusal is recorded, failed authentication included. Allowed calls are recorded only with `HAMCP_AUDIT_WRITES` or `HAMCP_AUDIT_READS`. An allowed write records `allow` before any request to HA and `outcome: done` once HA accepts it, so an `allow` with no `done` is a write that failed or whose outcome is unknown. Records hold names only: never service data, config bodies, templates, responses or keys.
 - `test/serve.test.ts`: refused keys and Origins audited without the key, and in the coverage matrix, every refused tool call audited and allowed calls audited only on opt-in.
 - `test/services.test.ts` and `test/write.test.ts`: allowed writes audited by name before any request to HA, and their outcome once HA accepts them.
+- `test/read.test.ts`: an allowed template render audited without its template or variables.
+
+**Registry edits are cosmetic only.** An `entity_name` write sends HA only the name, icon and aliases of one entity. A write that names any other registry field, or asks to create or delete, is refused with nothing sent.
+- `test/write.test.ts`: area, labels, hiding, disabling and an entity_id rename refused with nothing sent, and a Caller holding another kind refused.
+- `test/evaluator.test.ts`: the property that an `entity_name` write is decided by its own Grant only and its command carries only name, icon and aliases.
+- `test/e2e.test.ts`: against real HA, a rename and alias that leave every other registry field unchanged.
 
 ## Kill switch
 
@@ -113,5 +126,9 @@ These are accepted and documented, not fixed:
 - **Groups and data-field entities ride on the Grant.** The server checks the target only. It does not expand groups or check entities named in other service data fields.
 - **Failed-auth log flooding.** Every failed authentication writes an audit line, and the server does not rate-limit. Rate-limit at the proxy.
 - **The process holds the admin token** next to network-facing code.
+- **Aliases steer voice control.** Voice assistants match spoken names against aliases, and the Policy cannot see that. A Caller with `config_write: entity_name` that aliases `lock.garage` as "front door" makes "unlock the front door" open the garage.
+- **The system log can carry anything.** An integration may log a request, a response or a secret in a message or its exception text, just as a trace can hold any variable. Redaction masks only what it recognises.
+- **Zones move presence.** A zone change changes who counts as home and what location automations do, so a `config_write: zone` Grant can trigger any automation that keys on presence.
+- **Template output can carry camera, image and media_player tokens.** A template such as `{{ state_attr('camera.door', 'access_token') }}` prints a live token, which opens that camera's images and stream until HA rotates it. The server does not search rendered output for tokens, so plain read reaches this since v0.3.0.
 - **Wizard helpers can hide entities.** switch_as_x hides the switch it wraps, and a group can hide its members. A hidden entity escapes area and label Denies, and the wrapper, such as switch_as_x's light, falls under its own domain's Grants.
 - **Reading a user-started flow re-runs its step.** HA lists a discovery's handler without running it, but a flow a user started is read through HA's flow REST, which re-runs its current step with no input, before the helper check.

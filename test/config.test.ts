@@ -100,3 +100,81 @@ test('ha_get_trace returns the summary plus the sections asked for, masked and w
   assert.equal(wrong.result.isError, true);
   assert.deepEqual(wrong.result.content, [{ type: 'text', text: `No automation has the id automation.porch_light. ${ID_HINT}` }]);
 });
+
+/** HA's system log, oldest first as recorded; HA lists it newest first. */
+const SYSTEM_LOG = [
+  { name: 'homeassistant.components.hue', level: 'WARNING', message: ['Bridge slow to answer'], source: ['components/hue/bridge.py', 80], timestamp: 1_793_000_000, exception: '', count: 1, first_occurred: 1_793_000_000 },
+  {
+    name: 'homeassistant.components.automation.porch_light',
+    level: 'ERROR',
+    message: ['Error in action: https://bob:LOGSECRET@nas.local/hook refused Bearer LOGSECRET1'],
+    source: ['components/automation/__init__.py', 712],
+    timestamp: 1_793_000_120.5,
+    exception: '',
+    count: 2,
+    first_occurred: 1_793_000_060,
+  },
+  { name: 'custom_components.nas', level: 'INFO', message: ['Polled the NAS'], source: ['custom_components/nas/sensor.py', 33], timestamp: 1_793_000_180, exception: '', count: 1, first_occurred: 1_793_000_180 },
+];
+
+test('ha_get_logs lists the system log newest first, filtered by minimum level and query, with secrets masked', async (t) => {
+  const ha = await fakeHa(t, { systemLog: SYSTEM_LOG });
+  const server = await startServer(t, policy, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
+  const call = adminCaller(ha, await connect(t, server.url, auditor.key, 'modern'));
+  const names = async (args: Record<string, unknown>) => {
+    const { result, sent } = await call('ha_get_logs', args);
+    assert.deepEqual(sent, [{ type: 'system_log/list' }]);
+    return (body(result) as { entries: { name: string }[] }).entries.map((e) => e.name);
+  };
+  assert.deepEqual(await names({}), ['custom_components.nas', 'homeassistant.components.automation.porch_light', 'homeassistant.components.hue']);
+  assert.deepEqual(await names({ level: 'warning' }), ['homeassistant.components.automation.porch_light', 'homeassistant.components.hue']);
+  assert.deepEqual(await names({ level: 'critical' }), []);
+  // The query matches the logger name, the source path or a message, case-insensitively.
+  assert.deepEqual(await names({ query: 'HUE' }), ['homeassistant.components.hue']);
+  assert.deepEqual(await names({ query: 'nas/sensor.py' }), ['custom_components.nas']);
+  assert.deepEqual(await names({ query: 'error in action', level: 'error' }), ['homeassistant.components.automation.porch_light']);
+  // It matches the masked text, so a query cannot probe for a secret.
+  assert.deepEqual(await names({ query: 'LOGSECRET' }), []);
+
+  const page = body((await call('ha_get_logs', { level: 'error' })).result);
+  assert.deepEqual(page, {
+    total: 1,
+    offset: 0,
+    has_more: false,
+    entries: [
+      {
+        name: 'homeassistant.components.automation.porch_light',
+        level: 'ERROR',
+        message: [`Error in action: https://${M}@nas.local/hook refused Bearer ${M}`],
+        source: ['components/automation/__init__.py', 712],
+        timestamp: '2026-10-26T07:35:20.500Z',
+        exception: '',
+        count: 2,
+        first_occurred: '2026-10-26T07:34:20.000Z',
+      },
+    ],
+  });
+  assert.equal((await call('ha_get_logs', { level: 'fatal' })).result.isError, true);
+});
+
+test('ha_list_blueprints lists automation and script blueprints by path, with their metadata masked', async (t) => {
+  const { call } = await auditorOn(t);
+  const both = await call('ha_list_blueprints', {});
+  assert.deepEqual(both.sent, [{ type: 'blueprint/list', domain: 'automation' }, { type: 'blueprint/list', domain: 'script' }]);
+  const motion = {
+    domain: 'automation',
+    path: 'homeassistant/motion_light.yaml',
+    name: 'Motion-activated Light',
+    description: 'Turn on a light when motion is detected.',
+    inputs: { motion_entity: { name: 'Motion Sensor' }, hook: { name: 'Webhook', default: { api_key: M } } },
+    source_url: 'https://github.com/home-assistant/core/blob/dev/homeassistant/components/automation/blueprints/motion_light.yaml',
+  };
+  const broken = { domain: 'automation', path: 'mine/broken.yaml', error: "Failed to load blueprint: Unable to read file mine/broken.yaml" };
+  const confirm = { domain: 'script', path: 'homeassistant/confirmable_notification.yaml', name: 'Confirmable Notification', inputs: { notify_device: { name: 'Device' } } };
+  assert.deepEqual(body(both.result), { total: 3, offset: 0, has_more: false, blueprints: [motion, broken, confirm] });
+
+  const scripts = await call('ha_list_blueprints', { domain: 'script' });
+  assert.deepEqual(scripts.sent, [{ type: 'blueprint/list', domain: 'script' }]);
+  assert.deepEqual(body(scripts.result), { total: 1, offset: 0, has_more: false, blueprints: [confirm] });
+  assert.deepEqual(body((await call('ha_list_blueprints', { limit: 1, offset: 1 })).result), { total: 3, offset: 1, has_more: true, blueprints: [broken] });
+});

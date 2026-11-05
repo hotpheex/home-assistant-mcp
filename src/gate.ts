@@ -30,6 +30,8 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'config/floor_registry/list',
     'history/history_during_period',
     'logbook/get_events',
+    'recorder/list_statistic_ids',
+    'recorder/statistics_during_period',
   ]),
   // The entity registry only tells a trace call whether its item exists; none of it is returned.
   config_read: new Set([
@@ -39,9 +41,16 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'trace/get',
     'config/entity_registry/list',
     ...HELPER_DOMAINS.map((d) => `${d}/list`),
+    'system_log/list',
+    'zone/list',
+    'blueprint/list',
     'config_entries/flow/progress',
   ]),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
+};
+/** HA answers a template render only as a subscription, so plain read may open one, for its first event only. */
+const ONE_SHOT: Partial<Record<Operation, ReadonlySet<string>>> = {
+  plain_read: new Set(['render_template']),
 };
 /** Config read may GET these: a stored config, and the lookups a helper flow needs; any other REST request must be the exact write an Allowed names. */
 const CONFIG_PATHS = [
@@ -88,6 +97,8 @@ export interface Gate {
   /** Answers with HA's status and JSON body, leaving their meaning to the caller. */
   rest(allowed: Allowed, request: RestRequest): Promise<{ status: number; body: unknown }>;
   close(): void;
+  /** Subscribes, answers with the first event, and unsubscribes. */
+  subscribeOnce(allowed: Allowed, command: Command): Promise<unknown>;
 }
 
 const releaseOf = (version: string) => version.split('.').slice(0, 2).map(Number);
@@ -230,6 +241,29 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       } catch {
         // fetch cannot tell a refused connection from one dropped or abandoned mid-request, so a write errs towards unknown.
         throw write ? new OutcomeUnknown() : new HaUnavailable(true);
+      }
+    },
+    async subscribeOnce(allowed, command) {
+      issuedOnly(allowed);
+      if (!ONE_SHOT[allowed.operation]?.has(command.type)) throw new Error(`${allowed.operation} may not subscribe to ${command.type}`);
+      const conn = connections.get(allowed.tier);
+      if (!conn?.connected) throw new HaUnavailable();
+      try {
+        return await timed(async (signal) => {
+          const gone = abandoned(signal);
+          const first = Promise.withResolvers<unknown>();
+          const subscribed = conn.subscribeMessage(first.resolve, { ...command }, { resubscribe: false });
+          try {
+            await Promise.race([subscribed, gone]);
+            return await Promise.race([first.promise, gone]);
+          } finally {
+            // Ends it even once abandoned, as HA may still answer; a failed unsubscribe does not fail the read.
+            const ended = subscribed.then((unsubscribe) => unsubscribe(), () => {});
+            await Promise.race([ended, gone]).catch(() => {});
+          }
+        });
+      } catch (e) {
+        throw failureOf(e, false);
       }
     },
     close() {

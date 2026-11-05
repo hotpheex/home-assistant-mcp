@@ -2,6 +2,7 @@ import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer } from 'ws';
+import { parse } from 'yaml';
 
 export interface FakeState {
   entity_id: string;
@@ -65,6 +66,15 @@ export interface FakeHaOptions {
   traces?: FakeTrace[];
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
+  statistics?: FakeStatistic[];
+  /** How each template renders; one not listed renders as its own text, as a static template does. */
+  templates?: Record<string, FakeTemplate>;
+  /** HA's system log entries, oldest first, in `system_log/list`'s shape. */
+  systemLog?: Record<string, unknown>[];
+  /** Stored (UI) zones. */
+  zones?: Record<string, unknown>[];
+  /** Installed blueprints by domain and path, each as `blueprint/list` gives it: `{metadata}` or `{error}`. */
+  blueprints?: Record<string, Record<string, Record<string, unknown>>>;
   /** Config entries, of helper integrations and others. */
   entries?: FakeConfigEntry[];
   /** Config flows already in progress, such as a discovery HA started. */
@@ -101,6 +111,8 @@ const FLOW_STEPS: Record<string, Record<string, FlowStep>> = {
 };
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
+/** What HA's `config/entity_registry/update` schema takes besides `entity_id`. */
+const REGISTRY_UPDATE_KEYS = ['aliases', 'area_id', 'categories', 'device_class', 'icon', 'labels', 'name', 'new_entity_id', 'disabled_by', 'hidden_by', 'options_domain', 'options'];
 const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 /** Each helper's storage schema in HA 2026.10: its required keys, the defaults it fills, and its other keys besides `icon`. */
 const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<string, unknown>; optional: string[] }> = {
@@ -117,6 +129,17 @@ const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<stri
 /** HA validates the whole body of a config POST, so a partial one is refused. */
 const REQUIRED_KEYS: Record<string, string[]> = { automation: ['triggers', 'actions'], script: ['sequence'], scene: ['name', 'entities'] };
 
+/** A long-term statistic's metadata, and its rows per period, each with an ISO `start` and its type values. */
+export interface FakeStatistic {
+  statistic_id: string;
+  name: string | null;
+  source: string;
+  unit_of_measurement: string | null;
+  has_sum: boolean;
+  mean_type: number;
+  periods: Partial<Record<'5minute' | 'hour' | 'day' | 'week' | 'month', ({ start: string } & Partial<Record<'min' | 'max' | 'mean' | 'sum' | 'state' | 'change', number>>)[]>>;
+}
+
 /** A stored run: summary fields plus the sections only trace/get returns. */
 export interface FakeTrace extends Record<string, unknown> {
   domain: 'automation' | 'script';
@@ -125,6 +148,17 @@ export interface FakeTrace extends Record<string, unknown> {
   timestamp: { start: string; finish: string };
 }
 const TRACE_SECTIONS = ['trace', 'config', 'blueprint_inputs', 'context'];
+
+/** A template's render: its result, needing `variable` if named, a compile or render error, or `seconds` of work. */
+export interface FakeTemplate {
+  result?: unknown;
+  variable?: string;
+  compileError?: string;
+  renderError?: string;
+  seconds?: number;
+}
+/** Python's str() of the float HA coerces a timeout to. */
+const pyFloat = (n: number) => (Number.isInteger(n) ? n.toFixed(1) : String(n));
 
 /** A command the server sent after authenticating, with the token of the connection it came on. */
 export interface Received {
@@ -245,7 +279,8 @@ export async function startFakeHa(options: FakeHaOptions) {
   let down = false;
   let hung = false;
   let refused = 0;
-  const entities = options.entities ?? [];
+  // A copy, since a registry update changes it and the seed is shared across tests.
+  const entities = structuredClone(options.entities ?? []);
   const entityEntry = (e: FakeEntity) => {
     const entry: Partial<FakeEntity> = { name: null, device_id: null, area_id: null, labels: [], hidden_by: null, disabled_by: null, entity_category: null, ...e };
     delete entry.aliases;
@@ -265,6 +300,8 @@ export async function startFakeHa(options: FakeHaOptions) {
   const entries = structuredClone(options.entries ?? []);
   const flows = structuredClone(options.flows ?? []);
   const helpers = structuredClone(options.helpers ?? {});
+  const zones = structuredClone(options.zones ?? []);
+  const blueprints = structuredClone(options.blueprints ?? {});
   const configOf = adminOnly((_, msg) => {
     const config = configs[msg.entity_id as string];
     return config && (msg.entity_id as string).startsWith(`${msg.type.split('/')[0]}.`) ? { config } : haError('not_found', 'Entity not found');
@@ -311,6 +348,15 @@ export async function startFakeHa(options: FakeHaOptions) {
           return [id, e ? { ...entityEntry(e), aliases: e.aliases ?? [] } : null];
         }),
       ),
+    'config/entity_registry/update': adminOnly((_, msg) => {
+      const entity = entities.find((e) => e.entity_id === msg.entity_id) ?? haError('not_found', 'Entity not found');
+      const changes = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'entity_id'].includes(k)));
+      const extra = Object.keys(changes).find((k) => !REGISTRY_UPDATE_KEYS.includes(k));
+      if (extra) haError('invalid_format', `extra keys not allowed @ data['${extra}']`);
+      const { new_entity_id, ...fields } = changes;
+      Object.assign(entity, fields, typeof new_entity_id === 'string' && { entity_id: new_entity_id });
+      return { entity_entry: { ...entityEntry(entity), aliases: entity.aliases ?? [] } };
+    }),
     'config/device_registry/list': () => options.devices ?? [],
     'config/area_registry/list': () => options.areas ?? [],
     'config/label_registry/list': () => options.labels ?? [],
@@ -350,6 +396,74 @@ export async function startFakeHa(options: FakeHaOptions) {
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
+    'recorder/list_statistic_ids': () =>
+      (options.statistics ?? []).map(({ statistic_id, name, source, unit_of_measurement, has_sum, mean_type }) => ({
+        statistic_id,
+        display_unit_of_measurement: unit_of_measurement,
+        has_mean: mean_type === 1,
+        mean_type,
+        has_sum,
+        name,
+        source,
+        statistics_unit_of_measurement: unit_of_measurement,
+        unit_class: null,
+      })),
+    'recorder/statistics_during_period': (_, msg) => {
+      const period = msg.period as keyof FakeStatistic['periods'];
+      const ms = { '5minute': 300_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000, month: 2_592_000_000 }[period];
+      if (ms === undefined || !Array.isArray(msg.statistic_ids) || msg.statistic_ids.length === 0) return haError('invalid_format', 'Invalid statistics request');
+      const types = msg.types as string[];
+      const [from, to] = [Date.parse(msg.start_time as string), msg.end_time === undefined ? Date.now() : Date.parse(msg.end_time as string)];
+      const out: Record<string, Record<string, number | null>[]> = {};
+      for (const s of (options.statistics ?? []).filter((x) => (msg.statistic_ids as string[]).includes(x.statistic_id))) {
+        const rows = (s.periods[period] ?? [])
+          .filter((r) => from <= Date.parse(r.start) && Date.parse(r.start) < to)
+          .map((r) => ({ start: Date.parse(r.start), end: Date.parse(r.start) + ms, ...Object.fromEntries(types.map((k) => [k, new Map(Object.entries(r)).get(k) ?? null])) }));
+        if (rows.length > 0) out[s.statistic_id] = rows;
+      }
+      return out;
+    },
+    // HA 2026.10's handle_render_template: the timeout check, then a compile error as the result, then events.
+    render_template: (_, msg, conn) => {
+      const template = typeof msg.template === 'string' ? msg.template : haError('invalid_format', "required key not provided @ data['template']");
+      const render = options.templates?.[template] ?? { result: template };
+      const timeout = msg.timeout === undefined ? 0 : Number(msg.timeout);
+      if (timeout && (render.seconds ?? 0) > timeout) haError('template_error', `Exceeded maximum execution time of ${pyFloat(timeout)}s`);
+      if (render.compileError !== undefined) haError('template_error', render.compileError);
+      const report = msg.report_errors === true;
+      const missing = render.variable !== undefined && !Object.hasOwn((msg.variables as Record<string, unknown> | undefined) ?? {}, render.variable);
+      const renderError = render.renderError ?? (missing && msg.strict === true ? `UndefinedError: '${render.variable}' is undefined` : undefined);
+      if (renderError !== undefined) {
+        if (report) conn.emit({ error: renderError, level: 'ERROR' });
+        return null;
+      }
+      if (missing && report) conn.emit({ error: `'${render.variable}' is undefined`, level: 'WARNING' });
+      const entities = [...template.matchAll(/states\(['"]([\w.]+)['"]\)/g)].map((m) => m[1]);
+      conn.emit({ result: missing ? '' : render.result, listeners: { all: false, domains: [], entities, time: false } });
+      return null;
+    },
+    // HA lists its deduplicated log newest first.
+    'system_log/list': adminOnly(() => [...(options.systemLog ?? [])].reverse()),
+    'blueprint/list': adminOnly((_, msg) => blueprints[msg.domain as string] ?? {}),
+    // HA appends `.yaml` to a saved path, but deletes the path exactly as given.
+    'blueprint/save': adminOnly((_, msg) => {
+      const domain = msg.domain as string;
+      const metadata = (parse(msg.yaml as string) as { blueprint?: { domain?: string } } | null)?.blueprint;
+      if (metadata?.domain !== domain) haError('invalid_format', `Invalid blueprint: Found incorrect blueprint type ${metadata?.domain}, expected ${domain}`);
+      const path = (msg.path as string).endsWith('.yaml') ? (msg.path as string) : `${msg.path as string}.yaml`;
+      const stored = (blueprints[domain] ??= {});
+      const exists = path in stored;
+      if (exists && msg.allow_override !== true) haError('already_exists', 'File already exists');
+      stored[path] = { metadata };
+      return { overrides_existing: exists };
+    }),
+    'blueprint/delete': adminOnly((_, msg) => {
+      const stored = blueprints[msg.domain as string] ?? {};
+      const path = msg.path as string;
+      if (!(path in stored)) haError('unknown_error', `[Errno 2] No such file or directory: '${path}'`);
+      delete stored[path];
+      return null;
+    }),
   };
   for (const domain of HELPER_DOMAINS) {
     const items = () => (helpers[domain] ??= []);
@@ -381,6 +495,28 @@ export async function startFakeHa(options: FakeHaOptions) {
       return null;
     });
   }
+  // HA 2026.10's zone collection: a create fills radius and passive, and an update validates only the keys it sends and merges them.
+  const ZONE_KEYS = ['name', 'latitude', 'longitude', 'radius', 'passive', 'icon'];
+  const zoneFields = (msg: Message) => {
+    const fields = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'zone_id'].includes(k)));
+    const extra = Object.keys(fields).find((k) => !ZONE_KEYS.includes(k));
+    return extra ? haError('invalid_format', `extra keys not allowed @ data['${extra}']`) : fields;
+  };
+  const zoneOf = (msg: Message) => zones.find((z) => z.id === msg.zone_id) ?? haError('not_found', `Unable to find zone_id ${String(msg.zone_id)}`);
+  handlers['zone/list'] = () => zones;
+  handlers['zone/create'] = adminOnly((_, msg) => {
+    const fields = zoneFields(msg);
+    const missing = ['name', 'latitude', 'longitude'].find((k) => !(k in fields));
+    if (missing) haError('invalid_format', `required key not provided @ data['${missing}']. Got None`);
+    const zone = { id: String(fields.name).toLowerCase().replace(/[^a-z0-9]+/g, '_'), radius: 100, passive: false, ...fields };
+    zones.push(zone);
+    return zone;
+  });
+  handlers['zone/update'] = adminOnly((_, msg) => Object.assign(zoneOf(msg), zoneFields(msg)));
+  handlers['zone/delete'] = adminOnly((_, msg) => {
+    zones.splice(zones.indexOf(zoneOf(msg)), 1);
+    return null;
+  });
 
   /** HA's config REST API: automation and scene entries by config id, scripts by object key. */
   const entityOf = (kind: string, id: string) =>
@@ -534,6 +670,8 @@ export async function startFakeHa(options: FakeHaOptions) {
     received,
     configs,
     helpers,
+    zones,
+    blueprints,
     entries,
     flows,
     /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
