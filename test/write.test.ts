@@ -264,3 +264,54 @@ test('a config write dropped or left unanswered after it was sent reports outcom
   assert.equal(((await updated).content as { text: string }[])[0]?.text, 'HA unavailable: Home Assistant did not answer. Try again later.');
   assert.ok(!types().includes('POST /api/config/script/config/morning'));
 });
+
+test('zone writes share the helper path: zone WebSocket commands, an update merged over the stored zone, config served only to a zone writer', async (t) => {
+  const people = { zoner: newKey(), helperer: newKey() };
+  const ha = await fakeHa(t);
+  const zonePolicy = policyOf(people, 'grants:\n  - caller: zoner\n    config_write: zone\n  - caller: helperer\n    config_write: helper\n');
+  const server = await startServer(t, zonePolicy, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN, HAMCP_AUDIT_WRITES: 'true' });
+  const call = adminCaller(ha, await connect(t, server.url, people.zoner.key, 'modern'));
+  const office = { name: 'Office', latitude: -33.86, longitude: 151.2, radius: 250, passive: false, icon: 'mdi:briefcase' };
+  const created = await call('ha_write_config', { kind: 'zone', action: 'create', id: 'office', config: office });
+  assert.deepEqual(created.sent, [{ type: 'zone/create', ...office }]);
+  assert.deepEqual(body(created.result), { kind: 'zone', action: 'create', id: 'office', result: { id: 'office', ...office } });
+
+  const moved = await call('ha_write_config', { kind: 'zone', action: 'update', id: 'office', config: { radius: 100 } });
+  assert.deepEqual(moved.sent, [{ type: 'zone/list' }, { type: 'zone/update', ...office, radius: 100, zone_id: 'office' }]);
+  assert.deepEqual(ha.zones, [{ id: 'office', ...office, radius: 100 }]);
+  const read = await call('ha_get_config', { kind: 'zone', id: 'office' });
+  assert.deepEqual(read.sent, [{ type: 'zone/list' }]);
+  assert.deepEqual(body(read.result), { config: { id: 'office', ...office, radius: 100 } });
+  const marked = await call('ha_write_config', { kind: 'zone', action: 'update', id: 'office', config: { name: M } });
+  assert.match(JSON.stringify(marked.result.content), /config carries a redacted value at name/);
+  assert.deepEqual(marked.sent, []);
+
+  const deleted = await call('ha_write_config', { kind: 'zone', action: 'delete', id: 'office' });
+  assert.deepEqual(deleted.sent, [{ type: 'zone/delete', zone_id: 'office' }]);
+  assert.deepEqual(ha.zones, []);
+  const gone = await call('ha_get_config', { kind: 'zone', id: 'office' });
+  assert.match(JSON.stringify(gone.result.content), /Zone office not found/);
+
+  // A helper Grant writes no zone, and a zone Grant no helper.
+  const helperer = adminCaller(ha, await connect(t, server.url, people.helperer.key, 'modern'));
+  for (const [who, args] of [
+    [helperer, { kind: 'zone', action: 'create', id: 'office', config: office }],
+    [helperer, { kind: 'zone', id: 'office' }],
+    [call, { kind: 'helper', action: 'create', id: 'input_boolean.guest_mode', config: { name: 'Guest mode' } }],
+  ] as const) {
+    const denied = await who('action' in args ? 'ha_write_config' : 'ha_get_config', args);
+    assert.match(JSON.stringify(denied.result.content), /no Grant for (config writes of zone|zone config|config writes of helper)\. Do not retry/);
+    assert.deepEqual(denied.sent, []);
+  }
+  assert.deepEqual(
+    server.audits().map((a) => [a.caller, a.operation, a.kind, a.action, a.decision ?? a.outcome]),
+    [
+      ['zoner', 'config_write', 'zone', 'create', 'allow'], ['zoner', 'config_write', 'zone', 'create', 'done'],
+      ['zoner', 'config_write', 'zone', 'update', 'allow'], ['zoner', 'config_write', 'zone', 'update', 'done'],
+      ['zoner', 'config_write', 'zone', 'update', 'deny'],
+      ['zoner', 'config_write', 'zone', 'delete', 'allow'], ['zoner', 'config_write', 'zone', 'delete', 'done'],
+      ['helperer', 'config_write', 'zone', 'create', 'deny'], ['helperer', 'config_read', 'zone', undefined, 'deny'],
+      ['zoner', 'config_write', 'helper', 'create', 'deny'],
+    ],
+  );
+});

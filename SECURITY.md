@@ -26,6 +26,7 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 | `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
+| `config_write: zone` | `ha_write_config`, plus config read and plain read | Create, update and delete zones, at the admin tier. Also zone config. |
 
 **Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so a Caller gets no URL that opens their images or streams.
 
@@ -56,6 +57,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/serve.test.ts`: the coverage matrix, every tool for a Caller holding and lacking its kind.
 - `test/evaluator.test.ts`: the property that a Caller with no Grant is refused every service.
 - `test/services.test.ts`: a service no Grant names, and a Deny without targets, refused before any outbound message.
+- `test/serve.test.ts`: the kind matrix, zone config read and write for a Caller holding and lacking the `zone` kind; `test/evaluator.test.ts`: the property that only a zone Grant writes or reads zones.
 
 **The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands.
 - `test/repo.test.ts`: lint fails on any import of the HA client or another network client, or any `fetch` or `WebSocket`, outside the gate, and on casting to `Allowed` outside the evaluator.
@@ -109,3 +111,4 @@ These are accepted and documented, not fixed:
 - **Groups and data-field entities ride on the Grant.** The server checks the target only. It does not expand groups or check entities named in other service data fields.
 - **Failed-auth log flooding.** Every failed authentication writes an audit line, and the server does not rate-limit. Rate-limit at the proxy.
 - **The process holds the admin token** next to network-facing code.
+- **Zones move presence.** A zone change changes who counts as home and what location automations do, so a `config_write: zone` Grant can trigger any automation that keys on presence.
