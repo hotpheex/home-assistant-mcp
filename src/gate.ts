@@ -30,6 +30,8 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'config/floor_registry/list',
     'history/history_during_period',
     'logbook/get_events',
+    'lovelace/dashboards/list',
+    'lovelace/config',
   ]),
   // The entity registry only tells a trace call whether its item exists; none of it is returned.
   config_read: new Set([
@@ -39,6 +41,8 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'trace/get',
     'config/entity_registry/list',
     ...HELPER_DOMAINS.map((d) => `${d}/list`),
+    'lovelace/dashboards/list',
+    'lovelace/config',
   ]),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };

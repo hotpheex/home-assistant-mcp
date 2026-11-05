@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fc from 'fast-check';
-import { decideServiceCall, planServiceCall, type Expansion, type Selectors } from '../src/evaluator.ts';
-import { parsePolicy, type Policy } from '../src/policy.ts';
+import { decideConfigRead, decideConfigWrite, decideServiceCall, planServiceCall, type Expansion, type Selectors } from '../src/evaluator.ts';
+import { CONFIG_KINDS, parsePolicy, type Policy } from '../src/policy.ts';
 
 const HASH = 'a'.repeat(64);
 const policyOf = (rules: string) => parsePolicy(`version: 1\ncallers:\n  agent:\n    keys: [{ sha256: ${HASH} }]\n${rules}`);
@@ -161,4 +161,21 @@ test('property: an allowed call has every entity covered by a Grant, so one unco
 
 test('property: adding a Grant never turns an allow into a deny', () => {
   fc.assert(fc.property(scenario, (s) => !decide(s) || decide(s, [...s.grants, s.extra])));
+});
+
+test('property: a dashboard write or config read is decided by a dashboard Grant alone, and is a lovelace WebSocket command', () => {
+  const grant = fc.record({ caller: fc.constantFrom('agent', 'other'), config_write: fc.constantFrom(...CONFIG_KINDS) });
+  const write = fc.record({ action: fc.constantFrom('create', 'update', 'delete' as const), id: fc.constantFrom('lovelace', 'kitchen-wall', 'map') });
+  fc.assert(
+    fc.property(fc.array(grant), write, fc.constantFrom(...CONFIG_KINDS), (grants, { action, id }, other) => {
+      const policy = asPolicy(grants as unknown as Rule[], []);
+      const holds = (kind: string) => grants.some((g) => g.caller === 'agent' && g.config_write === kind);
+      const { allowed } = decideConfigWrite(policy, 'agent', { kind: 'dashboard', action, id, config: action === 'delete' ? undefined : { title: 'x' } });
+      assert.equal(allowed !== undefined, holds('dashboard'));
+      assert.equal(decideConfigRead(policy, 'agent', 'dashboard').allowed !== undefined, holds('dashboard'));
+      if (other !== 'dashboard' && !holds(other)) assert.equal(decideConfigWrite(policy, 'agent', { kind: other, action: 'delete', id: 'x' }).allowed, undefined);
+      if (allowed?.write.via !== 'websocket') return allowed === undefined;
+      return /^lovelace\/(dashboards\/(create|delete)|config\/save)$/.test(allowed.write.command.type);
+    }),
+  );
 });

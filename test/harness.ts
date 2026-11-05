@@ -87,6 +87,18 @@ export const CONFIGS: Partial<FakeHaOptions> = {
   })),
 };
 
+/** Two storage dashboards, one never saved and with a collection id HA suffixed, and a layout with an inline secret; `lovelace` keys the default dashboard's layout. */
+export const DASHBOARDS: Partial<FakeHaOptions> = {
+  dashboards: [
+    { id: 'kitchen_wall', url_path: 'kitchen-wall', title: 'Kitchen wall', icon: 'mdi:tablet', show_in_sidebar: true, require_admin: false, mode: 'storage' },
+    { id: 'spare_room_2', url_path: 'spare-room', title: 'Spare room', show_in_sidebar: false, require_admin: false, mode: 'storage' },
+  ],
+  layouts: {
+    lovelace: { title: 'Home', views: [{ title: 'Home', cards: [{ type: 'entities', entities: ['light.kitchen'] }] }] },
+    'kitchen-wall': { views: [{ title: 'Wall', cards: [{ type: 'iframe', url: 'https://bob:DASHSECRET@cam.local/live' }] }] },
+  },
+};
+
 export function newKey() {
   const key = `hamcp_${randomBytes(32).toString('base64url')}`;
   return { key, sha256: createHash('sha256').update(key).digest('hex') };
@@ -103,6 +115,7 @@ export async function fakeHa(t: TestContext, options: Partial<FakeHaOptions> = {
     services: { light: { turn_on: { target: { entity: [{ domain: ['light'] }] } } } },
     ...REGISTRIES,
     ...CONFIGS,
+    ...DASHBOARDS,
     ...options,
   });
   t.after(() => ha.close());

@@ -64,6 +64,10 @@ export interface FakeHaOptions {
   traces?: FakeTrace[];
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
+  /** Dashboard collection items, as `lovelace/dashboards/list` serves them. */
+  dashboards?: Record<string, unknown>[];
+  /** Saved layouts by url_path; `lovelace` is the default dashboard, which HA reaches by omitting url_path. */
+  layouts?: Record<string, Record<string, unknown>>;
 }
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
@@ -229,6 +233,15 @@ export async function startFakeHa(options: FakeHaOptions) {
     options.users[token]?.is_admin ? handler(token, msg, conn) : haError('unauthorized', 'Unauthorized');
   const configs = structuredClone(options.configs ?? {});
   const helpers = structuredClone(options.helpers ?? {});
+  const dashboards = structuredClone(options.dashboards ?? []);
+  const layouts = structuredClone(options.layouts ?? {});
+  /** HA's `_handle_errors`: no url_path is the default dashboard, and any other must be a listed one. */
+  const layoutKey = (msg: Message) =>
+    msg.url_path === undefined || msg.url_path === null
+      ? 'lovelace'
+      : dashboards.some((d) => d.url_path === msg.url_path)
+        ? (msg.url_path as string)
+        : haError('config_not_found', `Unknown config specified: ${msg.url_path as string}`);
   const configOf = adminOnly((_, msg) => {
     const config = configs[msg.entity_id as string];
     return config && (msg.entity_id as string).startsWith(`${msg.type.split('/')[0]}.`) ? { config } : haError('not_found', 'Entity not found');
@@ -310,6 +323,34 @@ export async function startFakeHa(options: FakeHaOptions) {
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
+    'lovelace/dashboards/list': () => dashboards,
+    'lovelace/config': (_, msg) => layouts[layoutKey(msg)] ?? haError('config_not_found', 'No config found.'),
+    'lovelace/config/save': adminOnly((_, msg) => {
+      layouts[layoutKey(msg)] = msg.config as Record<string, unknown>;
+      return null;
+    }),
+    // The default panel always exists, so no dashboard can take lovelace; a collection id is the slugified path, suffixed if taken.
+    'lovelace/dashboards/create': adminOnly((_, msg) => {
+      const fields = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'allow_single_word'].includes(k)));
+      const path = fields.url_path as string;
+      if (msg.allow_single_word !== true && !path.includes('-')) haError('invalid_format', 'Url path needs to contain a hyphen (-)');
+      if (path === 'lovelace' || dashboards.some((d) => d.url_path === path)) haError('home_assistant_error', `The URL "${path}" is already in use`);
+      const extra = Object.keys(fields).find((k) => !['url_path', 'title', 'icon', 'show_in_sidebar', 'require_admin', 'mode'].includes(k));
+      if (extra) haError('invalid_format', `extra keys not allowed @ data['${extra}']`);
+      if (typeof fields.title !== 'string') haError('invalid_format', "required key not provided @ data['title']");
+      const base = path.replace(/[^a-z0-9]+/g, '_');
+      let id = base;
+      for (let n = 2; dashboards.some((d) => d.id === id); n++) id = `${base}_${n}`;
+      const item = { id, show_in_sidebar: true, require_admin: false, mode: 'storage', ...fields };
+      dashboards.push(item);
+      return item;
+    }),
+    'lovelace/dashboards/delete': adminOnly((_, msg) => {
+      const item = dashboards.find((d) => d.id === msg.dashboard_id) ?? haError('not_found', `Unable to find dashboard_id ${String(msg.dashboard_id)}`);
+      dashboards.splice(dashboards.indexOf(item), 1);
+      delete layouts[String(item.url_path)];
+      return null;
+    }),
   };
   for (const domain of HELPER_DOMAINS) {
     const items = () => (helpers[domain] ??= []);
@@ -446,6 +487,8 @@ export async function startFakeHa(options: FakeHaOptions) {
     received,
     configs,
     helpers,
+    dashboards,
+    layouts,
     /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
     drop,
     /** Command types recorded and never answered while pings still are, as HA does with a script called directly until it ends. */

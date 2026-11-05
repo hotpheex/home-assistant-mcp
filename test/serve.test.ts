@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type Operation } from '../src/evaluator.ts';
+import { decideConfigRead, decideConfigWrite, decideRead, decideServiceCall, NAME_LOOKUP, planServiceCall, type Allowed, type Operation } from '../src/evaluator.ts';
 import { openGate } from '../src/gate.ts';
 import { parsePolicy } from '../src/policy.ts';
 import { TOOL_KIND, type ToolName } from '../src/tools.ts';
@@ -95,6 +95,7 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_write_config: { kind: 'automation', action: 'update', id: 'porch_light_1', config: { alias: 'Porch light at dusk' } },
   ha_list_services: {},
   ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
+  ha_get_dashboard: { dashboard: 'lovelace' },
 };
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
@@ -114,6 +115,8 @@ const PURE_READS = new Set([
   'trace/list',
   'trace/get',
   ...['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'].map((d) => `${d}/list`),
+  'lovelace/dashboards/list',
+  'lovelace/config',
 ]);
 test('the gate sends only an Allowed the evaluator issued, as issued: a forged, spread or altered one sends nothing', async (t) => {
   const ha = await fakeHa(t);
@@ -195,3 +198,20 @@ for (const era of ERAS) {
     });
   }
 }
+
+test('no Allowed a dashboard Grant gives can reach dashboard resources, which load JavaScript into every browser', async (t) => {
+  const ha = await fakeHa(t);
+  const gate = openGate(ha.url, new Map([['users', USERS_TOKEN], ['admin', ADMIN_TOKEN]] as const), () => {}, (reason) => assert.fail(reason));
+  t.after(() => gate.close());
+  await gate.connected;
+  const policy = parsePolicy(`version: 1\ncallers: { agent: { keys: [] } }\ngrants:\n  - caller: agent\n    config_write: dashboard\n`);
+  const allowed = [
+    decideRead(policy, 'agent', 'plain_read').allowed,
+    decideConfigRead(policy, 'agent', 'dashboard').allowed,
+    ...(['create', 'update', 'delete'] as const).map((action) => decideConfigWrite(policy, 'agent', { kind: 'dashboard', action, id: 'hall-tablet', config: action === 'delete' ? undefined : {} }).allowed),
+  ];
+  for (const type of ['lovelace/resources', 'lovelace/resources/create', 'lovelace/resources/update', 'lovelace/resources/delete', 'lovelace/dashboards/update']) {
+    for (const a of allowed) await assert.rejects(gate.send(a!, { type, res_type: 'module', url: '/local/x.js' }), /may not send/);
+  }
+  assert.deepEqual(ha.received.filter((r) => r.message.type.startsWith('lovelace/')), []);
+});
