@@ -17,6 +17,7 @@ export const CONFIG_KINDS = [
   'script',
   'scene',
   'helper',
+  'zone',
 ] as const;
 
 const target = z
