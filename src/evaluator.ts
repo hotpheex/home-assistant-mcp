@@ -229,12 +229,14 @@ function writeOf({ kind, action, id, config = {} }: ConfigWrite): Write {
 
 export type ConfigWriteDecision = { allowed: Allowed & { write: Write }; grants: number[] } | { allowed: undefined; grants: [] };
 
+/** Every config write is issued alike, so no write tool can reach the admin tier but through a Grant of its kind. */
+const configWriteOf = (grants: number[], write: () => Write): ConfigWriteDecision =>
+  grants.length === 0 ? { allowed: undefined, grants: [] } : { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: write() }), grants };
+
 /** A config write needs a config-write Grant of its kind; the Allowed names the exact request. */
 export function decideConfigWrite(policy: Policy, caller: string, write: ConfigWrite): ConfigWriteDecision {
   // A wizard helper has no config to write: only its flow, decided below, makes one.
-  const grants = write.kind === 'helper_entry' ? [] : writersOf(policy, caller, write.kind);
-  if (grants.length === 0) return { allowed: undefined, grants: [] };
-  return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: writeOf(write) }), grants };
+  return configWriteOf(write.kind === 'helper_entry' ? [] : writersOf(policy, caller, write.kind), () => writeOf(write));
 }
 
 /**
@@ -278,10 +280,8 @@ export interface BlueprintWrite {
  * Only save and delete are issued: HA's URL import would have HA fetch any URL from inside the network.
  */
 export function decideBlueprintWrite(policy: Policy, caller: string, { domain, action, path, yaml }: BlueprintWrite): ConfigWriteDecision {
-  const grants = writersOf(policy, caller, domain);
-  if (grants.length === 0) return { allowed: undefined, grants: [] };
   const command = action === 'delete' ? { type: 'blueprint/delete', domain, path } : { type: 'blueprint/save', domain, path, yaml, ...(action === 'update' && { allow_override: true }) };
-  return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: { via: 'websocket', command } }), grants };
+  return configWriteOf(writersOf(policy, caller, domain), () => ({ via: 'websocket', command }));
 }
 
 /** HA names a flow by a random hex id and an entry by a ULID; anything else could walk the REST path out of the flow API. */
@@ -295,8 +295,10 @@ export type HelperFlow =
   | { action: 'edit'; entry_id: string }
   | { action: 'delete'; entry_id: string };
 
-const FLOW_PATH = '/api/config/config_entries/flow';
-const OPTIONS_PATH = '/api/config/config_entries/options/flow';
+export const FLOW_PATH = '/api/config/config_entries/flow';
+export const OPTIONS_PATH = '/api/config/config_entries/options/flow';
+/** HA's helper integrations, and the entries of those it has set up. */
+export const HELPER_LISTS = { handlers: '/api/config/config_entries/flow_handlers?type=helper', entries: '/api/config/config_entries/entry?type=helper' } as const;
 function flowRequest(flow: HelperFlow): RestRequest {
   if (flow.action === 'start') return { method: 'POST', path: FLOW_PATH, body: { handler: flow.handler } };
   // HA names an options flow's handler by the entry it edits.
@@ -306,13 +308,17 @@ function flowRequest(flow: HelperFlow): RestRequest {
   return flow.action === 'step' ? { method: 'POST', path, body: flow.input } : { method: 'DELETE', path };
 }
 
+/** A flow's or entry's integration as HA reports it; `discovered` when HA, not a user, started the flow. */
+export interface FlowOrigin {
+  integration: string;
+  discovered?: boolean;
+}
+
 /**
- * A flow is driven, or an entry removed, only for an integration in HA's own live helper list, so `helper_entry` never
- * adds, changes or removes another integration or drives a discovery; `integration` is the flow's or entry's as HA reports it.
+ * A flow is driven, or an entry removed, only for an integration in HA's own live helper list, and never a flow HA started
+ * itself, so `helper_entry` never adds, changes or removes another integration or drives a discovery, even a helper's.
  */
-export function decideHelperFlow(policy: Policy, caller: string, flow: HelperFlow, integration: string, helpers: readonly string[]): ConfigWriteDecision {
-  const grants = writersOf(policy, caller, 'helper_entry');
-  const helper = helpers.includes(integration) && (flow.action === 'start' ? flow.handler === integration : FLOW_ID.test('entry_id' in flow ? flow.entry_id : flow.flow_id));
-  if (grants.length === 0 || !helper) return { allowed: undefined, grants: [] };
-  return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: { via: 'rest', request: flowRequest(flow) } }), grants };
+export function decideHelperFlow(policy: Policy, caller: string, flow: HelperFlow, { integration, discovered }: FlowOrigin, helpers: readonly string[]): ConfigWriteDecision {
+  const helper = !discovered && helpers.includes(integration) && (flow.action === 'start' ? flow.handler === integration : FLOW_ID.test('entry_id' in flow ? flow.entry_id : flow.flow_id));
+  return configWriteOf(helper ? writersOf(policy, caller, 'helper_entry') : [], () => ({ via: 'rest', request: flowRequest(flow) }));
 }

@@ -303,13 +303,13 @@ test('an entity_name update sends only its name, icon or aliases to the entity r
   assert.equal(ha.received.filter((r) => r.message.type === 'config/entity_registry/update').length, 5);
 });
 
-test('an entity_name write is refused, with nothing sent, for any other registry field, for create or delete, and for a Caller holding another kind', async (t) => {
+test('an entity_name write is refused, with nothing sent, for any other registry field (audited), for create or delete, and for a Caller holding another kind', async (t) => {
   const { ha, server, as } = await registry(t, {});
   const call = await as('namer');
   const update = { kind: 'entity_name', action: 'update', id: 'lock.front_door' };
   for (const field of [{ area_id: 'garage' }, { labels: [] }, { hidden_by: 'user' }, { disabled_by: 'user' }, { new_entity_id: 'lock.back_door' }]) {
     const refused = await call('ha_write_config', { ...update, config: { name: 'Front', ...field } });
-    assert.match(JSON.stringify(refused.result.content), new RegExp(`config\\.${Object.keys(field)[0]}: entity_name changes only name, icon and aliases`));
+    assert.match(JSON.stringify(refused.result.content), new RegExp(`Denied: entity_name changes only name, icon and aliases, not config\\.${Object.keys(field)[0]}\\. Nothing was sent`));
     assert.deepEqual(refused.sent, []);
   }
   const create = await call('ha_write_config', { ...update, action: 'create', config: { name: 'Front' } });
@@ -328,11 +328,13 @@ test('an entity_name write is refused, with nothing sent, for any other registry
 
   const allowed = await call('ha_write_config', { ...update, config: { aliases: ['Front'] } });
   assert.equal(allowed.result.isError, undefined);
+  const field = ['namer', 'entity_name', 'lock.front_door', 'deny', 'entity_name changes only name, icon and aliases'];
   assert.deepEqual(
-    server.audits().map((a) => [a.caller, a.kind, a.id, a.decision, a.grants]),
-    [['helper_writer', 'entity_name', 'lock.front_door', 'deny', []]],
-    'only the Grant denial is audited, since writes are audited on opt-in',
+    server.audits().map((a) => [a.caller, a.kind, a.id, a.decision, a.reason]),
+    [field, field, field, field, field, ['helper_writer', 'entity_name', 'lock.front_door', 'deny', undefined]],
+    'only refusals are audited, since writes are audited on opt-in',
   );
+  assert.doesNotMatch(JSON.stringify(server.audits()), /garage|back_door|Front/, 'audit lines carry names, never config');
 });
 
 test('zone writes share the helper path: zone WebSocket commands, an update merged over the stored zone, config served only to a zone writer', async (t) => {
@@ -440,7 +442,7 @@ test('a blueprint write is refused with nothing sent for the other domain, anoth
   assert.match(JSON.stringify(hidden.result.content), /no Grant for config writes of automation or script\. Do not retry/);
 
   const marked = await scripter.call('ha_write_blueprint', { domain: 'script', action: 'update', path: 'ping', yaml: `${scriptBlueprint}variables:\n  key: ${M}\n` });
-  assert.match(JSON.stringify(marked.result.content), /yaml carries a redacted value: put the real value in its place\. Nothing was sent/);
+  assert.match(JSON.stringify(marked.result.content), /yaml carries a redacted value at line 6: put the real value in its place\. Nothing was sent/);
   const imported = await scripter.call('ha_write_blueprint', { domain: 'script', action: 'create', path: 'ping2', url: 'https://example.com/b.yaml' });
   assert.match(JSON.stringify(imported.result.content), /Input validation error/);
   for (const refused of [...crossed, hidden, marked, imported]) assert.deepEqual(refused.sent, []);

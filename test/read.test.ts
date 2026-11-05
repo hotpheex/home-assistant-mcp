@@ -116,7 +116,7 @@ test('ha_get_logbook reads the last hour by default, optionally for one entity',
   assert.deepEqual([typo.total, typo.not_current_entity_ids], [0, ['lock.front_dor']]);
 });
 
-test('read: plain lists the seven read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
+test('read: plain lists the eight read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
   const { call, client } = await readerOn(t);
   const listed = await client.listTools();
   assert.deepEqual(listed.tools.map((tool) => tool.name), ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services', 'ha_get_statistics', 'ha_render_template', 'ha_get_dashboard']);
@@ -372,7 +372,7 @@ test('ha_render_template returns HA\'s template error, a render over its timeout
   const slow = '{% for i in range(10**9) %}{% endfor %}';
   assert.equal(await render({ template: slow }), 'Home Assistant refused the request: Exceeded maximum execution time of 5.0s');
   assert.equal(await render({ template: slow, timeout: 10.5 }), 'Home Assistant refused the request: Exceeded maximum execution time of 10.5s');
-  assert.match((await render({ template: slow, timeout: 31 })) ?? '', /^Input validation error: timeout/);
+  assert.match((await render({ template: slow, timeout: 15.5 })) ?? '', /^Input validation error: timeout: Too big: expected number to be <=15/);
   assert.equal(sent('render_template').length, 5);
   assert.equal(sent('unsubscribe_events').length, 2, 'only the two subscriptions HA opened are ended');
 
@@ -386,17 +386,28 @@ test('ha_render_template returns HA\'s template error, a render over its timeout
   assert.equal(await stalled, 'HA unavailable: Home Assistant did not answer. Try again later.');
 });
 
-test('ha_get_dashboard lists the dashboards, and reads a stored layout masked, naming the default lovelace by no url_path', async (t) => {
-  const { call, client, sent } = await readerOn(t);
+test('ha_get_dashboard lists the dashboards, and reads a stored layout masked, or one view of it, naming the default lovelace by no url_path', async (t) => {
+  const home = { title: 'Home', path: 'home', cards: [{ type: 'entities', entities: ['light.kitchen'] }] };
+  const lovelace = { title: 'Home', views: [home, { title: 'Notes', path: 'notes', cards: [{ type: 'markdown', content: 'x'.repeat(48_000) }] }] };
+  const { call, client, sent } = await readerOn(t, { layouts: { ...DASHBOARDS.layouts, lovelace } });
   assert.deepEqual(await call('ha_get_dashboard', {}), { dashboards: DASHBOARDS.dashboards });
-  assert.deepEqual(await call('ha_get_dashboard', { dashboard: 'lovelace' }), { dashboard: 'lovelace', config: DASHBOARDS.layouts!.lovelace });
   assert.deepEqual(await call('ha_get_dashboard', { dashboard: 'kitchen-wall' }), {
     dashboard: 'kitchen-wall',
     config: { views: [{ title: 'Wall', cards: [{ type: 'iframe', url: `https://${M}@cam.local/live` }] }] },
   });
-  assert.deepEqual(sent('lovelace/config').map((m) => Object.hasOwn(m, 'url_path') ? m.url_path : 'default'), ['default', 'kitchen-wall']);
-  for (const [dashboard, refusal] of [['nope', /Unknown config specified: nope/], ['spare-room', /No config found/]] as const) {
-    const failed = await client.callTool({ name: 'ha_get_dashboard', arguments: { dashboard } });
+  // A layout too big to return whole is read one view at a time, by index or path.
+  const whole = await client.callTool({ name: 'ha_get_dashboard', arguments: { dashboard: 'lovelace' } });
+  assert.match(JSON.stringify(whole.content), /narrow the query with a `view`, by its index or path/);
+  assert.deepEqual(await call('ha_get_dashboard', { dashboard: 'lovelace', view: 0 }), { dashboard: 'lovelace', view: home });
+  assert.deepEqual(await call('ha_get_dashboard', { dashboard: 'lovelace', view: 'home' }), { dashboard: 'lovelace', view: home });
+  assert.deepEqual(sent('lovelace/config').map((m) => Object.hasOwn(m, 'url_path') ? m.url_path : 'default'), ['kitchen-wall', 'default', 'default', 'default']);
+  for (const [args, refusal] of [
+    [{ dashboard: 'nope' }, /Unknown config specified: nope/],
+    [{ dashboard: 'spare-room' }, /No config found/],
+    [{ dashboard: 'lovelace', view: 2 }, /Dashboard lovelace has no view 2: it has 2 views, by index from 0 or by path home, notes/],
+    [{ view: 0 }, /Input validation error: view: is taken only with dashboard/],
+  ] as const) {
+    const failed = await client.callTool({ name: 'ha_get_dashboard', arguments: args });
     assert.equal(failed.isError, true);
     assert.match(JSON.stringify(failed.content), refusal);
   }

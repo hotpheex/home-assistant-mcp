@@ -7,7 +7,7 @@ import {
   ERR_INVALID_AUTH,
   type Connection,
 } from 'home-assistant-js-websocket';
-import { HELPER_DOMAINS, isIssued, type Allowed, type Operation, type Tier } from './evaluator.ts';
+import { FLOW_ID, FLOW_PATH, HELPER_DOMAINS, HELPER_LISTS, isIssued, OPTIONS_PATH, type Allowed, type Operation, type Tier } from './evaluator.ts';
 import type { Log } from './log.ts';
 
 const MINIMUM_HA = [2026, 10] as const;
@@ -57,14 +57,12 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
 const ONE_SHOT: Partial<Record<Operation, ReadonlySet<string>>> = {
   plain_read: new Set(['render_template']),
 };
-/** Config read may GET these: a stored config, and the lookups a helper flow needs; any other REST request must be the exact write an Allowed names. */
-const CONFIG_PATHS = [
-  /^\/api\/config\/(automation|script|scene)\/config\/[^/]+$/,
-  /^\/api\/config\/config_entries\/flow_handlers\?type=helper$/,
-  /^\/api\/config\/config_entries\/entry\?type=helper$/,
-  /^\/api\/config\/config_entries\/flow\/[0-9A-Za-z]+$/,
-  /^\/api\/config\/config_entries\/options\/flow\/[0-9A-Za-z]+$/,
-];
+const CONFIG_PATH = /^\/api\/config\/(automation|script|scene)\/config\/[^/]+$/;
+/** Config read may GET a stored config, and the lookups a helper flow needs; any other REST request must be the exact write an Allowed names. */
+const lookupable = (path: string) =>
+  CONFIG_PATH.test(path) ||
+  (Object.values(HELPER_LISTS) as string[]).includes(path) ||
+  [FLOW_PATH, OPTIONS_PATH].some((flows) => path.startsWith(`${flows}/`) && FLOW_ID.test(path.slice(flows.length + 1)));
 
 export type Command = { type: string } & Record<string, unknown>;
 /** A request to HA's config REST API, the only REST the server makes. */
@@ -103,7 +101,6 @@ export interface Gate {
   /** Answers with HA's status and JSON body, leaving their meaning to the caller. */
   rest(allowed: Allowed, request: RestRequest): Promise<{ status: number; body: unknown }>;
   close(): void;
-  /** Subscribes, answers with the first event, and unsubscribes. */
   subscribeOnce(allowed: Allowed, command: Command): Promise<unknown>;
 }
 
@@ -231,7 +228,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
     async rest(allowed, request) {
       issuedOnly(allowed);
       const write = allowed.write?.via === 'rest' && request === allowed.write.request;
-      const lookup = allowed.operation === 'config_read' && request.method === 'GET' && CONFIG_PATHS.some((p) => p.test(request.path));
+      const lookup = allowed.operation === 'config_read' && request.method === 'GET' && lookupable(request.path);
       if (!write && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
       if (!connections.get(allowed.tier)?.connected) throw new HaUnavailable();
       try {

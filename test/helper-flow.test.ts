@@ -18,19 +18,21 @@ const policy = policyOf(
 `,
 );
 
-/** Flows the operator has open on an integration that is not a helper: one HA discovered, one started in the UI. */
+/** Flows the operator has open: two HA discovered, the second for a helper integration, and one started in the UI. */
 const DISCOVERED = 'd15c0e2ed15c0e2ed15c0e2ed15c0e2e';
+const DISCOVERED_HELPER = 'd15c0e2e7e3f1a7ed15c0e2e7e3f1a7e';
 const OPERATOR_STARTED = '0be2a7020be2a7020be2a7020be2a702';
 
 async function house(t: TestContext, seed: Partial<FakeHaOptions> = {}) {
   const ha = await fakeHa(t, {
     flows: [
       { flow_id: DISCOVERED, handler: 'hue', source: 'zeroconf', step_id: 'user' },
+      { flow_id: DISCOVERED_HELPER, handler: 'template', source: 'zeroconf', step_id: 'user' },
       { flow_id: OPERATOR_STARTED, handler: 'hue', source: 'user', step_id: 'user' },
     ],
     ...seed,
   });
-  const server = await startServer(t, policy, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN, HAMCP_AUDIT_WRITES: 'true' });
+  const server = await startServer(t, policy, ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN, HAMCP_AUDIT_WRITES: 'true', HAMCP_AUDIT_READS: 'true' });
   const as = async (who: string) => {
     const client = await connect(t, server.url, keys[who]!.key, 'modern');
     return { client, call: adminCaller(ha, client) };
@@ -40,7 +42,7 @@ async function house(t: TestContext, seed: Partial<FakeHaOptions> = {}) {
 
 const HELPERS = 'GET /api/config/config_entries/flow_handlers?type=helper';
 
-test('a template sensor is created through its menu and form steps, each request with the admin token and audited by name', async (t) => {
+test('a template sensor is created through its menu and form steps, each request with the admin token and audited by name; a list is a read', async (t) => {
   const { ha, server, as } = await house(t);
   const { call } = await as('wizard');
 
@@ -69,9 +71,16 @@ test('a template sensor is created through its menu and form steps, each request
   const { handlers, entries } = body(listed.result) as { handlers: string[]; entries: unknown[] };
   assert.ok(handlers.includes('template') && handlers.includes('switch_as_x') && !handlers.includes('hue'));
   assert.deepEqual(entries, [{ entry_id: created.result.entry_id, domain: 'template', title: 'Door open minutes' }]);
+  // A list is a read, so it is audited only on the reads opt-in, and an oversize one is refused whole.
+  ha.entries.push({ ...ha.entries[0]!, entry_id: 'big', title: 'x'.repeat(48_000) });
+  const oversize = await call('ha_helper_flow', { action: 'list' });
+  assert.match(JSON.stringify(oversize.result.content), /over 48000 characters, so nothing was returned, and this tool offers no narrower query/);
+  const reads = server.audits().filter((a) => a.request !== undefined);
+  assert.deepEqual(reads.map((a) => [a.decision, a.request]), [['allow', { action: 'list' }], ['allow', { action: 'list' }]]);
 
   const named = (a: Record<string, unknown>) => [a.action, a.handler, a.flow_id, a.decision ?? a.outcome];
-  assert.deepEqual(server.audits().map(named), [
+  const writes = server.audits().filter((a) => a.request === undefined);
+  assert.deepEqual(writes.map(named), [
     ['start', 'template', undefined, 'allow'],
     ['start', 'template', flow_id, 'done'],
     ['step', 'template', flow_id, 'allow'],
@@ -79,8 +88,8 @@ test('a template sensor is created through its menu and form steps, each request
     ['step', 'template', flow_id, 'allow'],
     ['step', 'template', flow_id, 'done'],
   ]);
-  assert.equal(server.audits().at(-1)?.entry_id, created.result.entry_id);
-  assert.ok(server.audits().every((a) => a.kind === 'helper_entry' && a.tool === 'ha_helper_flow'));
+  assert.equal(writes.at(-1)?.entry_id, created.result.entry_id);
+  assert.ok(writes.every((a) => a.kind === 'helper_entry' && a.tool === 'ha_helper_flow'));
   assert.doesNotMatch(JSON.stringify(server.audits()), /Door open|\{\{|next_step_id/, 'audit lines carry names, never step input');
 });
 
@@ -98,32 +107,37 @@ test('a step HA rejects returns its field errors, and the same flow can be stepp
   assert.deepEqual(ha.entries.map((e) => [e.domain, e.title]), [['switch_as_x', 'switch.coffee_maker']]);
 });
 
-test('a setup, step or abort of an integration HA does not list as a helper is refused and audited, with nothing sent beyond the lookups', async (t) => {
+test('a setup, step or abort of a discovery, or of an integration HA does not list as a helper, is refused and audited, with nothing sent beyond the lookups', async (t) => {
   const { ha, server, as } = await house(t);
   const { call } = await as('wizard');
-  const refused = async (args: Record<string, unknown>, lookups: Record<string, unknown>[]) => {
+  const refused = async (args: Record<string, unknown>, lookups: Record<string, unknown>[], why = /does not list hue as a helper integration.*Do not retry/) => {
     const { result, sent } = await call('ha_helper_flow', args);
     assert.equal(result.isError, true);
-    assert.match(JSON.stringify(result.content), /does not list hue as a helper integration.*Do not retry/);
+    assert.match(JSON.stringify(result.content), why);
     assert.deepEqual(sent, lookups);
   };
   const progress = { type: 'config_entries/flow/progress' };
   await refused({ action: 'start', handler: 'hue' }, [{ type: HELPERS }]);
-  // A discovery is named by HA's progress list, so its step is never run, even by a read.
-  await refused({ action: 'step', flow_id: DISCOVERED, input: { host: '10.0.0.9' } }, [progress, { type: HELPERS }]);
-  await refused({ action: 'abort', flow_id: DISCOVERED }, [progress, { type: HELPERS }]);
+  // A discovery is named by HA's progress list, so its step is never run, even by a read, whatever its integration.
+  const discovery = /Home Assistant started flow \w+ itself, such as a discovery.*Do not retry/;
+  for (const flow_id of [DISCOVERED, DISCOVERED_HELPER]) {
+    await refused({ action: 'step', flow_id, input: { host: '10.0.0.9' } }, [progress, { type: HELPERS }], discovery);
+    await refused({ action: 'abort', flow_id }, [progress, { type: HELPERS }], discovery);
+  }
   const read = { type: `GET /api/config/config_entries/flow/${OPERATOR_STARTED}` };
   await refused({ action: 'step', flow_id: OPERATOR_STARTED, input: { host: '10.0.0.9' } }, [progress, read, { type: HELPERS }]);
   await refused({ action: 'abort', flow_id: OPERATOR_STARTED }, [progress, read, { type: HELPERS }]);
-  assert.deepEqual(ha.flows.map((f) => [f.flow_id, f.step_id]), [[DISCOVERED, 'user'], [OPERATOR_STARTED, 'user']]);
+  assert.deepEqual(ha.flows.map((f) => [f.flow_id, f.step_id]), [[DISCOVERED, 'user'], [DISCOVERED_HELPER, 'user'], [OPERATOR_STARTED, 'user']]);
   assert.deepEqual(ha.entries, []);
 
   assert.deepEqual(
     server.audits().map((a) => [a.action, a.handler, a.flow_id, a.decision, a.reason]),
     [
       ['start', 'hue', undefined, 'deny', 'not a helper integration'],
-      ['step', 'hue', DISCOVERED, 'deny', 'not a helper integration'],
-      ['abort', 'hue', DISCOVERED, 'deny', 'not a helper integration'],
+      ['step', 'hue', DISCOVERED, 'deny', 'a discovery'],
+      ['abort', 'hue', DISCOVERED, 'deny', 'a discovery'],
+      ['step', 'template', DISCOVERED_HELPER, 'deny', 'a discovery'],
+      ['abort', 'template', DISCOVERED_HELPER, 'deny', 'a discovery'],
       ['step', 'hue', OPERATOR_STARTED, 'deny', 'not a helper integration'],
       ['abort', 'hue', OPERATOR_STARTED, 'deny', 'not a helper integration'],
     ],
@@ -156,19 +170,24 @@ test('a Caller holding helper, or another config-write kind, but not helper_entr
     assert.match(JSON.stringify(denied.result.content), /no Grant for config writes of helper_entry\. Do not retry/);
     assert.deepEqual(denied.sent, []);
   }
-  assert.deepEqual(ha.flows.length, 2);
+  assert.deepEqual(ha.flows.length, 3);
   assert.deepEqual(server.audits().map((a) => [a.caller, a.tool, a.decision]), [['helperer', 'ha_helper_flow', 'deny'], ['automator', 'ha_helper_flow', 'deny']]);
 });
 
-test('a wizard helper is never read or written as a config: only its flow makes one', async (t) => {
-  const { as } = await house(t);
-  const { call } = await as('wizard');
-  const write = await call('ha_write_config', { kind: 'helper_entry', action: 'create', id: 'template', config: { name: 'x' } });
+test('a wizard helper is never read or written as a config: a Caller holding only helper_entry is not shown the config write, and only its flow makes one', async (t) => {
+  const { server, as } = await house(t);
+  const { client, call } = await as('wizard');
+  assert.ok(!(await client.listTools()).tools.some((d) => d.name === 'ha_write_config'));
+  const hidden = await call('ha_write_config', { kind: 'helper_entry', action: 'create', id: 'template', config: { name: 'x' } });
+  assert.match(JSON.stringify(hidden.result.content), /no Grant for config writes of automation or script or scene or helper or entity_name or zone or dashboard\. Do not retry/);
+  assert.deepEqual(server.audits().map((a) => [a.caller, a.tool, a.decision]), [['wizard', 'ha_write_config', 'deny']]);
+  const write = await (await as('automator')).call('ha_write_config', { kind: 'helper_entry', action: 'create', id: 'template', config: { name: 'x' } });
   const read = await call('ha_get_config', { kind: 'helper_entry', id: 'template' });
   for (const { result, sent } of [write, read]) {
     assert.match(JSON.stringify(result.content), /kind: a wizard helper is set up through its flow, not as a config/);
     assert.deepEqual(sent, []);
   }
+  assert.deepEqual(hidden.sent, []);
 });
 
 const progress = { type: 'config_entries/flow/progress' };

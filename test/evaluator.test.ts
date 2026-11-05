@@ -194,7 +194,7 @@ test('property: only helper_entry allows a wizard-helper flow, never helper, and
     fc.property(writeGrants, flow, (grants, f) => {
       const policy = asPolicy(grants as unknown as Rule[], []);
       const integration = f.action === 'start' ? f.handler : 'template';
-      const allowed = decideHelperFlow(policy, 'agent', f, integration, ['template']).allowed !== undefined;
+      const allowed = decideHelperFlow(policy, 'agent', f, { integration }, ['template']).allowed !== undefined;
       const helper = decideConfigWrite(policy, 'agent', { kind: 'helper', action: 'create', id: 'input_boolean.x', config: {} }).allowed !== undefined;
       const entry = decideConfigWrite(policy, 'agent', { kind: 'helper_entry', action: 'create', id: 'x', config: {} }).allowed !== undefined;
       return (!allowed || holds(grants, 'helper_entry')) && helper === holds(grants, 'helper') && !entry;
@@ -234,15 +234,15 @@ test('property: a dashboard write or config read is decided by a dashboard Grant
   );
 });
 
-test("property: a flow is allowed only for an integration in HA's helper list, and only within HA's flow API", () => {
+test("property: a flow is allowed only for an integration in HA's helper list, never for one HA started, and only within HA's flow API", () => {
   fc.assert(
-    fc.property(flow, fc.constantFrom('template', 'hue'), (f, integration) => {
+    fc.property(flow, fc.constantFrom('template', 'hue'), fc.boolean(), (f, integration, discovered) => {
       const policy = asPolicy([{ caller: 'agent', config_write: 'helper_entry' }] as unknown as Rule[], []);
-      const { allowed } = decideHelperFlow(policy, 'agent', f, integration, ['template']);
+      const { allowed } = decideHelperFlow(policy, 'agent', f, { integration, discovered }, ['template']);
       if (allowed?.write.via !== 'rest') return allowed === undefined;
       const { path } = allowed.write.request;
       const api = /^\/api\/config\/config_entries\/((options\/)?flow|entry\/)/.test(new URL(path, 'http://ha').pathname);
-      return integration === 'template' && api && !path.includes('..') && (f.action !== 'delete' || allowed.write.request.method === 'DELETE');
+      return integration === 'template' && !discovered && api && !path.includes('..') && (f.action !== 'delete' || allowed.write.request.method === 'DELETE');
     }),
   );
 });

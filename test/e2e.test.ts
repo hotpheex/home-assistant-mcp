@@ -202,7 +202,7 @@ denies:
     for (const fn of cleanups.reverse()) fn();
   });
 
-  e2e('each of the ten tools runs once, and no canary appears in any byte they return', async (t) => {
+  e2e('every read, a service call and a config write run once, and no canary appears in any byte they return', async (t) => {
     // Each canary sits in what HA itself returns, so only the server keeps it out.
     const tokens = new Set<string>();
     const collectTokens = async () => {
@@ -240,6 +240,13 @@ denies:
     let traces: { run_id: string }[] = [];
     await eventually(async () => (traces = listed<{ run_id: string }>((await call('ha_list_traces', { kind: 'automation', id: 'canary' })).traces)).length > 0, 'a trace', 30_000);
     await call('ha_get_trace', { kind: 'automation', id: 'canary', run_id: traces[0]!.run_id, sections: ['trace', 'config', 'context'] });
+    await call('ha_get_statistics', {});
+    assert.deepEqual((await call('ha_get_statistics', { statistic_ids: ['sensor.e2e_none'], period: 'day' })).statistics, []);
+    await call('ha_render_template', { template: "{{ states('switch.e2e_plug') }}" });
+    await call('ha_get_dashboard', {});
+    await call('ha_get_logs', { limit: 10 });
+    assert.ok(Number((await call('ha_list_blueprints', {})).total) > 0, "HA's own blueprints are listed");
+    assert.ok(((await call('ha_helper_flow', { action: 'list' })).handlers as string[]).includes('template'));
     await call('ha_write_config', {
       kind: 'automation',
       action: 'create',

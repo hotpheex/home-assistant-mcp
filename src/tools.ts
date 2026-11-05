@@ -15,14 +15,18 @@ import {
   decideServiceCall,
   ENTITY_NAME_FIELDS,
   FLOW_ID,
+  FLOW_PATH,
   grantsFor,
   HELPER_DOMAINS,
+  HELPER_LISTS,
   mergedUpdate,
+  OPTIONS_PATH,
   planServiceCall,
   writersOf,
   type Allowed,
   type ConfigKind,
   type ConfigWrite,
+  type FlowOrigin,
   type HelperFlow,
   type Operation,
   decideBlueprintWrite,
@@ -31,7 +35,7 @@ import {
 import { HaUnavailable, OutcomeUnknown, type Command, type Gate, type RestRequest } from './gate.ts';
 import { auditFor, type Audit } from './log.ts';
 import { CONFIG_KINDS, type Policy } from './policy.ts';
-import { maskSecrets, redactedPath, stripBearerTokens } from './redaction.ts';
+import { maskSecrets, REDACTED, redactedPath, stripBearerTokens } from './redaction.ts';
 import { domainsOf, expandAll, extract, mergeTarget } from './resolver.ts';
 
 /** The Operation kind a Caller must hold to see and call each tool. */
@@ -62,6 +66,7 @@ const OPERATION_NAME: Record<Operation, string> = {
   service_call: 'service calls',
   config_write: 'config writes',
 };
+const writesOf = (kinds: readonly string[]) => `config writes of ${kinds.join(' or ')}`;
 
 /** The allowing Grants, what a denial names, and the names to audit. */
 interface Decided {
@@ -91,6 +96,8 @@ interface ToolSpec<Input extends z.ZodType> {
   decide?(args: z.output<Input>, policy: Policy, caller: string): Decided;
   /** The arguments an allowed read's audit names, for a tool whose input is more than names. */
   auditable?(args: z.output<Input>): Record<string, unknown>;
+  /** For a write tool, the calls that only read, so they are capped and audited as reads are. */
+  reads?(args: z.output<Input>): boolean;
   run(args: z.output<Input>, ctx: Context): Promise<CallToolResult>;
 }
 
@@ -146,6 +153,7 @@ const NARROWING: Partial<Record<ToolName, string>> = {
   ha_render_template: 'a template that renders less',
   ha_get_logs: 'a level, a query or a smaller limit',
   ha_list_blueprints: 'a domain or a smaller limit',
+  ha_get_dashboard: 'a `view`, by its index or path',
 };
 const charsOf = (result: CallToolResult) => result.content.reduce((n, c) => n + (c.type === 'text' ? c.text.length : 0), 0);
 const READS: ReadonlySet<Operation> = new Set(['plain_read', 'config_read']);
@@ -184,7 +192,6 @@ async function answered(request: Promise<unknown>): Promise<unknown> {
   }
 }
 
-/** Sends over WebSocket. */
 async function send<T>(ctx: Context, allowed: Allowed | undefined, command: Command): Promise<T> {
   if (!allowed) throw new Error('sent without an Allowed');
   return (await answered(ctx.gate.send(allowed, command))) as T;
@@ -197,6 +204,23 @@ function writeResult(value: unknown): CallToolResult {
   const marker = `\n[truncated: the response was ${full.length} characters, over the ${CHAR_CAP}-character cap; the call ran]`;
   const kept = full.slice(0, CHAR_CAP - marker.length).replace(/[\uD800-\uDBFF]$/, '');
   return { content: [{ type: 'text', text: kept + marker }] };
+}
+
+/** A masked value written back would replace the real secret, so a write carrying the marker is refused whole, saying where. */
+function refuseRedacted(ctx: Context, names: Record<string, unknown>, field: string, value: unknown) {
+  const marked = redactedPath(value);
+  if (marked === undefined) return;
+  ctx.audit({ ...names, decision: 'deny', reason: `${field} carries a redacted value` });
+  const at = typeof value === 'string' ? `line ${value.slice(0, value.indexOf(REDACTED)).split('\n').length}` : marked;
+  throw new ToolFailure(`${field} carries a redacted value at ${at}: put the real value in its place. Nothing was sent to Home Assistant.`);
+}
+
+/** Recorded before the write and any lookup in it, so a write refused by its lookup, failed, or of unknown outcome still leaves a record. */
+async function writing<T>(ctx: Context, names: Record<string, unknown>, grants: number[], write: () => Promise<T>, done: (result: T) => Record<string, unknown> = () => ({})) {
+  if (ctx.options.auditWrites) ctx.audit({ ...names, decision: 'allow', grants });
+  const result = await write();
+  if (ctx.options.auditWrites) ctx.audit({ ...names, outcome: 'done', ...done(result) });
+  return result;
 }
 
 /** Every read masks secrets, so Redaction means one thing on every read. */
@@ -810,10 +834,6 @@ const writeConfig = defineTool({
       if (action === 'delete' && config !== undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: 'is not taken by delete' });
       if (kind === 'entity_name' && action !== 'update') ctx.addIssue({ code: 'custom', path: ['action'], message: 'entity_name takes only update' });
       if (kind === 'entity_name' && !entityId.safeParse(id).success) ctx.addIssue({ code: 'custom', path: ['id'], message: 'must be an entity_id such as light.kitchen' });
-      for (const key of kind === 'entity_name' ? Object.keys(config ?? {}) : []) {
-        const allowed = (ENTITY_NAME_FIELDS as readonly string[]).includes(key);
-        if (!allowed) ctx.addIssue({ code: 'custom', path: ['config', key], message: 'entity_name changes only name, icon and aliases' });
-      }
       if (kind === 'dashboard' && id === 'lovelace' && action !== 'update') ctx.addIssue({ code: 'custom', path: ['id'], message: 'the default dashboard lovelace can only be updated' });
       if (kind === 'dashboard' && action === 'create' && Object.keys(config ?? {}).some((k) => !DASHBOARD_SIDEBAR.includes(k))) {
         ctx.addIssue({ code: 'custom', path: ['config'], message: 'a new dashboard takes only title, icon, show_in_sidebar and require_admin' });
@@ -821,36 +841,40 @@ const writeConfig = defineTool({
       if (kind === 'helper_entry') ctx.addIssue({ code: 'custom', path: ['kind'], message: NOT_A_CONFIG });
     }),
   annotations: { readOnlyHint: false, destructiveHint: true },
+  // A wizard helper is written only through its flow.
+  kinds: CONFIG_KINDS.filter((k) => k !== 'helper_entry'),
   decide: (change: ConfigWrite, policy, caller) => ({
     ...decideConfigWrite(policy, caller, change),
-    lacking: `config writes of ${change.kind}`,
+    lacking: writesOf([change.kind]),
     request: { kind: change.kind, action: change.action, id: change.id },
   }),
   async run(change: ConfigWrite, ctx) {
     const { kind, action, id } = change;
-    let allowed = ctx.allowed;
-    if (!allowed) throw new Error('config write sent without an Allowed');
-    const marked = redactedPath(change.config);
-    if (marked !== undefined) {
-      ctx.audit({ kind, action, id, decision: 'deny', reason: 'config carries a redacted value' });
-      throw new ToolFailure(`config carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
+    const names = { kind, action, id };
+    if (!ctx.allowed) throw new Error('config write sent without an Allowed');
+    let allowed: Allowed = ctx.allowed;
+    // Refused after the Grant, so a Caller reaching for another registry field is audited (ADR 0010).
+    const others = kind === 'entity_name' ? Object.keys(change.config ?? {}).filter((k) => !(ENTITY_NAME_FIELDS as readonly string[]).includes(k)) : [];
+    if (others.length > 0) {
+      ctx.audit({ ...names, decision: 'deny', reason: 'entity_name changes only name, icon and aliases' });
+      throw new ToolFailure(`Denied: entity_name changes only name, icon and aliases, not ${others.map((k) => `config.${k}`).join(', ')}. Nothing was sent to Home Assistant.`);
     }
-    // Recorded before the lookup, so a write refused by its lookup, failed, or of unknown outcome still leaves a record.
-    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
-    if (kind === 'dashboard') allowed = await dashboardLookup(ctx, change, allowed);
-    // A new helper or zone takes its id from its name, so only a collection update has a stored item to look up; HA's registry update is partial.
-    else if (kind !== 'entity_name' && (action === 'update' || (!collectionOf(kind, id) && action === 'create'))) {
-      const item = await stored(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, kind, id);
-      if (action === 'create' && item) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
-      if (action === 'update' && !item) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
-      if (item) allowed = mergedUpdate(allowed, item);
-    }
-    const { write } = allowed;
-    if (!write) throw new Error('config write sent without a write');
-    const result = write.via === 'websocket' ? await send(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
-    if (ctx.options.auditWrites) ctx.audit({ kind, action, id, outcome: 'done' });
+    refuseRedacted(ctx, names, 'config', change.config);
+    const result = await writing(ctx, names, ctx.grants, async () => {
+      if (kind === 'dashboard') allowed = await dashboardLookup(ctx, change, allowed);
+      // A new helper or zone takes its id from its name, so only a collection update has a stored item to look up; HA's registry update is partial.
+      else if (kind !== 'entity_name' && (action === 'update' || (!collectionOf(kind, id) && action === 'create'))) {
+        const item = await stored(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, kind, id);
+        if (action === 'create' && item) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
+        if (action === 'update' && !item) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);
+        if (item) allowed = mergedUpdate(allowed, item);
+      }
+      const { write } = allowed;
+      if (!write) throw new Error('config write sent without a write');
+      return write.via === 'websocket' ? await send(ctx, allowed, write.command) : await rest(ctx, allowed, write.request);
+    });
     // A helper or zone write echoes the whole stored item, keys the Caller did not send included.
-    return writeResult({ kind, action, id, result: maskSecrets(stripBearerTokens(result)) });
+    return writeResult({ ...names, result: maskSecrets(stripBearerTokens(result)) });
   },
 });
 
@@ -859,14 +883,14 @@ const renderTemplate = defineTool({
   description: [
     'Renders one Home Assistant template, such as one meant for an automation, and returns its `result` and the `listeners` (entities, domains and time) that would render it again, or Home Assistant\'s template error.',
     'Undefined names are errors, as in Home Assistant\'s template editor, so give the values of the template\'s own names in `variables`.',
-    'A render that takes longer than `timeout` seconds (default 5, at most 30) fails.',
+    'A render that takes longer than `timeout` seconds (default 5, at most 15) fails.',
     MASKED,
     'Example: {"template": "{{ states(\'sensor.kitchen_temperature\') | float > 20 }}"} tells whether the kitchen is above 20 degrees.',
   ].join(' '),
   input: z.strictObject({
     template: z.string().min(1).describe('The template, such as {{ states(\'light.kitchen\') }}.'),
     variables: z.record(z.string(), z.unknown()).optional().describe('Values for names the template uses.'),
-    timeout: z.number().positive().max(30).default(5).describe('Seconds the render may take, at most 30.'),
+    timeout: z.number().positive().max(15).default(5).describe('Seconds the render may take, at most 15.'),
   }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   // A template and its variables may carry anything, so the audit names only the timeout.
@@ -885,18 +909,29 @@ const getDashboard = defineTool({
   title: 'Get dashboard',
   description: [
     'Without `dashboard`, lists the dashboards stored in Home Assistant, each with its URL path, title and sidebar settings.',
-    'With `dashboard`, returns that dashboard\'s stored layout; `lovelace` names the default dashboard.',
+    'With `dashboard`, returns that dashboard\'s stored layout, or with `view` only that view, named by its index from 0 or its path; `lovelace` names the default dashboard.',
     'A dashboard whose layout Home Assistant generates has no stored layout, so reading it is refused.',
     MASKED,
-    'Example: {"dashboard": "kitchen-wall"}.',
+    'Example: {"dashboard": "kitchen-wall", "view": 0}.',
   ].join(' '),
-  input: z.strictObject({
-    dashboard: z.string().min(1).optional().describe('A dashboard URL path, such as kitchen-wall; lovelace is the default dashboard.'),
-  }),
+  input: z
+    .strictObject({
+      dashboard: z.string().min(1).optional().describe('A dashboard URL path, such as kitchen-wall; lovelace is the default dashboard.'),
+      view: z.union([z.number().int().min(0), z.string().min(1)]).optional().describe("One view of the dashboard: its index from 0, or its path."),
+    })
+    .superRefine(({ dashboard, view }, ctx) => {
+      if (dashboard === undefined && view !== undefined) ctx.addIssue({ code: 'custom', path: ['view'], message: 'is taken only with dashboard' });
+    }),
   annotations: { readOnlyHint: true, destructiveHint: false },
-  async run({ dashboard }, ctx) {
+  async run({ dashboard, view }, ctx) {
     if (dashboard === undefined) return text({ dashboards: await read(ctx, { type: 'lovelace/dashboards/list' }) });
-    return text({ dashboard, config: await read(ctx, { type: 'lovelace/config', ...dashboardPath(dashboard) }) });
+    const config = await read<{ views?: { path?: string }[] }>(ctx, { type: 'lovelace/config', ...dashboardPath(dashboard) });
+    if (view === undefined) return text({ dashboard, config });
+    const views = config.views ?? [];
+    const found = typeof view === 'number' ? views[view] : views.find((v) => v.path === view);
+    if (found) return text({ dashboard, view: found });
+    const paths = views.flatMap((v) => v.path ?? []);
+    throw new ToolFailure(`Dashboard ${dashboard} has no view ${view}: it has ${views.length} views, by index from 0${paths.length > 0 ? ` or by path ${paths.join(', ')}` : ''}.`);
   },
 });
 
@@ -959,28 +994,24 @@ const writeBlueprint = defineTool({
   kinds: ['automation', 'script'],
   decide: (change: BlueprintWrite, policy, caller) => ({
     ...decideBlueprintWrite(policy, caller, change),
-    lacking: `config writes of ${change.domain}`,
+    lacking: writesOf([change.domain]),
     request: { domain: change.domain, action: change.action, path: change.path },
   }),
   async run({ domain, action, path, yaml }: BlueprintWrite, ctx) {
     const { allowed } = ctx;
     if (allowed?.write?.via !== 'websocket') throw new Error('blueprint write sent without an Allowed');
-    if (redactedPath(yaml) !== undefined) {
-      ctx.audit({ domain, action, path, decision: 'deny', reason: 'yaml carries a redacted value' });
-      throw new ToolFailure('yaml carries a redacted value: put the real value in its place. Nothing was sent to Home Assistant.');
-    }
-    if (ctx.options.auditWrites) ctx.audit({ domain, action, path, decision: 'allow', grants: ctx.grants });
-    const result = await send(ctx, allowed, allowed.write.command);
-    if (ctx.options.auditWrites) ctx.audit({ domain, action, path, outcome: 'done' });
-    return writeResult({ domain, action, path, result });
+    const names = { domain, action, path };
+    refuseRedacted(ctx, names, 'yaml', yaml);
+    const { command } = allowed.write;
+    const result = await writing(ctx, names, ctx.grants, () => send(ctx, allowed, command));
+    return writeResult({ ...names, result });
   },
 });
 
-const HELPER_LIST = '/api/config/config_entries/flow_handlers?type=helper';
 /** The arguments each action takes; any other is refused. */
 const FLOW_ARGS = { list: [], start: ['handler'], edit: ['entry_id'], step: ['flow_id', 'input'], abort: ['flow_id'], delete: ['entry_id'] } as const;
 
-/** An entry's integration, by a lookup that runs nothing. */
+/** Reads the entry rather than a flow, so naming the integration runs no flow step. */
 async function entryDomain(ctx: Context, entryId: string): Promise<string> {
   try {
     return (await send<{ config_entry: { domain: string } }>(ctx, ctx.allowed, { type: 'config_entries/get_single', entry_id: entryId })).config_entry.domain;
@@ -991,15 +1022,16 @@ async function entryDomain(ctx: Context, entryId: string): Promise<string> {
 }
 
 /**
- * A flow's integration as HA reports it, and for an options flow the entry it edits. The progress list names a discovery
- * without running it; HA lists no other flow, and reading one re-runs its current step with no input.
+ * A flow's integration as HA reports it, and for an options flow the entry it edits. The progress list names a flow HA
+ * started, such as a discovery, without running it; HA lists no other flow, and reading one re-runs its current step with no input.
  */
-async function flowOf(ctx: Context, flowId: string): Promise<{ integration: string; entry_id?: string }> {
+async function flowOf(ctx: Context, flowId: string): Promise<FlowOrigin & { entry_id?: string }> {
   const listed = (await send<{ flow_id: string; handler: string }[]>(ctx, ctx.allowed, { type: 'config_entries/flow/progress' })).find((f) => f.flow_id === flowId);
+  if (listed) return { integration: listed.handler, discovered: true };
   const read = async (path: string) => (await rest(ctx, ctx.allowed, { method: 'GET', path: `${path}/${flowId}` })) as { handler: string } | undefined;
-  const flow = listed ?? (await read('/api/config/config_entries/flow'));
+  const flow = await read(FLOW_PATH);
   if (flow) return { integration: flow.handler };
-  const options = await read('/api/config/config_entries/options/flow');
+  const options = await read(OPTIONS_PATH);
   if (!options) throw new ToolFailure(`No setup or options flow ${flowId} is in progress; start or edit one.`);
   return { integration: await entryDomain(ctx, options.handler), entry_id: options.handler };
 }
@@ -1031,43 +1063,44 @@ const helperFlow = defineTool({
     }),
   annotations: { readOnlyHint: false, destructiveHint: true },
   kinds: ['helper_entry'],
+  reads: ({ action }) => action === 'list',
   // The Allowed here is for the lookups; the write is decided once HA has named the flow's integration.
   decide: ({ action, handler, flow_id, entry_id }, policy, caller) => ({
     ...decideConfigRead(policy, caller, 'helper_entry'),
-    lacking: 'config writes of helper_entry',
+    lacking: writesOf(['helper_entry']),
     request: { kind: 'helper_entry', action, handler, flow_id, entry_id },
   }),
   async run({ action, handler, flow_id, entry_id, input }, ctx) {
-    const lookup = (path: string) => rest(ctx, ctx.allowed, { method: 'GET', path });
+    const lookup = async <T>(path: string) => (await rest(ctx, ctx.allowed, { method: 'GET', path })) as T;
     if (action === 'list') {
-      const [handlers, entries] = await Promise.all([lookup(HELPER_LIST), lookup('/api/config/config_entries/entry?type=helper')]);
-      const named = (entries as { entry_id: string; domain: string; title: string }[]).map(({ entry_id, domain, title }) => ({ entry_id, domain, title }));
-      return writeResult(maskSecrets({ handlers: (handlers as string[]).sort(), entries: named }));
+      const [handlers, entries] = await Promise.all([lookup<string[]>(HELPER_LISTS.handlers), lookup<{ entry_id: string; domain: string; title: string }[]>(HELPER_LISTS.entries)]);
+      const named = entries.map(({ entry_id, domain, title }) => ({ entry_id, domain, title }));
+      return text(maskSecrets({ handlers: handlers.sort(), entries: named }));
     }
     const names = { kind: 'helper_entry', action, flow_id, entry_id };
-    const marked = redactedPath(input);
-    if (marked !== undefined) {
-      ctx.audit({ ...names, decision: 'deny', reason: 'input carries a redacted value' });
-      throw new ToolFailure(`input carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
-    }
+    refuseRedacted(ctx, names, 'input', input);
     const found = handler !== undefined ? { integration: handler } : entry_id !== undefined ? { integration: await entryDomain(ctx, entry_id), entry_id } : await flowOf(ctx, flow_id!);
     const { integration } = found;
     const options = found.entry_id !== undefined;
     const flow = (
       action === 'start' ? { action, handler } : action === 'step' ? { action, flow_id, input, options } : action === 'abort' ? { action, flow_id, options } : { action, entry_id }
     ) as HelperFlow;
-    const decision = decideHelperFlow(ctx.policy, ctx.auth.caller, flow, integration, (await lookup(HELPER_LIST)) as string[]);
-    const audit = (record: Record<string, unknown>) => ctx.audit({ ...names, handler: integration, entry_id: found.entry_id, ...record });
+    const decision = decideHelperFlow(ctx.policy, ctx.auth.caller, flow, found, await lookup<string[]>(HELPER_LISTS.handlers));
+    const named = { ...names, handler: integration, entry_id: found.entry_id };
     if (!decision.allowed) {
-      audit({ decision: 'deny', grants: [], reason: 'not a helper integration' });
-      throw new ToolFailure(`Denied: Home Assistant does not list ${integration} as a helper integration, so this Caller may not drive its flows or delete its entries. Do not retry this call.`);
+      const [reason, why] = found.discovered
+        ? ['a discovery', `Home Assistant started flow ${flow_id} itself, such as a discovery, so this Caller may not drive it`]
+        : ['not a helper integration', `Home Assistant does not list ${integration} as a helper integration, so this Caller may not drive its flows or delete its entries`];
+      ctx.audit({ ...named, decision: 'deny', grants: [], reason });
+      throw new ToolFailure(`Denied: ${why}. Do not retry this call.`);
     }
     const { write } = decision.allowed;
     if (write.via !== 'rest') throw new Error('a helper flow is driven over REST');
-    if (ctx.options.auditWrites) audit({ decision: 'allow', grants: decision.grants });
-    const result = (await rest(ctx, decision.allowed, write.request)) as { flow_id?: string; type?: string; result?: { entry_id?: string } } | null;
-    const created = result?.type === 'create_entry' ? result.result?.entry_id : undefined;
-    if (ctx.options.auditWrites) audit({ outcome: 'done', flow_id: flow_id ?? result?.flow_id, entry_id: found.entry_id ?? created });
+    type Answer = { flow_id?: string; type?: string; result?: { entry_id?: string } } | null;
+    const result = await writing(ctx, named, decision.grants, async () => (await rest(ctx, decision.allowed, write.request)) as Answer, (r) => ({
+      flow_id: flow_id ?? r?.flow_id,
+      entry_id: found.entry_id ?? (r?.type === 'create_entry' ? r.result?.entry_id : undefined),
+    }));
     return writeResult(maskSecrets(result));
   },
 });
@@ -1146,7 +1179,7 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
     if (!holds(name)) {
       audited({ decision: 'deny', grants: [] });
       const { kinds } = TOOLS[name];
-      const lacking = kinds === undefined ? OPERATION_NAME[operation] : `config writes of ${kinds.join(' or ')}`;
+      const lacking = kinds === undefined ? OPERATION_NAME[operation] : writesOf(kinds);
       return failure(`Denied: this Caller holds no Grant for ${lacking}. Do not retry this call.`);
     }
     const tool = TOOLS[name];
@@ -1163,13 +1196,14 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
       audited({ ...decided.request, decision: 'deny', grants: [] });
       return failure(`Denied: this Caller holds no Grant for ${decided.lacking}. Do not retry this call.`);
     }
-    if (options.auditReads && READS.has(operation)) {
+    const reading = READS.has(operation) || (tool.reads?.(args.data) ?? false);
+    if (options.auditReads && reading) {
       audited({ decision: 'allow', grants: decided.grants, request: tool.auditable?.(args.data) ?? args.data });
     }
     try {
       const result = await tool.run(args.data, { ...decided, policy, auth, gate, audit: audited, options });
       // A read is refused whole rather than cut off, so the Caller never reasons over a truncated answer.
-      if (READS.has(operation) && charsOf(result) > CHAR_CAP) {
+      if (reading && charsOf(result) > CHAR_CAP) {
         const narrowing = NARROWING[name];
         const over = `The response is over ${CHAR_CAP} characters, so nothing was returned`;
         return failure(narrowing === undefined ? `${over}, and this tool offers no narrower query.` : `${over}: narrow the query with ${narrowing}.`);

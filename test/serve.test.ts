@@ -108,7 +108,7 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
 };
 /** Further holder calls, for the actions a tool's sample leaves out. */
 const MORE_ARGS: Partial<Record<ToolName, Record<string, unknown>[]>> = {
-  ha_helper_flow: [{ action: 'edit', entry_id: TEMPLATE_ENTRY }, { action: 'delete', entry_id: TEMPLATE_ENTRY }],
+  ha_helper_flow: [{ action: 'list' }, { action: 'edit', entry_id: TEMPLATE_ENTRY }, { action: 'delete', entry_id: TEMPLATE_ENTRY }],
 };
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
