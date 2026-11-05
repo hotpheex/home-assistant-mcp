@@ -80,6 +80,8 @@ grants:
       - domain: '*'
   - caller: reader
     config_write: helper
+  - caller: reader
+    config_write: zone
 denies:
   - caller: reader
     services: [switch.turn_off]

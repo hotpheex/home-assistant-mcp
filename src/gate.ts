@@ -40,6 +40,7 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'config/entity_registry/list',
     ...HELPER_DOMAINS.map((d) => `${d}/list`),
     'system_log/list',
+    'zone/list',
   ]),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
