@@ -93,12 +93,12 @@ Each Grant gives one kind of access:
 
 | Grant | Gives |
 |---|---|
-| `read: plain` | States, history, logbook, registries and the service list of the whole house. |
+| `read: plain` | States, history, logbook, registries and the service list of the whole house, and template rendering. |
 | `read: config` | The config and traces of every automation and script. |
 | `services: [...]` with `targets` | Those services on entities in the named domains, areas (`area_id`) or labels (`label_id`). Omit `targets` for services that take none. Includes plain read. |
 | `config_write: automation \| script \| scene \| helper` | Create, update and delete items of that kind (`helper` covers `input_*`, `counter`, `timer` and `schedule`). Includes both reads. |
 
-Two Grants deserve care. Plain read is not scoped: a Caller that can read sees every entity, including people's locations. A config write is full control of the house, since an automation can call any service. [SECURITY.md](SECURITY.md) explains exactly what each Grant reveals and how calls are checked.
+Two Grants deserve care. Plain read is not scoped: a Caller that can read sees every entity, including people's locations, and a template it renders can print a camera's live access token. A config write is full control of the house, since an automation can call any service. [SECURITY.md](SECURITY.md) explains exactly what each Grant reveals and how calls are checked.
 
 To get editor validation, point the YAML language server at the JSON Schema that each release publishes:
 

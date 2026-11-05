@@ -303,4 +303,18 @@ denies:
     assert.equal(await running.exited, 1);
     assert.ok(running.records.some((r) => r.level === 'error' && /rejected the users-tier token/.test(String(r.msg))));
   });
+
+  e2e('a template renders from its subscription\'s first event, and a render error or an over-long render comes back as HA\'s error', async (t) => {
+    const client = await connect(t, server.url(), operator.key, 'modern');
+    const render = (args: Record<string, unknown>) => client.callTool({ name: 'ha_render_template', arguments: args });
+    const plug = (await owner.sendMessagePromise<{ entity_id: string; state: string }[]>({ type: 'get_states' })).find((s) => s.entity_id === 'switch.e2e_plug');
+    const rendered = await render({ template: "{{ states('switch.e2e_plug') }} at {{ when }}", variables: { when: 'dusk' } });
+    assert.deepEqual(body(rendered), { result: `${plug?.state} at dusk`, listeners: { all: false, domains: [], entities: ['switch.e2e_plug'], time: false } });
+    const undefinedName = await render({ template: '{{ nope }}' });
+    assert.ok(undefinedName.isError);
+    assert.match(JSON.stringify(undefinedName.content), /could not render the template: UndefinedError: 'nope' is undefined/);
+    const slow = await render({ template: '{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}', timeout: 0.5 });
+    assert.ok(slow.isError);
+    assert.match(JSON.stringify(slow.content), /Exceeded maximum execution time of 0\.5s/);
+  });
 });

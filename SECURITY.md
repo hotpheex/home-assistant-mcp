@@ -22,12 +22,12 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 
 | Grant | Tools | Gives |
 |---|---|---|
-| `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services` | States, history, logbook, registries and the service list of the **whole house**, at the users tier. |
+| `read: plain` | `ha_get_states`, `ha_get_history`, `ha_get_logbook`, `ha_get_registry`, `ha_list_services`, `ha_render_template` | States, history, logbook, registries and the service list of the **whole house**, and template rendering over all of it, at the users tier. |
 | `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
 
-**Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so a Caller gets no URL that opens their images or streams.
+**Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so no state gives a Caller a URL that opens their images or streams. A rendered template is the exception: it can print a live token (see Residual risks).
 
 **A config write is full control of the house.** An automation or script can call any service, so a Caller that writes them can do anything HA can do. Grant it as you would an HA admin account.
 
@@ -57,10 +57,12 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/evaluator.test.ts`: the property that a Caller with no Grant is refused every service.
 - `test/services.test.ts`: a service no Grant names, and a Deny without targets, refused before any outbound message.
 
-**The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands.
+**The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands. The one subscription, a plain-read template render, takes its first event and unsubscribes, and is abandoned at the same heartbeat timeout as every request.
 - `test/repo.test.ts`: lint fails on any import of the HA client or another network client, or any `fetch` or `WebSocket`, outside the gate, and on casting to `Allowed` outside the evaluator.
 - `test/serve.test.ts`: a forged, spread or altered decision handed to the gate sends nothing.
 - `test/serve.test.ts`: in the coverage matrix, a read tool sends only read-only commands, and startup sends nothing beyond name lookups.
+- `test/serve.test.ts`: the gate subscribes only for a plain-read template render, and never sends one as a plain command.
+- `test/read.test.ts`: a template render unsubscribes after its first event, and one HA leaves unanswered is abandoned.
 
 **Tiers and the admin pin.** Only config read and config write run with the admin token. Plain read and service calls run with the users-tier token, so HA refuses admin-only services. The server exits if the users-tier token belongs to an HA admin, and never reads a token no Grant needs.
 - `test/serve.test.ts`: in the coverage matrix, config read and config write reach HA with the admin token only, and every other tool with the users-tier token only.
@@ -73,7 +75,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/services.test.ts`: area and label expansion, the service's domain filter, data-key merging, `entity_id: all`, delegating services and Denies on config entities.
 - `test/e2e.test.ts`: against real HA, child devices under a label, hidden and config entities outside an area, and an area Deny catching a config button.
 
-**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Every read, plain, config and trace, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config write carrying the mask marker is refused, so a masked secret is never written back.
+**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Rendered template output is outside this promise: a template can print a bearer token, and the server does not search for one. Every read, plain, config, trace and template output, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config write carrying the mask marker is refused, so a masked secret is never written back.
 - `test/redaction.test.ts`: what is stripped and masked, and the expected leaks.
 - `test/read.test.ts`, `test/config.test.ts` and `test/write.test.ts`: Redaction in the read tools, and the marker refusal.
 - `test/e2e.test.ts`: no bearer token or secret from a real HA appears in any byte the ten tools return.
@@ -82,9 +84,10 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/read.test.ts`: a read at the cap returned whole, and one character over refused with the tool's narrowing.
 - `test/services.test.ts`: an oversize service response cut with a marker.
 
-**Audit.** The server writes one JSON object per line to stdout; audit records carry `"audit": true`. Every refusal is recorded, failed authentication included. Allowed calls are recorded only with `HAMCP_AUDIT_WRITES` or `HAMCP_AUDIT_READS`. An allowed write records `allow` before any request to HA and `outcome: done` once HA accepts it, so an `allow` with no `done` is a write that failed or whose outcome is unknown. Records hold names only: never service data, config bodies, responses or keys.
+**Audit.** The server writes one JSON object per line to stdout; audit records carry `"audit": true`. Every refusal is recorded, failed authentication included. Allowed calls are recorded only with `HAMCP_AUDIT_WRITES` or `HAMCP_AUDIT_READS`. An allowed write records `allow` before any request to HA and `outcome: done` once HA accepts it, so an `allow` with no `done` is a write that failed or whose outcome is unknown. Records hold names only: never service data, config bodies, templates, responses or keys.
 - `test/serve.test.ts`: refused keys and Origins audited without the key, and in the coverage matrix, every refused tool call audited and allowed calls audited only on opt-in.
 - `test/services.test.ts` and `test/write.test.ts`: allowed writes audited by name before any request to HA, and their outcome once HA accepts them.
+- `test/read.test.ts`: an allowed template render audited without its template or variables.
 
 ## Kill switch
 
@@ -109,3 +112,4 @@ These are accepted and documented, not fixed:
 - **Groups and data-field entities ride on the Grant.** The server checks the target only. It does not expand groups or check entities named in other service data fields.
 - **Failed-auth log flooding.** Every failed authentication writes an audit line, and the server does not rate-limit. Rate-limit at the proxy.
 - **The process holds the admin token** next to network-facing code.
+- **Template output can carry camera, image and media_player tokens.** A template such as `{{ state_attr('camera.door', 'access_token') }}` prints a live token, which opens that camera's images and stream until HA rotates it. The server does not search rendered output for tokens, so plain read reaches this since v0.3.0.
