@@ -14,7 +14,9 @@ import {
   mergedUpdate,
   planServiceCall,
   splitHelperId,
+  writersOf,
   type Allowed,
+  type ConfigKind,
   type ConfigWrite,
   type Operation,
 } from './evaluator.ts';
@@ -68,6 +70,8 @@ interface ToolSpec<Input extends z.ZodType> {
   description: string;
   input: Input;
   annotations: { readOnlyHint: boolean; destructiveHint: boolean };
+  /** A config-write tool that serves only these kinds is listed only to a Caller holding one of them. */
+  kinds?: readonly ConfigKind[];
   /** For a decision that needs the arguments, not just the tool's kind. */
   decide?(args: z.output<Input>, policy: Policy, caller: string): Decided;
   run(args: z.output<Input>, ctx: Context): Promise<CallToolResult>;
@@ -737,7 +741,10 @@ export interface AuditOptions {
  * directly is refused and audited before its input is read, so nothing reaches HA.
  */
 export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Authenticated, options: AuditOptions): Server {
-  const holds = (name: ToolName) => grantsFor(policy, auth.caller, TOOL_KIND[name]).length > 0;
+  const holds = (name: ToolName) => {
+    const { kinds } = TOOLS[name];
+    return kinds === undefined ? grantsFor(policy, auth.caller, TOOL_KIND[name]).length > 0 : kinds.some((k) => writersOf(policy, auth.caller, k).length > 0);
+  };
   const visible = (Object.keys(TOOLS) as ToolName[]).filter(holds);
   const server = new Server(
     { name: pkg.name, version: pkg.version },
@@ -755,7 +762,9 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
     const audited = auditFor(audit, auth, operation, name);
     if (!holds(name)) {
       audited({ decision: 'deny', grants: [] });
-      return failure(`Denied: this Caller holds no Grant for ${OPERATION_NAME[operation]}. Do not retry this call.`);
+      const { kinds } = TOOLS[name];
+      const lacking = kinds === undefined ? OPERATION_NAME[operation] : `config writes of ${kinds.join(' or ')}`;
+      return failure(`Denied: this Caller holds no Grant for ${lacking}. Do not retry this call.`);
     }
     const tool = TOOLS[name];
     const args = tool.input.safeParse(params.arguments ?? {});

@@ -185,7 +185,7 @@ export const configPath = (kind: ConfigKind, id: string) => `/api/config/${kind}
 /** A helper's config id is unique only within its domain, so the server names it `<domain>.<id>`. */
 export const splitHelperId = (id: string) => [id.slice(0, id.indexOf('.')), id.slice(id.indexOf('.') + 1)] as const;
 
-const writersOf = (policy: Policy, caller: string, kind: ConfigKind) => indicesOf(policy.grants, (g) => g.caller === caller && g.config_write === kind);
+export const writersOf = (policy: Policy, caller: string, kind: ConfigKind) => indicesOf(policy.grants, (g) => g.caller === caller && g.config_write === kind);
 
 /** Automation and script config is config read; scene and helper config only a config write of that kind gives. */
 export const decideConfigRead = (policy: Policy, caller: string, kind: ConfigKind) =>

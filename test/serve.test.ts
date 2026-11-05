@@ -82,6 +82,8 @@ const GRANT_FOR: Record<Operation, string> = {
   service_call: 'services: [light.turn_on]\n    targets: [{ domain: light }]',
   config_write: 'config_write: automation',
 };
+/** A holder Grant for a tool whose sample call needs more than its Operation's Grant. */
+const HOLDER_GRANT: Partial<Record<ToolName, string>> = {};
 const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_get_states: { query: 'kitchen', area: 'utility_room' },
   ha_get_history: { entity_ids: ['light.kitchen'] },
@@ -149,7 +151,7 @@ for (const era of ERAS) {
       const holder = newKey();
       const idle = newKey();
       const ha = await fakeHa(t);
-      const server = await startServer(t, policyOf({ holder, idle }, `grants:\n  - caller: holder\n    ${GRANT_FOR[kind]}\n`), ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
+      const server = await startServer(t, policyOf({ holder, idle }, `grants:\n  - caller: holder\n    ${HOLDER_GRANT[tool] ?? GRANT_FOR[kind]}\n`), ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN });
 
       const holding = await connect(t, server.url, holder.key, era);
       const definition = (await holding.listTools()).tools.find((d) => d.name === tool);

@@ -217,10 +217,16 @@ export async function startFakeHa(options: FakeHaOptions) {
     delete entry.aliases;
     return entry;
   };
-  type Handler = (token: string, msg: Message) => unknown;
+  /** The command's connection, for a handler that opens a subscription. */
+  interface Connection {
+    /** Queues an `event` on this command's subscription, sent after its `result`. */
+    emit(event: unknown): void;
+    subscriptions: Set<number>;
+  }
+  type Handler = (token: string, msg: Message, conn: Connection) => unknown;
   /** HA's require_admin. */
-  const adminOnly = (handler: Handler): Handler => (token, msg) =>
-    options.users[token]?.is_admin ? handler(token, msg) : haError('unauthorized', 'Unauthorized');
+  const adminOnly = (handler: Handler): Handler => (token, msg, conn) =>
+    options.users[token]?.is_admin ? handler(token, msg, conn) : haError('unauthorized', 'Unauthorized');
   const configs = structuredClone(options.configs ?? {});
   const helpers = structuredClone(options.helpers ?? {});
   const configOf = adminOnly((_, msg) => {
@@ -229,6 +235,7 @@ export async function startFakeHa(options: FakeHaOptions) {
   });
   const handlers: Record<string, Handler> = {
     supported_features: () => null,
+    unsubscribe_events: (_, msg, conn) => (conn.subscriptions.delete(msg.subscription as number) ? null : haError('not_found', 'Subscription not found.')),
     get_states: () =>
       (options.states ?? []).map((s) => ({
         ...s,
@@ -340,30 +347,41 @@ export async function startFakeHa(options: FakeHaOptions) {
     kind === 'script'
       ? (`script.${id}` in configs ? `script.${id}` : undefined)
       : Object.keys(configs).find((e) => e.startsWith(`${kind}.`) && configs[e]!.id === id);
-  function rest(req: IncomingMessage, res: ServerResponse, raw: string) {
-    const json = (status: number, value: unknown) => void res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
-    const match = /^\/api\/config\/(automation|script|scene)\/config\/([^/]+)$/.exec(req.url ?? '');
-    if (!match) return json(404, { message: 'Not found' });
-    const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
-    if (!options.users[token]?.is_admin) return void res.writeHead(401, { 'content-type': 'text/plain' }).end('401: Unauthorized');
-    const body = raw === '' ? undefined : (JSON.parse(raw) as Record<string, unknown>);
-    const type = `${req.method} ${req.url}`;
-    received.push({ token, message: { type, ...(body !== undefined && { body }) } });
-    if (drop.has(type)) return void req.socket.destroy();
-    if (hung) return;
-    const [, kind, key] = match as unknown as [string, string, string];
-    const id = decodeURIComponent(key);
-    const entity = entityOf(kind, id);
-    if (req.method === 'GET') return entity ? json(200, configs[entity]) : json(404, { message: 'Resource not found' });
-    if (req.method === 'DELETE') {
+  type Json = (status: number, value: unknown) => void;
+  type Route = (match: RegExpExecArray, method: string | undefined, body: Record<string, unknown> | undefined, json: Json) => void;
+  function configRoute([, kind, key]: RegExpExecArray, method: string | undefined, body: Record<string, unknown> | undefined, json: Json) {
+    const id = decodeURIComponent(key!);
+    const entity = entityOf(kind!, id);
+    if (method === 'GET') return entity ? json(200, configs[entity]) : json(404, { message: 'Resource not found' });
+    if (method === 'DELETE') {
       if (!entity) return json(400, { message: 'Resource not found' });
       delete configs[entity];
       return json(200, { result: 'ok' });
     }
-    const missing = REQUIRED_KEYS[kind]!.find((k) => !(k in (body ?? {})));
+    const missing = REQUIRED_KEYS[kind!]!.find((k) => !(k in (body ?? {})));
     if (missing) return json(400, { message: `Message malformed: required key not provided @ data['${missing}']` });
     configs[entity ?? `${kind}.${id}`] = kind === 'script' ? body! : { id, ...body };
     json(200, { result: 'ok' });
+  }
+  /** HA's admin-only config REST, matched against the whole URL, query included. */
+  const routes: [RegExp, Route][] = [
+    [/^\/api\/config\/(automation|script|scene)\/config\/([^/]+)$/, configRoute],
+  ];
+  function rest(req: IncomingMessage, res: ServerResponse, raw: string) {
+    const json: Json = (status, value) => void res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
+    const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
+    const body = raw === '' ? undefined : (JSON.parse(raw) as Record<string, unknown>);
+    const type = `${req.method} ${req.url}`;
+    received.push({ token, message: { type, ...(body !== undefined && { body }) } });
+    for (const [pattern, route] of routes) {
+      const match = pattern.exec(req.url ?? '');
+      if (!match) continue;
+      if (!options.users[token]?.is_admin) return void res.writeHead(401, { 'content-type': 'text/plain' }).end('401: Unauthorized');
+      if (drop.has(type)) return void req.socket.destroy();
+      if (hung) return;
+      return route(match, req.method, body, json);
+    }
+    json(404, { message: 'Not found' });
   }
 
   const http = createServer((req, res) => {
@@ -379,6 +397,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     }
     let token: string | undefined;
     let lastId = 0;
+    const subscriptions = new Set<number>();
     const send = (m: unknown) => ws.send(JSON.stringify(m));
     send({ type: 'auth_required', ha_version: version });
     ws.on('message', (raw) => {
@@ -408,7 +427,11 @@ export async function startFakeHa(options: FakeHaOptions) {
         return send({ id, type: 'result', success: false, error: { code: 'unknown_command', message: 'Unknown command.' } });
       }
       try {
-        send({ id, type: 'result', success: true, result: handler(token, msg) });
+        const events: unknown[] = [];
+        const result = handler(token, msg, { emit: (event) => void events.push(event), subscriptions });
+        send({ id, type: 'result', success: true, result });
+        if (events.length > 0) subscriptions.add(id);
+        for (const event of events) send({ id, type: 'event', event });
       } catch (e) {
         if (!(e instanceof HaError)) throw e;
         send({ id, type: 'result', success: false, error: { code: e.code, message: e.message } });

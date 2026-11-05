@@ -32,7 +32,14 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'logbook/get_events',
   ]),
   // The entity registry only tells a trace call whether its item exists; none of it is returned.
-  config_read: new Set(['automation/config', 'script/config', 'trace/list', 'trace/get', 'config/entity_registry/list', ...HELPER_DOMAINS.map((d) => `${d}/list`)]),
+  config_read: new Set([
+    'automation/config',
+    'script/config',
+    'trace/list',
+    'trace/get',
+    'config/entity_registry/list',
+    ...HELPER_DOMAINS.map((d) => `${d}/list`),
+  ]),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
 /** Config read may GET a stored config; any other REST request must be the exact write an Allowed names. */
