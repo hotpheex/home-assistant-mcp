@@ -19,6 +19,8 @@ import {
   type ConfigKind,
   type ConfigWrite,
   type Operation,
+  decideBlueprintWrite,
+  type BlueprintWrite,
 } from './evaluator.ts';
 import { HaUnavailable, OutcomeUnknown, type Command, type Gate, type RestRequest } from './gate.ts';
 import { auditFor, type Audit } from './log.ts';
@@ -40,6 +42,8 @@ export const TOOL_KIND = {
   ha_call_service: 'service_call',
   ha_get_statistics: 'plain_read',
   ha_get_logs: 'config_read',
+  ha_list_blueprints: 'config_read',
+  ha_write_blueprint: 'config_write',
 } as const satisfies Record<string, Operation>;
 export type ToolName = keyof typeof TOOL_KIND;
 
@@ -129,6 +133,7 @@ const NARROWING: Partial<Record<ToolName, string>> = {
   ha_get_trace: 'fewer sections',
   ha_get_statistics: 'a query, fewer statistic_ids, a shorter window, a longer period, fewer types or a smaller limit',
   ha_get_logs: 'a level, a query or a smaller limit',
+  ha_list_blueprints: 'a domain or a smaller limit',
 };
 const charsOf = (result: CallToolResult) => result.content.reduce((n, c) => n + (c.type === 'text' ? c.text.length : 0), 0);
 const READS: ReadonlySet<Operation> = new Set(['plain_read', 'config_read']);
@@ -785,6 +790,82 @@ const writeConfig = defineTool({
   },
 });
 
+type BlueprintEntry = { metadata: { name: string; description?: string; input?: unknown; source_url?: string } } | { error: string };
+
+const listBlueprints = defineTool({
+  title: 'List blueprints',
+  description: [
+    'Lists the installed automation and script blueprints, sorted by domain and path, each with its name, description, inputs and source URL, or the error that stopped it loading.',
+    'Filter by `domain` (automation or script); an automation or script uses a blueprint by its `path`.',
+    MASKED,
+    PAGED,
+    'Example: {"domain": "automation"} lists the automation blueprints.',
+  ].join(' '),
+  input: z.strictObject({ domain: scriptKind.optional().describe('automation or script; both when omitted.'), ...page }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  async run({ domain, ...paging }, ctx) {
+    const listed = await Promise.all(
+      (domain === undefined ? scriptKind.options : [domain]).map(async (d) =>
+        Object.entries(await read<Record<string, BlueprintEntry>>(ctx, { type: 'blueprint/list', domain: d }))
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([path, entry]) => {
+            if ('error' in entry) return { domain: d, path, error: entry.error };
+            const { name, description, input, source_url } = entry.metadata;
+            return { domain: d, path, name, description, inputs: input, source_url };
+          }),
+      ),
+    );
+    return text(pageOf('blueprints', listed.flat(), paging));
+  },
+});
+
+/** A path under the domain's blueprint folder; no segment starts with a dot, so none climbs out of it. */
+const blueprintPath = z
+  .string()
+  .regex(/^\w[\w.-]*(\/\w[\w.-]*)*$/, 'must be a relative path such as mine/porch_light.yaml')
+  .transform((p) => (p.endsWith('.yaml') ? p : `${p}.yaml`));
+
+const writeBlueprint = defineTool({
+  title: 'Write blueprint',
+  description: [
+    "Creates, updates or deletes one automation or script blueprint from YAML the Caller supplies; it needs a config write of the blueprint's domain, and is admin-equivalent as that is.",
+    "Name the blueprint by `domain` and `path` within that domain's blueprint folder, such as mine/porch_light.yaml; `.yaml` is added when left off.",
+    'A create refuses a path that exists and an update replaces the whole file, so send the full YAML; importing a blueprint from a URL is not offered, so fetch the YAML first.',
+    'YAML that carries **REDACTED** from a read is refused, so put the real value in its place first.',
+    'Example: {"domain": "script", "action": "delete", "path": "mine/ping.yaml"}.',
+  ].join(' '),
+  input: z
+    .strictObject({
+      domain: scriptKind.describe('automation or script.'),
+      action: z.enum(['create', 'update', 'delete']).describe('create, update or delete.'),
+      path: blueprintPath.describe('The path within the domain blueprint folder, such as mine/porch_light.yaml.'),
+      yaml: z.string().min(1).optional().describe('The whole blueprint YAML; omitted for delete.'),
+    })
+    .superRefine(({ action, yaml }, ctx) => {
+      if (action !== 'delete' && yaml === undefined) ctx.addIssue({ code: 'custom', path: ['yaml'], message: `is required to ${action}` });
+      if (action === 'delete' && yaml !== undefined) ctx.addIssue({ code: 'custom', path: ['yaml'], message: 'is not taken by delete' });
+    }),
+  annotations: { readOnlyHint: false, destructiveHint: true },
+  kinds: ['automation', 'script'],
+  decide: (change: BlueprintWrite, policy, caller) => ({
+    ...decideBlueprintWrite(policy, caller, change),
+    lacking: `config writes of ${change.domain}`,
+    request: { domain: change.domain, action: change.action, path: change.path },
+  }),
+  async run({ domain, action, path, yaml }: BlueprintWrite, ctx) {
+    const { allowed } = ctx;
+    if (allowed?.write?.via !== 'websocket') throw new Error('blueprint write sent without an Allowed');
+    if (redactedPath(yaml) !== undefined) {
+      ctx.audit({ domain, action, path, decision: 'deny', reason: 'yaml carries a redacted value' });
+      throw new ToolFailure('yaml carries a redacted value: put the real value in its place. Nothing was sent to Home Assistant.');
+    }
+    if (ctx.options.auditWrites) ctx.audit({ domain, action, path, decision: 'allow', grants: ctx.grants });
+    const result = await send(ctx, allowed, allowed.write.command);
+    if (ctx.options.auditWrites) ctx.audit({ domain, action, path, outcome: 'done' });
+    return writeResult({ domain, action, path, result });
+  },
+});
+
 const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_states: getStates,
   ha_get_history: getHistory,
@@ -798,6 +879,8 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_call_service: callService,
   ha_get_statistics: getStatistics,
   ha_get_logs: getLogs,
+  ha_list_blueprints: listBlueprints,
+  ha_write_blueprint: writeBlueprint,
 };
 
 /** Built once, so each tool's definition is identical for every Caller. */

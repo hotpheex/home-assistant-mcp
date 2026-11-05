@@ -156,3 +156,25 @@ test('ha_get_logs lists the system log newest first, filtered by minimum level a
   });
   assert.equal((await call('ha_get_logs', { level: 'fatal' })).result.isError, true);
 });
+
+test('ha_list_blueprints lists automation and script blueprints by path, with their metadata masked', async (t) => {
+  const { call } = await auditorOn(t);
+  const both = await call('ha_list_blueprints', {});
+  assert.deepEqual(both.sent, [{ type: 'blueprint/list', domain: 'automation' }, { type: 'blueprint/list', domain: 'script' }]);
+  const motion = {
+    domain: 'automation',
+    path: 'homeassistant/motion_light.yaml',
+    name: 'Motion-activated Light',
+    description: 'Turn on a light when motion is detected.',
+    inputs: { motion_entity: { name: 'Motion Sensor' }, hook: { name: 'Webhook', default: { api_key: M } } },
+    source_url: 'https://github.com/home-assistant/core/blob/dev/homeassistant/components/automation/blueprints/motion_light.yaml',
+  };
+  const broken = { domain: 'automation', path: 'mine/broken.yaml', error: "Failed to load blueprint: Unable to read file mine/broken.yaml" };
+  const confirm = { domain: 'script', path: 'homeassistant/confirmable_notification.yaml', name: 'Confirmable Notification', inputs: { notify_device: { name: 'Device' } } };
+  assert.deepEqual(body(both.result), { total: 3, offset: 0, has_more: false, blueprints: [motion, broken, confirm] });
+
+  const scripts = await call('ha_list_blueprints', { domain: 'script' });
+  assert.deepEqual(scripts.sent, [{ type: 'blueprint/list', domain: 'script' }]);
+  assert.deepEqual(body(scripts.result), { total: 1, offset: 0, has_more: false, blueprints: [confirm] });
+  assert.deepEqual(body((await call('ha_list_blueprints', { limit: 1, offset: 1 })).result), { total: 3, offset: 1, has_more: true, blueprints: [broken] });
+});

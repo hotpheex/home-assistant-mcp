@@ -27,6 +27,7 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
 | `config_write: zone` | `ha_write_config`, plus config read and plain read | Create, update and delete zones, at the admin tier. Also zone config. |
+| Blueprints | `ha_list_blueprints` with `read: config`; `ha_write_blueprint` with `config_write: automation` or `script` | The list of every automation and script blueprint, at the admin tier. Saving, overwriting and deleting blueprints of the written kind's domain from the Caller's YAML, at the admin tier; this adds no reach, because that kind is already full control. HA's blueprint import is never sent, so no Caller can make HA fetch a URL. |
 
 **Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so a Caller gets no URL that opens their images or streams.
 
@@ -58,6 +59,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/evaluator.test.ts`: the property that a Caller with no Grant is refused every service.
 - `test/services.test.ts`: a service no Grant names, and a Deny without targets, refused before any outbound message.
 - `test/serve.test.ts`: the kind matrix, zone config read and write for a Caller holding and lacking the `zone` kind; `test/evaluator.test.ts`: the property that only a zone Grant writes or reads zones.
+- `test/write.test.ts`: a tool that serves only some config-write kinds, such as the blueprint write, is hidden from and refused to a Caller that writes another kind.
 
 **The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands.
 - `test/repo.test.ts`: lint fails on any import of the HA client or another network client, or any `fetch` or `WebSocket`, outside the gate, and on casting to `Allowed` outside the evaluator.
@@ -75,7 +77,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/services.test.ts`: area and label expansion, the service's domain filter, data-key merging, `entity_id: all`, delegating services and Denies on config entities.
 - `test/e2e.test.ts`: against real HA, child devices under a label, hidden and config entities outside an area, and an area Deny catching a config button.
 
-**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Every read, plain, config and trace, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config write carrying the mask marker is refused, so a masked secret is never written back.
+**Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Every read, plain, config and trace, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config or blueprint write carrying the mask marker is refused, so a masked secret is never written back.
 - `test/redaction.test.ts`: what is stripped and masked, and the expected leaks.
 - `test/read.test.ts`, `test/config.test.ts` and `test/write.test.ts`: Redaction in the read tools, and the marker refusal.
 - `test/e2e.test.ts`: no bearer token or secret from a real HA appears in any byte the ten tools return.

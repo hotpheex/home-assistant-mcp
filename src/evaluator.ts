@@ -232,3 +232,22 @@ export function mergedUpdate(allowed: Allowed, stored: Record<string, unknown>):
   }
   throw new Error('only an issued config update merges');
 }
+
+export interface BlueprintWrite {
+  domain: 'automation' | 'script';
+  action: 'create' | 'update' | 'delete';
+  /** Ends in `.yaml`: HA appends it on save but not on delete. */
+  path: string;
+  yaml?: string;
+}
+
+/**
+ * A blueprint is written under the config-write kind of its domain, which is already admin-equivalent, so it adds no reach.
+ * Only save and delete are issued: HA's URL import would have HA fetch any URL from inside the network.
+ */
+export function decideBlueprintWrite(policy: Policy, caller: string, { domain, action, path, yaml }: BlueprintWrite): ConfigWriteDecision {
+  const grants = writersOf(policy, caller, domain);
+  if (grants.length === 0) return { allowed: undefined, grants: [] };
+  const command = action === 'delete' ? { type: 'blueprint/delete', domain, path } : { type: 'blueprint/save', domain, path, yaml, ...(action === 'update' && { allow_override: true }) };
+  return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: { via: 'websocket', command } }), grants };
+}
