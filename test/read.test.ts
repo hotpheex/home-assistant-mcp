@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
-import type { FakeHaOptions } from './fake-ha.ts';
+import type { FakeHaOptions, FakeStatistic } from './fake-ha.ts';
 import { body, connect, ERAS, fakeHa, HOUSE, newKey, policyOf, startServer } from './harness.ts';
 
 const reader = newKey();
@@ -115,10 +115,10 @@ test('ha_get_logbook reads the last hour by default, optionally for one entity',
   assert.deepEqual([typo.total, typo.not_current_entity_ids], [0, ['lock.front_dor']]);
 });
 
-test('read: plain lists the five read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
+test('read: plain lists the six read tools; ha_get_states filters, matches aliases, area and label names, pages, and gives attributes only in full', async (t) => {
   const { call, client } = await readerOn(t);
   const listed = await client.listTools();
-  assert.deepEqual(listed.tools.map((tool) => tool.name), ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services']);
+  assert.deepEqual(listed.tools.map((tool) => tool.name), ['ha_get_states', 'ha_get_history', 'ha_get_logbook', 'ha_get_registry', 'ha_list_services', 'ha_get_statistics']);
   assert.equal(listed.cacheScope, 'private');
 
   const ids = async (args: Record<string, unknown>) => ((await call('ha_get_states', args)).states as { entity_id: string }[]).map((s) => s.entity_id);
@@ -273,4 +273,59 @@ test('ha_get_registry lists each registry, filtered by a query', async (t) => {
     assert.deepEqual((await call('ha_get_registry', { registry: 'device', query })).entries, [device], query);
   }
   assert.equal((await call('ha_get_registry', { registry: 'device', query: 'zigbee' })).total, 0);
+});
+
+test('ha_get_statistics lists statistic ids by a query, and reads chosen types per period over the last 7 days by default, paged', async (t) => {
+  const meta = (statistic_id: string, name: string, unit: string) => ({ statistic_id, name, source: 'recorder', unit_of_measurement: unit, has_sum: false, mean_type: 1 });
+  const hours = (count: number, hoursAgo: number) =>
+    Array.from({ length: count }, (_, i) => ({ start: ago((hoursAgo - i) * 60), mean: 20 + i, min: 19 + i, max: 21 + i }));
+  const statistics: FakeStatistic[] = [
+    { ...meta('sensor.kitchen_temperature', 'Kitchen Temperature', '°C'), periods: { hour: [...hours(1, 8 * 24), ...hours(3, 3)], day: hours(1, 48) } },
+    { ...meta('sensor.grid_energy', 'Grid Energy', 'kWh'), has_sum: true, mean_type: 0, periods: { hour: [{ start: ago(120), sum: 4.2, state: 104.2, change: 1.1 }] } },
+  ];
+  const { call, sent, client, ha } = await readerOn(t, { statistics });
+
+  const listed = await call('ha_get_statistics', { query: 'KITCHEN' });
+  assert.deepEqual(
+    { total: listed.total, has_more: listed.has_more, ids: (listed.statistic_ids as { statistic_id: string }[]).map((s) => s.statistic_id) },
+    { total: 1, has_more: false, ids: ['sensor.kitchen_temperature'] },
+  );
+  assert.equal((await call('ha_get_statistics', { query: 'energy' })).total, 1);
+  assert.equal((await call('ha_get_statistics', {})).total, 2);
+
+  const statistic_ids = ['sensor.kitchen_temperature', 'sensor.grid_energy'];
+  const week = await call('ha_get_statistics', { statistic_ids, types: ['mean', 'sum'], limit: 2, offset: 1 });
+  const [request] = sent('recorder/statistics_during_period');
+  assert.deepEqual([request?.statistic_ids, request?.period, request?.types], [statistic_ids, 'hour', ['mean', 'sum']]);
+  near(request?.start_time, 7 * 24 * 60);
+  near(request?.end_time, 0);
+  near(week.start, 7 * 24 * 60);
+  const rows = week.statistics as Record<string, unknown>[];
+  assert.deepEqual(
+    { total: week.total, has_more: week.has_more, period: week.period, rows: rows.map((r) => [r.statistic_id, r.mean, r.sum]) },
+    { total: 4, has_more: true, period: 'hour', rows: [['sensor.kitchen_temperature', 20, null], ['sensor.kitchen_temperature', 21, null]] },
+  );
+  assert.equal(Date.parse(String(rows[0]!.end)) - Date.parse(String(rows[0]!.start)), 3_600_000);
+  assert.equal(rows[0]!.start, statistics[0]!.periods.hour![1]!.start);
+  assert.equal(rows[0]!.min, undefined);
+
+  const daily = await call('ha_get_statistics', { statistic_ids: ['sensor.kitchen_temperature'], period: 'day', start: ago(3 * 24 * 60), end: ago(0) });
+  assert.deepEqual((daily.statistics as Record<string, unknown>[]).map((r) => [r.start, r.mean, r.min, r.max, r.sum, r.state, r.change]), [
+    [statistics[0]!.periods.day![0]!.start, 20, 19, 21, null, null, null],
+  ]);
+
+  const sentBefore = ha.received.length;
+  const refused = async (args: Record<string, unknown>, pattern: RegExp) => {
+    const result = await client.callTool({ name: 'ha_get_statistics', arguments: args });
+    assert.equal(result.isError, true);
+    assert.match(JSON.stringify(result.content), pattern);
+  };
+  await refused({ statistic_ids, start: ago(60), end: ago(120) }, /after end/);
+  await refused({ statistic_ids, query: 'kitchen' }, /query: is taken only when listing/);
+  await refused({ start: ago(60) }, /start: is taken only with statistic_ids/);
+  await refused({ statistic_ids, period: 'year' }, /period/);
+  assert.equal(ha.received.length, sentBefore);
+
+  statistics[0]!.periods.hour!.push(...Array.from({ length: 500 }, (_, i) => ({ start: ago(24 * 60 + i), mean: i, min: i, max: i })));
+  await refused({ statistic_ids, limit: 500 }, /narrow the query with a query, fewer statistic_ids, a shorter window, a longer period/);
 });

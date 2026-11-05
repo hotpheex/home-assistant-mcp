@@ -38,6 +38,7 @@ export const TOOL_KIND = {
   ha_get_trace: 'config_read',
   ha_write_config: 'config_write',
   ha_call_service: 'service_call',
+  ha_get_statistics: 'plain_read',
 } as const satisfies Record<string, Operation>;
 export type ToolName = keyof typeof TOOL_KIND;
 
@@ -125,6 +126,7 @@ const NARROWING: Partial<Record<ToolName, string>> = {
   ha_list_services: 'a domain or a smaller limit',
   ha_list_traces: 'a smaller limit',
   ha_get_trace: 'fewer sections',
+  ha_get_statistics: 'a query, fewer statistic_ids, a shorter window, a longer period, fewer types or a smaller limit',
 };
 const charsOf = (result: CallToolResult) => result.content.reduce((n, c) => n + (c.type === 'text' ? c.text.length : 0), 0);
 const READS: ReadonlySet<Operation> = new Set(['plain_read', 'config_read']);
@@ -420,6 +422,60 @@ const getRegistry = defineTool({
   },
 });
 
+const STATISTIC_TYPES = ['min', 'max', 'mean', 'sum', 'state', 'change'] as const;
+type StatisticRow = { start: number; end: number } & Record<string, unknown>;
+
+const getStatistics = defineTool({
+  title: 'Get long-term statistics',
+  description: [
+    'Without `statistic_ids`, lists the long-term statistics Home Assistant keeps, sorted by statistic_id, with each one\'s name, unit and source; `query` keeps those whose statistic_id or name contains it, case-insensitively.',
+    'With `statistic_ids`, returns one row per statistic and `period` (`5minute`, `hour`, `day`, `week` or `month`; default `hour`), sorted by statistic_id and then time, with its start and end and the chosen `types` (`min`, `max`, `mean`, `sum`, `state` and `change`; default all), null where a statistic does not keep that type.',
+    'The window defaults to the last 7 days; `start` and `end` take ISO 8601 times, and a `start` after `end` is refused.',
+    MASKED,
+    PAGED,
+    'Example: {"statistic_ids": ["sensor.grid_energy"], "period": "month", "types": ["change"], "start": "2026-01-01T00:00:00Z"} gives the energy used each month this year.',
+  ].join(' '),
+  input: z
+    .strictObject({
+      query: z.string().min(1).optional().describe('Listing only: case-insensitive substring of the statistic_id or name.'),
+      statistic_ids: z.array(z.string().min(1)).min(1).optional().describe('The statistics to read, such as ["sensor.grid_energy"]; leave out to list them.'),
+      period: z.enum(['5minute', 'hour', 'day', 'week', 'month']).default('hour').describe('The length of each row.'),
+      types: z.array(z.enum(STATISTIC_TYPES)).min(1).default([...STATISTIC_TYPES]).describe('The values each row carries.'),
+      ...window,
+      ...page,
+    })
+    // An argument of the other mode is refused rather than silently ignored.
+    .superRefine(({ query, statistic_ids, start, end }, ctx) => {
+      if (statistic_ids !== undefined && query !== undefined) ctx.addIssue({ code: 'custom', path: ['query'], message: 'is taken only when listing, without statistic_ids' });
+      for (const [key, value] of Object.entries({ start, end })) {
+        if (statistic_ids === undefined && value !== undefined) ctx.addIssue({ code: 'custom', path: [key], message: 'is taken only with statistic_ids' });
+      }
+    }),
+  annotations: { readOnlyHint: true, destructiveHint: false },
+  async run(args, ctx) {
+    if (args.statistic_ids === undefined) {
+      const query = args.query?.toLowerCase();
+      const ids = (await read<{ statistic_id: string; name: string | null }[]>(ctx, { type: 'recorder/list_statistic_ids' }))
+        .filter((s) => query === undefined || [s.statistic_id, s.name ?? ''].some((v) => v.toLowerCase().includes(query)))
+        .sort((a, b) => a.statistic_id.localeCompare(b.statistic_id));
+      return text(pageOf('statistic_ids', ids, args));
+    }
+    const { start, end } = windowOf(args, 7 * 24);
+    const periods = await read<Record<string, StatisticRow[]>>(ctx, {
+      type: 'recorder/statistics_during_period',
+      start_time: start,
+      end_time: end,
+      statistic_ids: args.statistic_ids,
+      period: args.period,
+      types: args.types,
+    });
+    const rows = Object.keys(periods)
+      .sort()
+      .flatMap((id) => periods[id]!.map((r) => ({ statistic_id: id, ...r, start: new Date(r.start).toISOString(), end: new Date(r.end).toISOString() })));
+    return text({ start, end, period: args.period, ...pageOf('statistics', rows, args) });
+  },
+});
+
 const scriptKind = z.enum(['automation', 'script']);
 const itemId = z.string().min(1).describe("The automation's config `id`, or the script's object id (the part after `script.`).");
 
@@ -707,6 +763,7 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_trace: getTrace,
   ha_write_config: writeConfig,
   ha_call_service: callService,
+  ha_get_statistics: getStatistics,
 };
 
 /** Built once, so each tool's definition is identical for every Caller. */

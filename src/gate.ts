@@ -30,6 +30,8 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'config/floor_registry/list',
     'history/history_during_period',
     'logbook/get_events',
+    'recorder/list_statistic_ids',
+    'recorder/statistics_during_period',
   ]),
   // The entity registry only tells a trace call whether its item exists; none of it is returned.
   config_read: new Set([

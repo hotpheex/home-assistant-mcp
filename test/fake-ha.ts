@@ -64,6 +64,7 @@ export interface FakeHaOptions {
   traces?: FakeTrace[];
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
+  statistics?: FakeStatistic[];
 }
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
@@ -82,6 +83,17 @@ const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<stri
 };
 /** HA validates the whole body of a config POST, so a partial one is refused. */
 const REQUIRED_KEYS: Record<string, string[]> = { automation: ['triggers', 'actions'], script: ['sequence'], scene: ['name', 'entities'] };
+
+/** A long-term statistic's metadata, and its rows per period, each with an ISO `start` and its type values. */
+export interface FakeStatistic {
+  statistic_id: string;
+  name: string | null;
+  source: string;
+  unit_of_measurement: string | null;
+  has_sum: boolean;
+  mean_type: number;
+  periods: Partial<Record<'5minute' | 'hour' | 'day' | 'week' | 'month', ({ start: string } & Partial<Record<'min' | 'max' | 'mean' | 'sum' | 'state' | 'change', number>>)[]>>;
+}
 
 /** A stored run: summary fields plus the sections only trace/get returns. */
 export interface FakeTrace extends Record<string, unknown> {
@@ -310,6 +322,33 @@ export async function startFakeHa(options: FakeHaOptions) {
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
+    'recorder/list_statistic_ids': () =>
+      (options.statistics ?? []).map(({ statistic_id, name, source, unit_of_measurement, has_sum, mean_type }) => ({
+        statistic_id,
+        display_unit_of_measurement: unit_of_measurement,
+        has_mean: mean_type === 1,
+        mean_type,
+        has_sum,
+        name,
+        source,
+        statistics_unit_of_measurement: unit_of_measurement,
+        unit_class: null,
+      })),
+    'recorder/statistics_during_period': (_, msg) => {
+      const period = msg.period as keyof FakeStatistic['periods'];
+      const ms = { '5minute': 300_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000, month: 2_592_000_000 }[period];
+      if (ms === undefined || !Array.isArray(msg.statistic_ids) || msg.statistic_ids.length === 0) return haError('invalid_format', 'Invalid statistics request');
+      const types = msg.types as string[];
+      const [from, to] = [Date.parse(msg.start_time as string), msg.end_time === undefined ? Date.now() : Date.parse(msg.end_time as string)];
+      const out: Record<string, Record<string, number | null>[]> = {};
+      for (const s of (options.statistics ?? []).filter((x) => (msg.statistic_ids as string[]).includes(x.statistic_id))) {
+        const rows = (s.periods[period] ?? [])
+          .filter((r) => from <= Date.parse(r.start) && Date.parse(r.start) < to)
+          .map((r) => ({ start: Date.parse(r.start), end: Date.parse(r.start) + ms, ...Object.fromEntries(types.map((k) => [k, new Map(Object.entries(r)).get(k) ?? null])) }));
+        if (rows.length > 0) out[s.statistic_id] = rows;
+      }
+      return out;
+    },
   };
   for (const domain of HELPER_DOMAINS) {
     const items = () => (helpers[domain] ??= []);
