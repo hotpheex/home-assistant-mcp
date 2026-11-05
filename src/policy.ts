@@ -17,6 +17,7 @@ export const CONFIG_KINDS = [
   'script',
   'scene',
   'helper',
+  'entity_name',
   'zone',
 ] as const;
 

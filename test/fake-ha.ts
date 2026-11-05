@@ -77,6 +77,8 @@ export interface FakeHaOptions {
 }
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
+/** What HA's `config/entity_registry/update` schema takes besides `entity_id`. */
+const REGISTRY_UPDATE_KEYS = ['aliases', 'area_id', 'categories', 'device_class', 'icon', 'labels', 'name', 'new_entity_id', 'disabled_by', 'hidden_by', 'options_domain', 'options'];
 const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 /** Each helper's storage schema in HA 2026.10: its required keys, the defaults it fills, and its other keys besides `icon`. */
 const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<string, unknown>; optional: string[] }> = {
@@ -243,7 +245,8 @@ export async function startFakeHa(options: FakeHaOptions) {
   let down = false;
   let hung = false;
   let refused = 0;
-  const entities = options.entities ?? [];
+  // A copy, since a registry update changes it and the seed is shared across tests.
+  const entities = structuredClone(options.entities ?? []);
   const entityEntry = (e: FakeEntity) => {
     const entry: Partial<FakeEntity> = { name: null, device_id: null, area_id: null, labels: [], hidden_by: null, disabled_by: null, entity_category: null, ...e };
     delete entry.aliases;
@@ -309,6 +312,15 @@ export async function startFakeHa(options: FakeHaOptions) {
           return [id, e ? { ...entityEntry(e), aliases: e.aliases ?? [] } : null];
         }),
       ),
+    'config/entity_registry/update': adminOnly((_, msg) => {
+      const entity = entities.find((e) => e.entity_id === msg.entity_id) ?? haError('not_found', 'Entity not found');
+      const changes = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'entity_id'].includes(k)));
+      const extra = Object.keys(changes).find((k) => !REGISTRY_UPDATE_KEYS.includes(k));
+      if (extra) haError('invalid_format', `extra keys not allowed @ data['${extra}']`);
+      const { new_entity_id, ...fields } = changes;
+      Object.assign(entity, fields, typeof new_entity_id === 'string' && { entity_id: new_entity_id });
+      return { entity_entry: { ...entityEntry(entity), aliases: entity.aliases ?? [] } };
+    }),
     'config/device_registry/list': () => options.devices ?? [],
     'config/area_registry/list': () => options.areas ?? [],
     'config/label_registry/list': () => options.labels ?? [],

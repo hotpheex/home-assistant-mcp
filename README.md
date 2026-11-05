@@ -97,6 +97,7 @@ Each Grant gives one kind of access:
 | `read: config` | The config and traces of every automation and script, and HA's system log. |
 | `services: [...]` with `targets` | Those services on entities in the named domains, areas (`area_id`) or labels (`label_id`). Omit `targets` for services that take none. Includes plain read. |
 | `config_write: automation \| script \| scene \| helper` | Create, update and delete items of that kind (`helper` covers `input_*`, `counter`, `timer` and `schedule`). Includes both reads. |
+| `config_write: entity_name` | Update an entity's name, icon and voice aliases. Every other registry edit stays excluded: areas, labels, hiding, disabling, devices and entity_id renames. Includes both reads. |
 | `config_write: zone` | Create, update and delete zones, which moves presence: who counts as home and what location automations do. Includes both reads. |
 | Blueprints | `read: config` lists the installed automation and script blueprints. `config_write: automation` or `script` also saves and deletes blueprints of that domain from YAML the Caller supplies. HA's import of a blueprint from a URL is not offered. |
 

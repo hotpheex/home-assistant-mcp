@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import type { TestContext } from 'node:test';
 import { test } from 'node:test';
 import { REDACTED as M } from '../src/redaction.ts';
-import { ADMIN_TOKEN, adminCaller, body, connect, fakeHa, newKey, policyOf, startServer, until } from './harness.ts';
+import { ADMIN_TOKEN, adminCaller, body, connect, fakeHa, newKey, policyOf, REGISTRIES, startServer, until } from './harness.ts';
 
 const keys = Object.fromEntries(['auditor', 'automator', 'scripter', 'scener', 'helperer'].map((name) => [name, newKey()]));
 const policy = policyOf(
@@ -263,6 +263,74 @@ test('a config write dropped or left unanswered after it was sent reports outcom
   assert.match(JSON.stringify((await deleted).content), /Outcome unknown/);
   assert.equal(((await updated).content as { text: string }[])[0]?.text, 'HA unavailable: Home Assistant did not answer. Try again later.');
   assert.ok(!types().includes('POST /api/config/script/config/morning'));
+});
+
+const namers = Object.fromEntries(['namer', 'helper_writer'].map((name) => [name, newKey()]));
+async function registry(t: TestContext, env: Record<string, string> = { HAMCP_AUDIT_WRITES: 'true' }) {
+  const ha = await fakeHa(t);
+  const rules = 'grants:\n  - caller: namer\n    config_write: entity_name\n  - caller: helper_writer\n    config_write: helper\n';
+  const server = await startServer(t, policyOf(namers, rules), ha, { HAMCP_HA_ADMIN_TOKEN: ADMIN_TOKEN, ...env });
+  const as = async (who: string) => adminCaller(ha, await connect(t, server.url, namers[who]!.key, 'modern'));
+  return { ha, server, as };
+}
+
+test('an entity_name update sends only its name, icon or aliases to the entity registry, audited by entity_id', async (t) => {
+  const { ha, server, as } = await registry(t);
+  const call = await as('namer');
+  const changes = [{ name: 'Espresso' }, { icon: 'mdi:coffee' }, { aliases: ['Coffee', 'Barista'] }];
+  for (const config of changes) {
+    const written = await call('ha_write_config', { kind: 'entity_name', action: 'update', id: 'switch.coffee_maker', config });
+    assert.equal(written.result.isError, undefined);
+    assert.deepEqual(written.sent, [{ type: 'config/entity_registry/update', entity_id: 'switch.coffee_maker', ...config }]);
+  }
+  const renamed = await call('ha_write_config', { kind: 'entity_name', action: 'update', id: 'switch.coffee_maker', config: { name: null, icon: null } });
+  assert.deepEqual(body(renamed.result), {
+    kind: 'entity_name',
+    action: 'update',
+    id: 'switch.coffee_maker',
+    result: { entity_entry: { entity_id: 'switch.coffee_maker', name: null, icon: null, device_id: 'dev_coffee', area_id: null, labels: [], hidden_by: null, disabled_by: null, entity_category: null, aliases: ['Coffee', 'Barista'] } },
+  });
+  const missing = await call('ha_write_config', { kind: 'entity_name', action: 'update', id: 'switch.nope', config: { name: 'x' } });
+  assert.match(JSON.stringify(missing.result.content), /Home Assistant refused the request: Entity not found/);
+  assert.deepEqual(REGISTRIES.entities?.[0], { entity_id: 'switch.coffee_maker', device_id: 'dev_coffee' }, "the fake's seed registry is not changed");
+  assert.deepEqual(
+    server.audits().map((a) => [a.kind, a.action, a.id, a.decision ?? a.outcome]),
+    [...changes, {}].flatMap(() => [['entity_name', 'update', 'switch.coffee_maker', 'allow'], ['entity_name', 'update', 'switch.coffee_maker', 'done']]).concat([['entity_name', 'update', 'switch.nope', 'allow']]),
+  );
+  assert.doesNotMatch(JSON.stringify(server.audits()), /Espresso|Barista|mdi:coffee/);
+  assert.equal(ha.received.filter((r) => r.message.type === 'config/entity_registry/update').length, 5);
+});
+
+test('an entity_name write is refused, with nothing sent, for any other registry field, for create or delete, and for a Caller holding another kind', async (t) => {
+  const { ha, server, as } = await registry(t, {});
+  const call = await as('namer');
+  const update = { kind: 'entity_name', action: 'update', id: 'lock.front_door' };
+  for (const field of [{ area_id: 'garage' }, { labels: [] }, { hidden_by: 'user' }, { disabled_by: 'user' }, { new_entity_id: 'lock.back_door' }]) {
+    const refused = await call('ha_write_config', { ...update, config: { name: 'Front', ...field } });
+    assert.match(JSON.stringify(refused.result.content), new RegExp(`config\\.${Object.keys(field)[0]}: entity_name changes only name, icon and aliases`));
+    assert.deepEqual(refused.sent, []);
+  }
+  const create = await call('ha_write_config', { ...update, action: 'create', config: { name: 'Front' } });
+  assert.match(JSON.stringify(create.result.content), /action: entity_name takes only update/);
+  const remove = await call('ha_write_config', { ...update, action: 'delete' });
+  assert.match(JSON.stringify(remove.result.content), /action: entity_name takes only update/);
+  const notEntity = await call('ha_write_config', { ...update, id: 'front_door', config: { name: 'Front' } });
+  assert.match(JSON.stringify(notEntity.result.content), /id: must be an entity_id/);
+  const read = await call('ha_get_config', { kind: 'entity_name', id: 'lock.front_door' });
+  assert.match(JSON.stringify(read.result.content), /kind: entity_name has no config to read; ha_get_registry lists each entity's name and icon/);
+
+  const other = await as('helper_writer');
+  const denied = await other('ha_write_config', { ...update, config: { aliases: ['Garage'] } });
+  assert.match(JSON.stringify(denied.result.content), /no Grant for config writes of entity_name\. Do not retry/);
+  assert.equal(ha.received.filter((r) => r.message.type === 'config/entity_registry/update').length, 0);
+
+  const allowed = await call('ha_write_config', { ...update, config: { aliases: ['Front'] } });
+  assert.equal(allowed.result.isError, undefined);
+  assert.deepEqual(
+    server.audits().map((a) => [a.caller, a.kind, a.id, a.decision, a.grants]),
+    [['helper_writer', 'entity_name', 'lock.front_door', 'deny', []]],
+    'only the Grant denial is audited, since writes are audited on opt-in',
+  );
 });
 
 test('zone writes share the helper path: zone WebSocket commands, an update merged over the stored zone, config served only to a zone writer', async (t) => {

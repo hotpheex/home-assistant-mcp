@@ -10,6 +10,7 @@ import {
   decideConfigWrite,
   decideRead,
   decideServiceCall,
+  ENTITY_NAME_FIELDS,
   grantsFor,
   HELPER_DOMAINS,
   mergedUpdate,
@@ -526,6 +527,7 @@ const getConfig = defineTool({
       }
       if (!byEntity && id === undefined) ctx.addIssue({ code: 'custom', path: ['id'], message: `is required for a ${kind}` });
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
+      if (kind === 'entity_name') ctx.addIssue({ code: 'custom', path: ['kind'], message: "entity_name has no config to read; ha_get_registry lists each entity's name and icon" });
     }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   decide: ({ kind }, policy, caller) => ({ ...decideConfigRead(policy, caller, kind), lacking: `${kind} config`, request: { kind } }),
@@ -753,18 +755,25 @@ const writeConfig = defineTool({
     'An update sends only the top-level keys it changes and keeps the rest; creating an automation, script or scene refuses an id that exists, and a new helper or zone takes its id from its `name`, which the result returns.',
     'A config that carries **REDACTED** from a config read is refused, so put the real value in its place first.',
     'Example: {"kind": "automation", "action": "update", "id": "porch_light_1", "config": {"alias": "Porch light at dusk"}}.',
+    'Kind `entity_name` only updates the `name`, `icon` or `aliases` of the entity whose entity_id is `id`; voice assistants match its aliases.',
   ].join(' '),
   input: z
     .strictObject({
-      kind: configKind.describe('automation, script, scene, helper or zone.'),
+      kind: configKind.describe('automation, script, scene, helper, zone or entity_name.'),
       action: z.enum(['create', 'update', 'delete']).describe('create, update or delete.'),
-      id: z.string().min(1).describe("An automation's, scene's or zone's config id, a script's object id, or a helper's <domain>.<id>."),
+      id: z.string().min(1).describe("An automation's, scene's or zone's config id, a script's object id, a helper's <domain>.<id>, or an entity_name's entity_id."),
       config: z.record(z.string(), z.unknown()).optional().describe('The config to create, or the top-level keys to change; omitted for delete.'),
     })
     .superRefine(({ kind, action, id, config }, ctx) => {
       if (kind === 'helper' && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
       if (action !== 'delete' && config === undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: `is required to ${action}` });
       if (action === 'delete' && config !== undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: 'is not taken by delete' });
+      if (kind === 'entity_name' && action !== 'update') ctx.addIssue({ code: 'custom', path: ['action'], message: 'entity_name takes only update' });
+      if (kind === 'entity_name' && !entityId.safeParse(id).success) ctx.addIssue({ code: 'custom', path: ['id'], message: 'must be an entity_id such as light.kitchen' });
+      for (const key of kind === 'entity_name' ? Object.keys(config ?? {}) : []) {
+        const allowed = (ENTITY_NAME_FIELDS as readonly string[]).includes(key);
+        if (!allowed) ctx.addIssue({ code: 'custom', path: ['config', key], message: 'entity_name changes only name, icon and aliases' });
+      }
     }),
   annotations: { readOnlyHint: false, destructiveHint: true },
   decide: (change: ConfigWrite, policy, caller) => ({
@@ -783,8 +792,8 @@ const writeConfig = defineTool({
     }
     // Recorded before the lookup, so a write refused by its lookup, failed, or of unknown outcome still leaves a record.
     if (ctx.options.auditWrites) ctx.audit({ kind, action, id, decision: 'allow', grants: ctx.grants });
-    // A new helper or zone takes its id from its name, so only a collection update has a stored item to look up.
-    if (action === 'update' || (!collectionOf(kind, id) && action === 'create')) {
+    // A new helper or zone takes its id from its name, so only a collection update has a stored item to look up; HA's registry update is partial.
+    if (kind !== 'entity_name' && (action === 'update' || (!collectionOf(kind, id) && action === 'create'))) {
       const item = await stored(ctx, decideConfigRead(ctx.policy, ctx.auth.caller, kind).allowed, kind, id);
       if (action === 'create' && item) throw new ToolFailure(`The ${kind} ${id} already exists; update it instead.`);
       if (action === 'update' && !item) throw new ToolFailure(`The ${kind} ${id} does not exist; create it instead.`);

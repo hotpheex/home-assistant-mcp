@@ -81,6 +81,8 @@ grants:
   - caller: reader
     config_write: helper
   - caller: reader
+    config_write: entity_name
+  - caller: reader
     config_write: zone
 denies:
   - caller: reader
