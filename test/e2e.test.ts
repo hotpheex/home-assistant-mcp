@@ -170,6 +170,8 @@ suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP
       - domain: automation
   - caller: operator
     config_write: automation
+  - caller: operator
+    config_write: helper_entry
   - caller: expander
     services: [switch.turn_on]
     targets:
@@ -302,5 +304,39 @@ denies:
     await agent.sendMessagePromise({ type: 'auth/delete_refresh_token', refresh_token_id: tokens.find((r) => r.client_name === 'hamcp-e2e-revoked')?.id });
     assert.equal(await running.exited, 1);
     assert.ok(running.records.some((r) => r.level === 'error' && /rejected the users-tier token/.test(String(r.msg))));
+  });
+
+  e2e("wizard helpers are set up through HA's own flows: a template sensor end to end, and a switch_as_x light that hides its switch", async (t) => {
+    const client = await connect(t, server.url(), operator.key, 'modern');
+    const flow = async (args: Record<string, unknown>) => {
+      const result = await client.callTool({ name: 'ha_helper_flow', arguments: args });
+      assert.ok(!result.isError, JSON.stringify(result.content));
+      return body(result) as Record<string, unknown>;
+    };
+    const states = () => owner.sendMessagePromise<(HaState & { state: string })[]>({ type: 'get_states' });
+
+    const menu = await flow({ action: 'start', handler: 'template' });
+    assert.deepEqual([menu.type, (menu.menu_options as string[]).includes('sensor')], ['menu', true]);
+    const step = (input: Record<string, unknown>) => ({ action: 'step', flow_id: menu.flow_id, input });
+    assert.equal((await flow(step({ next_step_id: 'sensor' }))).step_id, 'sensor');
+    const rejected = await client.callTool({ name: 'ha_helper_flow', arguments: step({ name: 'E2E minutes' }) });
+    assert.ok(rejected.isError);
+    assert.match(JSON.stringify(rejected.content), /refused the input: .*state.*still open/);
+    assert.equal((await flow(step({ name: 'E2E minutes', state: '{{ 6 * 7 }}' }))).type, 'create_entry');
+    await eventually(async () => (await states()).some((s) => s.entity_id === 'sensor.e2e_minutes' && s.state === '42'), 'the template sensor', 30_000);
+
+    const wrap = await flow({ action: 'start', handler: 'switch_as_x' });
+    const wrapped = await flow({ action: 'step', flow_id: wrap.flow_id, input: { entity_id: 'switch.e2e_plug', target_domain: 'light' } });
+    const entryId = (wrapped.result as { entry_id: string }).entry_id;
+    // Removing the entry unhides the switch for the other cases.
+    t.after(() => fetch(`${HA}/api/config/config_entries/entry/${entryId}`, { method: 'DELETE', headers: { authorization: `Bearer ${adminToken}` } }));
+    const plug = await owner.sendMessagePromise<{ hidden_by: string | null }>({ type: 'config/entity_registry/get', entity_id: 'switch.e2e_plug' });
+    assert.equal(plug.hidden_by, 'integration');
+
+    const { handlers, entries } = await flow({ action: 'list' });
+    assert.ok((handlers as string[]).includes('template') && !(handlers as string[]).includes('hamcp_house'));
+    assert.deepEqual((entries as { domain: string }[]).map((e) => e.domain).sort(), ['switch_as_x', 'template']);
+    const refused = await client.callTool({ name: 'ha_helper_flow', arguments: { action: 'start', handler: 'hamcp_house' } });
+    assert.match(JSON.stringify(refused.content), /does not list hamcp_house as a helper integration/);
   });
 });

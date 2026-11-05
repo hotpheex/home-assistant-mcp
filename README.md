@@ -97,6 +97,7 @@ Each Grant gives one kind of access:
 | `read: config` | The config and traces of every automation and script. |
 | `services: [...]` with `targets` | Those services on entities in the named domains, areas (`area_id`) or labels (`label_id`). Omit `targets` for services that take none. Includes plain read. |
 | `config_write: automation \| script \| scene \| helper` | Create, update and delete items of that kind (`helper` covers `input_*`, `counter`, `timer` and `schedule`). Includes both reads. |
+| `config_write: helper_entry` | Set up wizard helpers, such as template sensors, groups, thresholds and switch_as_x, through HA's own setup forms, only for integrations HA lists as helpers. Full control of the house, as a template switch can run any action. Includes both reads. |
 
 Two Grants deserve care. Plain read is not scoped: a Caller that can read sees every entity, including people's locations. A config write is full control of the house, since an automation can call any service. [SECURITY.md](SECURITY.md) explains exactly what each Grant reveals and how calls are checked.
 

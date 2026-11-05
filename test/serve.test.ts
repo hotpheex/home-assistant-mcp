@@ -83,7 +83,9 @@ const GRANT_FOR: Record<Operation, string> = {
   config_write: 'config_write: automation',
 };
 /** A holder Grant for a tool whose sample call needs more than its Operation's Grant. */
-const HOLDER_GRANT: Partial<Record<ToolName, string>> = {};
+const HOLDER_GRANT: Partial<Record<ToolName, string>> = {
+  ha_helper_flow: 'config_write: helper_entry',
+};
 const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_get_states: { query: 'kitchen', area: 'utility_room' },
   ha_get_history: { entity_ids: ['light.kitchen'] },
@@ -95,6 +97,7 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_write_config: { kind: 'automation', action: 'update', id: 'porch_light_1', config: { alias: 'Porch light at dusk' } },
   ha_list_services: {},
   ha_call_service: { domain: 'light', service: 'turn_on', target: { entity_id: 'light.kitchen' } },
+  ha_helper_flow: { action: 'start', handler: 'template' },
 };
 /** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([

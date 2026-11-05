@@ -26,10 +26,11 @@ The server speaks plain HTTP. A key sent in clear can be replayed by anyone who 
 | `read: config` | `ha_get_config`, `ha_list_traces`, `ha_get_trace` | The config and traces of every automation and script, at the admin tier. It does not include plain read: a trace call reads the entity registry only to refuse an id that names no automation or script, and returns nothing from it. |
 | `services: [...]` | `ha_call_service`, plus plain read | The named services over the covered targets, at the users tier, with the service's response. |
 | `config_write: <kind>` | `ha_write_config`, plus config read and plain read | Create, update and delete items of that kind, at the admin tier. Also the scene or helper config of that kind. |
+| `config_write: helper_entry` | `ha_helper_flow`, plus config read and plain read | Set up wizard helpers through HA's own setup forms, at the admin tier. Only integrations in HA's live helper list are served: a setup, step or abort of any other integration, a discovery included, is refused. |
 
 **Plain read is not scoped.** Any Caller that can read sees every entity: every person's and device tracker's location, every camera entity, and every logbook entry. Bearer tokens in camera, image and media_player attributes are stripped, so a Caller gets no URL that opens their images or streams.
 
-**A config write is full control of the house.** An automation or script can call any service, so a Caller that writes them can do anything HA can do. Grant it as you would an HA admin account.
+**A config write is full control of the house.** An automation, a script or a wizard helper (`helper_entry`) can call any service, since a template switch or button runs any action, so a Caller that writes them can do anything HA can do. Grant it as you would an HA admin account.
 
 Running a script or triggering an automation is an ordinary service Grant, and it grants everything that script or automation does. Service calls run with the users-tier token, so HA itself refuses admin-only services. No tool edits areas, labels or registry names, so a Caller cannot move an entity into its own Grant.
 
@@ -56,6 +57,8 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 - `test/serve.test.ts`: the coverage matrix, every tool for a Caller holding and lacking its kind.
 - `test/evaluator.test.ts`: the property that a Caller with no Grant is refused every service.
 - `test/services.test.ts`: a service no Grant names, and a Deny without targets, refused before any outbound message.
+- `test/evaluator.test.ts`: the properties that only `helper_entry` allows a wizard-helper flow, never `helper`, and only for an integration in HA's helper list.
+- `test/helper-flow.test.ts`: a setup, step or abort of an integration HA does not list as a helper, a discovery included, refused and audited with nothing sent beyond the lookups; a Caller holding `helper` is not shown the flow tool.
 
 **The gate.** `src/gate.ts` is the only code that reaches HA. It sends only what an `Allowed` decision permits, and only the evaluator can build an `Allowed`: the gate refuses any decision the evaluator did not issue, and an issued one cannot be changed. Read tools may send only an allowlist of read-only commands.
 - `test/repo.test.ts`: lint fails on any import of the HA client or another network client, or any `fetch` or `WebSocket`, outside the gate, and on casting to `Allowed` outside the evaluator.
@@ -76,6 +79,7 @@ Each guarantee names the tests that pin it. The suite runs on every pull request
 **Redaction.** Every read strips `access_token` attributes and `token=` URL parameters from camera, image and media_player states. Every read, plain, config and trace, masks values under secret-looking keys, URL userinfo and `Bearer` tokens, so a harmless value under a secret-looking key is masked too. A config write carrying the mask marker is refused, so a masked secret is never written back.
 - `test/redaction.test.ts`: what is stripped and masked, and the expected leaks.
 - `test/read.test.ts`, `test/config.test.ts` and `test/write.test.ts`: Redaction in the read tools, and the marker refusal.
+- `test/helper-flow.test.ts`: the marker refusal for setup step input.
 - `test/e2e.test.ts`: no bearer token or secret from a real HA appears in any byte the ten tools return.
 
 **Size cap.** A result is at most 48,000 characters, below Claude Code's 50,000-character file threshold, so a Caller never reasons over a saved file or a preview. A larger read is refused whole, with a hint that names the narrowing the tool offers. A larger write result is cut with a marker, because the write has already run.
@@ -109,3 +113,5 @@ These are accepted and documented, not fixed:
 - **Groups and data-field entities ride on the Grant.** The server checks the target only. It does not expand groups or check entities named in other service data fields.
 - **Failed-auth log flooding.** Every failed authentication writes an audit line, and the server does not rate-limit. Rate-limit at the proxy.
 - **The process holds the admin token** next to network-facing code.
+- **Wizard helpers can hide entities.** switch_as_x hides the switch it wraps, and a group can hide its members. A hidden entity escapes area and label Denies, and the wrapper, such as switch_as_x's light, falls under its own domain's Grants.
+- **Reading a user-started flow re-runs its step.** HA lists a discovery's handler without running it, but a flow a user started is read through HA's flow REST, which re-runs its current step with no input, before the helper check.

@@ -7,8 +7,10 @@ import {
   configPath,
   decideConfigRead,
   decideConfigWrite,
+  decideHelperFlow,
   decideRead,
   decideServiceCall,
+  FLOW_ID,
   grantsFor,
   HELPER_DOMAINS,
   mergedUpdate,
@@ -18,6 +20,7 @@ import {
   type Allowed,
   type ConfigKind,
   type ConfigWrite,
+  type HelperFlow,
   type Operation,
 } from './evaluator.ts';
 import { HaUnavailable, OutcomeUnknown, type Command, type Gate, type RestRequest } from './gate.ts';
@@ -38,6 +41,7 @@ export const TOOL_KIND = {
   ha_get_trace: 'config_read',
   ha_write_config: 'config_write',
   ha_call_service: 'service_call',
+  ha_helper_flow: 'config_write',
 } as const satisfies Record<string, Operation>;
 export type ToolName = keyof typeof TOOL_KIND;
 
@@ -180,6 +184,11 @@ async function rest(ctx: Context, allowed: Allowed | undefined, request: RestReq
     throw outage(e);
   });
   if (answer.status === 404 && request.method === 'GET') return undefined;
+  // A flow step that fails HA's schema answers 400 with field errors, and the flow stays open.
+  const errors = (answer.body as { errors?: unknown } | null)?.errors;
+  if (answer.status === 400 && errors !== undefined) {
+    throw new ToolFailure(`Home Assistant refused the input: ${JSON.stringify(maskSecrets(errors))}. The flow is still open: correct the input and submit the step again.`);
+  }
   if (answer.status !== 200) {
     const message = (answer.body as { message?: string } | null)?.message ?? `HTTP ${answer.status}`;
     throw new ToolFailure(`Home Assistant refused the request: ${message}`);
@@ -426,6 +435,7 @@ const itemId = z.string().min(1).describe("The automation's config `id`, or the 
 const configKind = z.enum(CONFIG_KINDS);
 const helperId = new RegExp(`^(${HELPER_DOMAINS.join('|')})\\.[a-z0-9_]+$`);
 const HELPER_ID_RULE = 'must be <helper domain>.<id>, such as input_boolean.guest_mode';
+const NOT_A_CONFIG = 'a wizard helper is set up through its flow, not as a config';
 
 const getConfig = defineTool({
   title: 'Get config',
@@ -453,6 +463,7 @@ const getConfig = defineTool({
       }
       if (!byEntity && id === undefined) ctx.addIssue({ code: 'custom', path: ['id'], message: `is required for a ${kind}` });
       if (kind === 'helper' && id !== undefined && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
+      if (kind === 'helper_entry') ctx.addIssue({ code: 'custom', path: ['kind'], message: NOT_A_CONFIG });
     }),
   annotations: { readOnlyHint: true, destructiveHint: false },
   decide: ({ kind }, policy, caller) => ({ ...decideConfigRead(policy, caller, kind), lacking: `${kind} config`, request: { kind } }),
@@ -662,6 +673,7 @@ const writeConfig = defineTool({
       if (kind === 'helper' && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
       if (action !== 'delete' && config === undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: `is required to ${action}` });
       if (action === 'delete' && config !== undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: 'is not taken by delete' });
+      if (kind === 'helper_entry') ctx.addIssue({ code: 'custom', path: ['kind'], message: NOT_A_CONFIG });
     }),
   annotations: { readOnlyHint: false, destructiveHint: true },
   decide: (change: ConfigWrite, policy, caller) => ({
@@ -696,6 +708,84 @@ const writeConfig = defineTool({
   },
 });
 
+const HELPER_LIST = '/api/config/config_entries/flow_handlers?type=helper';
+/** The arguments each action takes; any other is refused. */
+const FLOW_ARGS = { list: [], start: ['handler'], step: ['flow_id', 'input'], abort: ['flow_id'] } as const;
+
+/**
+ * A flow's integration as HA reports it. The progress list names a discovery flow without running it; a flow
+ * a user started is not listed, and reading it re-runs its current step with no input.
+ */
+async function flowHandler(ctx: Context, flowId: string): Promise<string> {
+  const listed = (await send<{ flow_id: string; handler: string }[]>(ctx, ctx.allowed, { type: 'config_entries/flow/progress' })).find((f) => f.flow_id === flowId);
+  const flow = listed ?? ((await rest(ctx, ctx.allowed, { method: 'GET', path: `/api/config/config_entries/flow/${flowId}` })) as { handler: string } | undefined);
+  if (!flow) throw new ToolFailure(`No setup flow ${flowId} is in progress; start one.`);
+  return flow.handler;
+}
+
+const helperFlow = defineTool({
+  title: 'Set up a wizard helper',
+  description: [
+    "Sets up a wizard helper, such as a template sensor, a light group, a threshold or a switch shown as a light (switch_as_x), by driving Home Assistant's own setup form one step at a time; this is admin-equivalent, because a template switch or button can run any action.",
+    '`list` returns the helper integrations Home Assistant offers and the wizard helpers that exist; `start` with a `handler` from that list begins a setup; `step` with its `flow_id` submits one step\'s `input`, answering a menu with {"next_step_id": "<option>"}; `abort` abandons a setup.',
+    "Each step returns Home Assistant's answer as it stands: a `form` with its `data_schema` and any field `errors`, a `menu` with its `menu_options`, an `abort`, or a `create_entry` with the new entry in `result`; input Home Assistant rejects comes back with its field errors, and the same flow can be stepped again.",
+    'Only integrations Home Assistant lists as helpers are served, so any other setup is refused, and so is step input that carries **REDACTED** from a read.',
+    MASKED,
+    'Example: {"action": "step", "flow_id": "9f2c4e1a7b3d4c8e9a1f2b3c4d5e6f70", "input": {"next_step_id": "sensor"}} picks a sensor from the template menu.',
+  ].join(' '),
+  input: z
+    .strictObject({
+      action: z.enum(['list', 'start', 'step', 'abort']).describe('list, start, step or abort.'),
+      handler: slug.optional().describe('For start: a helper integration from list, such as template.'),
+      flow_id: z.string().regex(FLOW_ID, 'must be the flow_id start returned').optional().describe('For step and abort: the flow_id start returned.'),
+      input: z.record(z.string(), z.unknown()).optional().describe('For step: the form\'s fields, or {"next_step_id": "<option>"} for a menu.'),
+    })
+    .superRefine((args, ctx) => {
+      const taken: readonly string[] = FLOW_ARGS[args.action];
+      for (const key of ['handler', 'flow_id', 'input'] as const) {
+        if (taken.includes(key) && args[key] === undefined) ctx.addIssue({ code: 'custom', path: [key], message: `is required to ${args.action}` });
+        if (!taken.includes(key) && args[key] !== undefined) ctx.addIssue({ code: 'custom', path: [key], message: `is not taken by ${args.action}` });
+      }
+    }),
+  annotations: { readOnlyHint: false, destructiveHint: true },
+  kinds: ['helper_entry'],
+  // The Allowed here is for the lookups; the write is decided once HA has named the flow's integration.
+  decide: ({ action, handler, flow_id }, policy, caller) => ({
+    ...decideConfigRead(policy, caller, 'helper_entry'),
+    lacking: 'config writes of helper_entry',
+    request: { kind: 'helper_entry', action, handler, flow_id },
+  }),
+  async run({ action, handler, flow_id, input }, ctx) {
+    const lookup = (path: string) => rest(ctx, ctx.allowed, { method: 'GET', path });
+    if (action === 'list') {
+      const [handlers, entries] = await Promise.all([lookup(HELPER_LIST), lookup('/api/config/config_entries/entry?type=helper')]);
+      const named = (entries as { entry_id: string; domain: string; title: string }[]).map(({ entry_id, domain, title }) => ({ entry_id, domain, title }));
+      return writeResult(maskSecrets({ handlers: (handlers as string[]).sort(), entries: named }));
+    }
+    const names = { kind: 'helper_entry', action, flow_id };
+    const marked = redactedPath(input);
+    if (marked !== undefined) {
+      ctx.audit({ ...names, decision: 'deny', reason: 'input carries a redacted value' });
+      throw new ToolFailure(`input carries a redacted value at ${marked}: put the real value in its place. Nothing was sent to Home Assistant.`);
+    }
+    const integration = handler ?? (await flowHandler(ctx, flow_id!));
+    const flow = (action === 'start' ? { action, handler } : action === 'step' ? { action, flow_id, input } : { action, flow_id }) as HelperFlow;
+    const decision = decideHelperFlow(ctx.policy, ctx.auth.caller, flow, integration, (await lookup(HELPER_LIST)) as string[]);
+    const audit = (record: Record<string, unknown>) => ctx.audit({ ...names, handler: integration, ...record });
+    if (!decision.allowed) {
+      audit({ decision: 'deny', grants: [], reason: 'not a helper integration' });
+      throw new ToolFailure(`Denied: Home Assistant does not list ${integration} as a helper integration, so this Caller may not drive its setup. Do not retry this call.`);
+    }
+    const { write } = decision.allowed;
+    if (write.via !== 'rest') throw new Error('a helper flow is driven over REST');
+    if (ctx.options.auditWrites) audit({ decision: 'allow', grants: decision.grants });
+    const result = (await rest(ctx, decision.allowed, write.request)) as { flow_id?: string; type?: string; result?: { entry_id?: string } } | null;
+    const entry_id = result?.type === 'create_entry' ? result.result?.entry_id : undefined;
+    if (ctx.options.auditWrites) audit({ outcome: 'done', flow_id: flow_id ?? result?.flow_id, entry_id });
+    return writeResult(maskSecrets(result));
+  },
+});
+
 const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_states: getStates,
   ha_get_history: getHistory,
@@ -707,6 +797,7 @@ const TOOLS: Record<ToolName, ToolSpec<z.ZodType>> = {
   ha_get_trace: getTrace,
   ha_write_config: writeConfig,
   ha_call_service: callService,
+  ha_helper_flow: helperFlow,
 };
 
 /** Built once, so each tool's definition is identical for every Caller. */

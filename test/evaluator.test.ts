@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fc from 'fast-check';
-import { decideServiceCall, planServiceCall, type Expansion, type Selectors } from '../src/evaluator.ts';
-import { parsePolicy, type Policy } from '../src/policy.ts';
+import { decideConfigWrite, decideHelperFlow, decideServiceCall, planServiceCall, type Expansion, type HelperFlow, type Selectors } from '../src/evaluator.ts';
+import { CONFIG_KINDS, parsePolicy, type Policy } from '../src/policy.ts';
 
 const HASH = 'a'.repeat(64);
 const policyOf = (rules: string) => parsePolicy(`version: 1\ncallers:\n  agent:\n    keys: [{ sha256: ${HASH} }]\n${rules}`);
@@ -161,4 +161,37 @@ test('property: an allowed call has every entity covered by a Grant, so one unco
 
 test('property: adding a Grant never turns an allow into a deny', () => {
   fc.assert(fc.property(scenario, (s) => !decide(s) || decide(s, [...s.grants, s.extra])));
+});
+
+const writeGrants = fc.array(fc.record({ caller: fc.constantFrom('agent', 'other'), config_write: fc.constantFrom(...CONFIG_KINDS) }), { maxLength: 4 });
+const flow: fc.Arbitrary<HelperFlow> = fc.oneof(
+  fc.record({ action: fc.constant('start' as const), handler: fc.constantFrom('template', 'hue') }),
+  fc.record({ action: fc.constant('step' as const), flow_id: fc.oneof(fc.constant('9f2c4e1a7b3d4c8e'), fc.constant('../../automation/config/x'), fc.string()), input: fc.constant({}) }),
+  fc.record({ action: fc.constant('abort' as const), flow_id: fc.oneof(fc.constant('9f2c4e1a7b3d4c8e'), fc.constant('../../automation/config/x'), fc.string()) }),
+);
+const holds = (grants: { caller: string; config_write: string }[], kind: string) => grants.some((g) => g.caller === 'agent' && g.config_write === kind);
+
+test('property: only helper_entry allows a wizard-helper flow, never helper, and helper_entry allows no helper write', () => {
+  fc.assert(
+    fc.property(writeGrants, flow, (grants, f) => {
+      const policy = asPolicy(grants as unknown as Rule[], []);
+      const integration = f.action === 'start' ? f.handler : 'template';
+      const allowed = decideHelperFlow(policy, 'agent', f, integration, ['template']).allowed !== undefined;
+      const helper = decideConfigWrite(policy, 'agent', { kind: 'helper', action: 'create', id: 'input_boolean.x', config: {} }).allowed !== undefined;
+      const entry = decideConfigWrite(policy, 'agent', { kind: 'helper_entry', action: 'create', id: 'x', config: {} }).allowed !== undefined;
+      return (!allowed || holds(grants, 'helper_entry')) && helper === holds(grants, 'helper') && !entry;
+    }),
+  );
+});
+
+test("property: a flow is allowed only for an integration in HA's helper list, and only within HA's flow API", () => {
+  fc.assert(
+    fc.property(flow, fc.constantFrom('template', 'hue'), (f, integration) => {
+      const policy = asPolicy([{ caller: 'agent', config_write: 'helper_entry' }] as unknown as Rule[], []);
+      const { allowed } = decideHelperFlow(policy, 'agent', f, integration, ['template']);
+      if (allowed?.write.via !== 'rest') return allowed === undefined;
+      const { path } = allowed.write.request;
+      return integration === 'template' && new URL(path, 'http://ha').pathname.startsWith('/api/config/config_entries/flow') && !path.includes('..');
+    }),
+  );
 });

@@ -212,7 +212,8 @@ export type ConfigWriteDecision = { allowed: Allowed & { write: Write }; grants:
 
 /** A config write needs a config-write Grant of its kind; the Allowed names the exact request. */
 export function decideConfigWrite(policy: Policy, caller: string, write: ConfigWrite): ConfigWriteDecision {
-  const grants = writersOf(policy, caller, write.kind);
+  // A wizard helper has no config to write: only its flow, decided below, makes one.
+  const grants = write.kind === 'helper_entry' ? [] : writersOf(policy, caller, write.kind);
   if (grants.length === 0) return { allowed: undefined, grants: [] };
   return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: writeOf(write) }), grants };
 }
@@ -228,4 +229,31 @@ export function mergedUpdate(allowed: Allowed, stored: Record<string, unknown>):
     return issue({ ...allowed, write: { via: 'websocket', command: { ...item, ...write.command } } });
   }
   throw new Error('only an issued config update merges');
+}
+
+/** HA names a flow by a random hex id; anything else could walk the REST path out of the flow API. */
+export const FLOW_ID = /^[0-9A-Za-z]+$/;
+
+/** One request to HA's setup flow for a wizard helper. */
+export type HelperFlow =
+  | { action: 'start'; handler: string }
+  | { action: 'step'; flow_id: string; input: Record<string, unknown> }
+  | { action: 'abort'; flow_id: string };
+
+const FLOW_PATH = '/api/config/config_entries/flow';
+function flowRequest(flow: HelperFlow): RestRequest {
+  if (flow.action === 'start') return { method: 'POST', path: FLOW_PATH, body: { handler: flow.handler } };
+  const path = `${FLOW_PATH}/${flow.flow_id}`;
+  return flow.action === 'step' ? { method: 'POST', path, body: flow.input } : { method: 'DELETE', path };
+}
+
+/**
+ * A flow is driven only for an integration in HA's own live helper list, so `helper_entry` never adds an
+ * integration or drives a discovery; `integration` is the flow's handler as HA reports it.
+ */
+export function decideHelperFlow(policy: Policy, caller: string, flow: HelperFlow, integration: string, helpers: readonly string[]): ConfigWriteDecision {
+  const grants = writersOf(policy, caller, 'helper_entry');
+  const helper = helpers.includes(integration) && (flow.action === 'start' ? flow.handler === integration : FLOW_ID.test(flow.flow_id));
+  if (grants.length === 0 || !helper) return { allowed: undefined, grants: [] };
+  return { allowed: issue({ operation: 'config_write', tier: OPERATION_TIER.config_write, write: { via: 'rest', request: flowRequest(flow) } }), grants };
 }

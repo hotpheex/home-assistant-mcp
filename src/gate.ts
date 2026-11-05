@@ -39,11 +39,17 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'trace/get',
     'config/entity_registry/list',
     ...HELPER_DOMAINS.map((d) => `${d}/list`),
+    'config_entries/flow/progress',
   ]),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
-/** Config read may GET a stored config; any other REST request must be the exact write an Allowed names. */
-const CONFIG_PATH = /^\/api\/config\/(automation|script|scene)\/config\/[^/]+$/;
+/** Config read may GET these: a stored config, and the lookups a helper flow needs; any other REST request must be the exact write an Allowed names. */
+const CONFIG_PATHS = [
+  /^\/api\/config\/(automation|script|scene)\/config\/[^/]+$/,
+  /^\/api\/config\/config_entries\/flow_handlers\?type=helper$/,
+  /^\/api\/config\/config_entries\/entry\?type=helper$/,
+  /^\/api\/config\/config_entries\/flow\/[0-9A-Za-z]+$/,
+];
 
 export type Command = { type: string } & Record<string, unknown>;
 /** A request to HA's config REST API, the only REST the server makes. */
@@ -208,7 +214,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
     async rest(allowed, request) {
       issuedOnly(allowed);
       const write = allowed.write?.via === 'rest' && request === allowed.write.request;
-      const lookup = allowed.operation === 'config_read' && request.method === 'GET' && CONFIG_PATH.test(request.path);
+      const lookup = allowed.operation === 'config_read' && request.method === 'GET' && CONFIG_PATHS.some((p) => p.test(request.path));
       if (!write && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
       if (!connections.get(allowed.tier)?.connected) throw new HaUnavailable();
       try {
