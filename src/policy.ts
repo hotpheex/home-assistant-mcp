@@ -12,7 +12,16 @@ const service = z
     else if (!/^[a-z0-9_]+\.([a-z0-9_]+|\*)$/.test(ctx.value)) ctx.issues.push({ code: 'custom', input: ctx.value, message: 'must be <domain>.<service> or <domain>.*' });
   });
 
-export const CONFIG_KINDS = ['automation', 'script', 'scene', 'helper'] as const;
+export const CONFIG_KINDS = [
+  'automation',
+  'script',
+  'scene',
+  'helper',
+  'entity_name',
+  'zone',
+  'dashboard',
+  'helper_entry',
+] as const;
 
 const target = z
   .strictObject({ domain: z.union([z.literal('*'), name]).optional(), area: name.optional(), label: name.optional() })

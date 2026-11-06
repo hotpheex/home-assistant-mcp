@@ -1,6 +1,8 @@
+import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { WebSocketServer } from 'ws';
+import { parse } from 'yaml';
 
 export interface FakeState {
   entity_id: string;
@@ -64,9 +66,64 @@ export interface FakeHaOptions {
   traces?: FakeTrace[];
   /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
+  statistics?: FakeStatistic[];
+  /** How each template renders; one not listed renders as its own text, as a static template does. */
+  templates?: Record<string, FakeTemplate>;
+  /** HA's system log entries, oldest first, in `system_log/list`'s shape. */
+  systemLog?: Record<string, unknown>[];
+  /** Stored (UI) zones. */
+  zones?: Record<string, unknown>[];
+  /** Installed blueprints by domain and path, each as `blueprint/list` gives it: `{metadata}` or `{error}`. */
+  blueprints?: Record<string, Record<string, Record<string, unknown>>>;
+  /** Dashboard collection items, as `lovelace/dashboards/list` serves them. */
+  dashboards?: Record<string, unknown>[];
+  /** Saved layouts by url_path; `lovelace` is the default dashboard, which HA reaches by omitting url_path. */
+  layouts?: Record<string, Record<string, unknown>>;
+  /** Config entries, of helper integrations and others. */
+  entries?: FakeConfigEntry[];
+  /** Config flows already in progress, such as a discovery HA started. */
+  flows?: FakeFlow[];
+  /** Options flows in progress; each one's `handler` is its entry's id. */
+  optionsFlows?: FakeFlow[];
 }
 
+/** A config entry, with the fields HA's entry list serves that the tools read. */
+export interface FakeConfigEntry {
+  entry_id: string;
+  domain: string;
+  title: string;
+  source: string;
+  options: Record<string, unknown>;
+}
+/** A config flow in progress: its integration, how it began, and its current step. */
+export interface FakeFlow {
+  flow_id: string;
+  handler: string;
+  source: string;
+  step_id: string;
+}
+/** HA 2026.10.4's helper list, which it builds from integration manifests. */
+const HELPER_HANDLERS = ['derivative', 'filter', 'generic_hygrostat', 'generic_thermostat', 'group', 'history_stats', 'integration', 'min_max', 'mold_indicator', 'otp', 'random', 'statistics', 'switch_as_x', 'template', 'threshold', 'tod', 'trend', 'utility_meter'];
+/** Setup steps, cut to what the tests drive: a menu's options, or a form's fields and the field that titles the entry it creates. */
+type FlowStep = { menu: string[] } | { fields: Record<string, boolean>; title: string };
+const FLOW_STEPS: Record<string, Record<string, FlowStep>> = {
+  template: {
+    user: { menu: ['alarm_control_panel', 'binary_sensor', 'button', 'sensor', 'switch'] },
+    sensor: { fields: { name: true, state: true, unit_of_measurement: false }, title: 'name' },
+  },
+  switch_as_x: { user: { fields: { entity_id: true, invert: false, target_domain: true }, title: 'entity_id' } },
+  // An integration, not a helper: no helper_entry call may ever drive it.
+  hue: { user: { fields: { host: true }, title: 'host' } },
+};
+/** Each integration's options form, cut to one step: HA's template options skip their empty `init` to the entry's own type. */
+const OPTIONS_FORMS: Record<string, { step_id: string; fields: Record<string, boolean> }> = {
+  template: { step_id: 'sensor', fields: { state: true, unit_of_measurement: false } },
+  hue: { step_id: 'init', fields: { allow_hue_groups: false } },
+};
+
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
+/** What HA's `config/entity_registry/update` schema takes besides `entity_id`. */
+const REGISTRY_UPDATE_KEYS = ['aliases', 'area_id', 'categories', 'device_class', 'icon', 'labels', 'name', 'new_entity_id', 'disabled_by', 'hidden_by', 'options_domain', 'options'];
 const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
 /** Each helper's storage schema in HA 2026.10: its required keys, the defaults it fills, and its other keys besides `icon`. */
 const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<string, unknown>; optional: string[] }> = {
@@ -83,6 +140,17 @@ const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<stri
 /** HA validates the whole body of a config POST, so a partial one is refused. */
 const REQUIRED_KEYS: Record<string, string[]> = { automation: ['triggers', 'actions'], script: ['sequence'], scene: ['name', 'entities'] };
 
+/** A long-term statistic's metadata, and its rows per period, each with an ISO `start` and its type values. */
+export interface FakeStatistic {
+  statistic_id: string;
+  name: string | null;
+  source: string;
+  unit_of_measurement: string | null;
+  has_sum: boolean;
+  mean_type: number;
+  periods: Partial<Record<'5minute' | 'hour' | 'day' | 'week' | 'month', ({ start: string } & Partial<Record<'min' | 'max' | 'mean' | 'sum' | 'state' | 'change', number>>)[]>>;
+}
+
 /** A stored run: summary fields plus the sections only trace/get returns. */
 export interface FakeTrace extends Record<string, unknown> {
   domain: 'automation' | 'script';
@@ -91,6 +159,17 @@ export interface FakeTrace extends Record<string, unknown> {
   timestamp: { start: string; finish: string };
 }
 const TRACE_SECTIONS = ['trace', 'config', 'blueprint_inputs', 'context'];
+
+/** A template's render: its result, needing `variable` if named, a compile or render error, or `seconds` of work. */
+export interface FakeTemplate {
+  result?: unknown;
+  variable?: string;
+  compileError?: string;
+  renderError?: string;
+  seconds?: number;
+}
+/** Python's str() of the float HA coerces a timeout to. */
+const pyFloat = (n: number) => (Number.isInteger(n) ? n.toFixed(1) : String(n));
 
 /** A command the server sent after authenticating, with the token of the connection it came on. */
 export interface Received {
@@ -211,24 +290,46 @@ export async function startFakeHa(options: FakeHaOptions) {
   let down = false;
   let hung = false;
   let refused = 0;
-  const entities = options.entities ?? [];
+  // A copy, since a registry update changes it and the seed is shared across tests.
+  const entities = structuredClone(options.entities ?? []);
   const entityEntry = (e: FakeEntity) => {
     const entry: Partial<FakeEntity> = { name: null, device_id: null, area_id: null, labels: [], hidden_by: null, disabled_by: null, entity_category: null, ...e };
     delete entry.aliases;
     return entry;
   };
-  type Handler = (token: string, msg: Message) => unknown;
+  /** The command's connection, for a handler that opens a subscription. */
+  interface Connection {
+    /** Queues an `event` on this command's subscription, sent after its `result`. */
+    emit(event: unknown): void;
+    subscriptions: Set<number>;
+  }
+  type Handler = (token: string, msg: Message, conn: Connection) => unknown;
   /** HA's require_admin. */
-  const adminOnly = (handler: Handler): Handler => (token, msg) =>
-    options.users[token]?.is_admin ? handler(token, msg) : haError('unauthorized', 'Unauthorized');
+  const adminOnly = (handler: Handler): Handler => (token, msg, conn) =>
+    options.users[token]?.is_admin ? handler(token, msg, conn) : haError('unauthorized', 'Unauthorized');
   const configs = structuredClone(options.configs ?? {});
+  const entries = structuredClone(options.entries ?? []);
+  const flows = structuredClone(options.flows ?? []);
+  const optionsFlows = structuredClone(options.optionsFlows ?? []);
   const helpers = structuredClone(options.helpers ?? {});
+  const zones = structuredClone(options.zones ?? []);
+  const blueprints = structuredClone(options.blueprints ?? {});
+  const dashboards = structuredClone(options.dashboards ?? []);
+  const layouts = structuredClone(options.layouts ?? {});
+  /** HA's `_handle_errors`: no url_path is the default dashboard, and any other must be a listed one. */
+  const layoutKey = (msg: Message) =>
+    msg.url_path === undefined || msg.url_path === null
+      ? 'lovelace'
+      : dashboards.some((d) => d.url_path === msg.url_path)
+        ? (msg.url_path as string)
+        : haError('config_not_found', `Unknown config specified: ${msg.url_path as string}`);
   const configOf = adminOnly((_, msg) => {
     const config = configs[msg.entity_id as string];
     return config && (msg.entity_id as string).startsWith(`${msg.type.split('/')[0]}.`) ? { config } : haError('not_found', 'Entity not found');
   });
   const handlers: Record<string, Handler> = {
     supported_features: () => null,
+    unsubscribe_events: (_, msg, conn) => (conn.subscriptions.delete(msg.subscription as number) ? null : haError('not_found', 'Subscription not found.')),
     get_states: () =>
       (options.states ?? []).map((s) => ({
         ...s,
@@ -268,6 +369,15 @@ export async function startFakeHa(options: FakeHaOptions) {
           return [id, e ? { ...entityEntry(e), aliases: e.aliases ?? [] } : null];
         }),
       ),
+    'config/entity_registry/update': adminOnly((_, msg) => {
+      const entity = entities.find((e) => e.entity_id === msg.entity_id) ?? haError('not_found', 'Entity not found');
+      const changes = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'entity_id'].includes(k)));
+      const extra = Object.keys(changes).find((k) => !REGISTRY_UPDATE_KEYS.includes(k));
+      if (extra) haError('invalid_format', `extra keys not allowed @ data['${extra}']`);
+      const { new_entity_id, ...fields } = changes;
+      Object.assign(entity, fields, typeof new_entity_id === 'string' && { entity_id: new_entity_id });
+      return { entity_entry: { ...entityEntry(entity), aliases: entity.aliases ?? [] } };
+    }),
     'config/device_registry/list': () => options.devices ?? [],
     'config/area_registry/list': () => options.areas ?? [],
     'config/label_registry/list': () => options.labels ?? [],
@@ -299,10 +409,114 @@ export async function startFakeHa(options: FakeHaOptions) {
         options.traces?.find((tr) => tr.domain === msg.domain && tr.item_id === msg.item_id && tr.run_id === msg.run_id) ??
         haError('not_found', 'The trace could not be found'),
     ),
+    // Only flows a user did not start, such as discoveries.
+    'config_entries/flow/progress': adminOnly(() =>
+      flows.filter((f) => !['user', 'reconfigure'].includes(f.source)).map((f) => ({ flow_id: f.flow_id, handler: f.handler, step_id: f.step_id, context: { source: f.source } })),
+    ),
+    'config_entries/get_single': adminOnly((_, msg) => {
+      const entry = entries.find((e) => e.entry_id === msg.entry_id);
+      return entry ? { config_entry: served(entry) } : haError('not_found', 'Config entry not found');
+    }),
     'logbook/get_events': (_, msg) =>
       (options.logbook ?? [])
         .filter((e) => inWindow(e.when, msg) && (msg.entity_ids === undefined || (msg.entity_ids as string[]).includes(e.entity_id ?? '')))
         .map((e) => ({ ...e, when: seconds(e.when) })),
+    'recorder/list_statistic_ids': () =>
+      (options.statistics ?? []).map(({ statistic_id, name, source, unit_of_measurement, has_sum, mean_type }) => ({
+        statistic_id,
+        display_unit_of_measurement: unit_of_measurement,
+        has_mean: mean_type === 1,
+        mean_type,
+        has_sum,
+        name,
+        source,
+        statistics_unit_of_measurement: unit_of_measurement,
+        unit_class: null,
+      })),
+    'recorder/statistics_during_period': (_, msg) => {
+      const period = msg.period as keyof FakeStatistic['periods'];
+      const ms = { '5minute': 300_000, hour: 3_600_000, day: 86_400_000, week: 604_800_000, month: 2_592_000_000 }[period];
+      if (ms === undefined || !Array.isArray(msg.statistic_ids) || msg.statistic_ids.length === 0) return haError('invalid_format', 'Invalid statistics request');
+      const types = msg.types as string[];
+      const [from, to] = [Date.parse(msg.start_time as string), msg.end_time === undefined ? Date.now() : Date.parse(msg.end_time as string)];
+      const out: Record<string, Record<string, number | null>[]> = {};
+      for (const s of (options.statistics ?? []).filter((x) => (msg.statistic_ids as string[]).includes(x.statistic_id))) {
+        const rows = (s.periods[period] ?? [])
+          .filter((r) => from <= Date.parse(r.start) && Date.parse(r.start) < to)
+          .map((r) => ({ start: Date.parse(r.start), end: Date.parse(r.start) + ms, ...Object.fromEntries(types.map((k) => [k, new Map(Object.entries(r)).get(k) ?? null])) }));
+        if (rows.length > 0) out[s.statistic_id] = rows;
+      }
+      return out;
+    },
+    // HA 2026.10's handle_render_template: the timeout check, then a compile error as the result, then events.
+    render_template: (_, msg, conn) => {
+      const template = typeof msg.template === 'string' ? msg.template : haError('invalid_format', "required key not provided @ data['template']");
+      const render = options.templates?.[template] ?? { result: template };
+      const timeout = msg.timeout === undefined ? 0 : Number(msg.timeout);
+      if (timeout && (render.seconds ?? 0) > timeout) haError('template_error', `Exceeded maximum execution time of ${pyFloat(timeout)}s`);
+      if (render.compileError !== undefined) haError('template_error', render.compileError);
+      const report = msg.report_errors === true;
+      const missing = render.variable !== undefined && !Object.hasOwn((msg.variables as Record<string, unknown> | undefined) ?? {}, render.variable);
+      const renderError = render.renderError ?? (missing && msg.strict === true ? `UndefinedError: '${render.variable}' is undefined` : undefined);
+      if (renderError !== undefined) {
+        if (report) conn.emit({ error: renderError, level: 'ERROR' });
+        return null;
+      }
+      if (missing && report) conn.emit({ error: `'${render.variable}' is undefined`, level: 'WARNING' });
+      const entities = [...template.matchAll(/states\(['"]([\w.]+)['"]\)/g)].map((m) => m[1]);
+      conn.emit({ result: missing ? '' : render.result, listeners: { all: false, domains: [], entities, time: false } });
+      return null;
+    },
+    // HA lists its deduplicated log newest first.
+    'system_log/list': adminOnly(() => [...(options.systemLog ?? [])].reverse()),
+    'blueprint/list': adminOnly((_, msg) => blueprints[msg.domain as string] ?? {}),
+    // HA appends `.yaml` to a saved path, but deletes the path exactly as given.
+    'blueprint/save': adminOnly((_, msg) => {
+      const domain = msg.domain as string;
+      const metadata = (parse(msg.yaml as string) as { blueprint?: { domain?: string } } | null)?.blueprint;
+      if (metadata?.domain !== domain) haError('invalid_format', `Invalid blueprint: Found incorrect blueprint type ${metadata?.domain}, expected ${domain}`);
+      const path = (msg.path as string).endsWith('.yaml') ? (msg.path as string) : `${msg.path as string}.yaml`;
+      const stored = (blueprints[domain] ??= {});
+      const exists = path in stored;
+      if (exists && msg.allow_override !== true) haError('already_exists', 'File already exists');
+      stored[path] = { metadata };
+      return { overrides_existing: exists };
+    }),
+    'blueprint/delete': adminOnly((_, msg) => {
+      const stored = blueprints[msg.domain as string] ?? {};
+      const path = msg.path as string;
+      if (!(path in stored)) haError('unknown_error', `[Errno 2] No such file or directory: '${path}'`);
+      delete stored[path];
+      return null;
+    }),
+    'lovelace/dashboards/list': () => dashboards,
+    'lovelace/config': (_, msg) => layouts[layoutKey(msg)] ?? haError('config_not_found', 'No config found.'),
+    'lovelace/config/save': adminOnly((_, msg) => {
+      layouts[layoutKey(msg)] = msg.config as Record<string, unknown>;
+      return null;
+    }),
+    // The default panel always exists, so no dashboard can take lovelace; a collection id is the slugified path, suffixed if taken.
+    'lovelace/dashboards/create': adminOnly((_, msg) => {
+      const fields = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'allow_single_word'].includes(k)));
+      const path = fields.url_path as string;
+      if (msg.allow_single_word !== true && !path.includes('-')) haError('invalid_format', 'Url path needs to contain a hyphen (-)');
+      if (path === 'lovelace' || dashboards.some((d) => d.url_path === path)) haError('home_assistant_error', `The URL "${path}" is already in use`);
+      const extra = Object.keys(fields).find((k) => !['url_path', 'title', 'icon', 'show_in_sidebar', 'require_admin', 'mode'].includes(k));
+      if (extra) haError('invalid_format', `extra keys not allowed @ data['${extra}']`);
+      if (typeof fields.title !== 'string') haError('invalid_format', "required key not provided @ data['title']");
+      const base = path.replace(/[^a-z0-9]+/g, '_');
+      let id = base;
+      for (let n = 2; dashboards.some((d) => d.id === id); n++) id = `${base}_${n}`;
+      const item = { id, show_in_sidebar: true, require_admin: false, mode: 'storage', ...fields };
+      dashboards.push(item);
+      return item;
+    }),
+    'lovelace/dashboards/delete': adminOnly((_, msg) => {
+      const item = dashboards.find((d) => d.id === msg.dashboard_id) ?? haError('not_found', `Unable to find dashboard_id ${String(msg.dashboard_id)}`);
+      dashboards.splice(dashboards.indexOf(item), 1);
+      delete layouts[String(item.url_path)];
+      return null;
+    }),
   };
   for (const domain of HELPER_DOMAINS) {
     const items = () => (helpers[domain] ??= []);
@@ -334,36 +548,151 @@ export async function startFakeHa(options: FakeHaOptions) {
       return null;
     });
   }
+  // HA 2026.10's zone collection: a create fills radius and passive, and an update validates only the keys it sends and merges them.
+  const ZONE_KEYS = ['name', 'latitude', 'longitude', 'radius', 'passive', 'icon'];
+  const zoneFields = (msg: Message) => {
+    const fields = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'zone_id'].includes(k)));
+    const extra = Object.keys(fields).find((k) => !ZONE_KEYS.includes(k));
+    return extra ? haError('invalid_format', `extra keys not allowed @ data['${extra}']`) : fields;
+  };
+  const zoneOf = (msg: Message) => zones.find((z) => z.id === msg.zone_id) ?? haError('not_found', `Unable to find zone_id ${String(msg.zone_id)}`);
+  handlers['zone/list'] = () => zones;
+  handlers['zone/create'] = adminOnly((_, msg) => {
+    const fields = zoneFields(msg);
+    const missing = ['name', 'latitude', 'longitude'].find((k) => !(k in fields));
+    if (missing) haError('invalid_format', `required key not provided @ data['${missing}']. Got None`);
+    const zone = { id: String(fields.name).toLowerCase().replace(/[^a-z0-9]+/g, '_'), radius: 100, passive: false, ...fields };
+    zones.push(zone);
+    return zone;
+  });
+  handlers['zone/update'] = adminOnly((_, msg) => Object.assign(zoneOf(msg), zoneFields(msg)));
+  handlers['zone/delete'] = adminOnly((_, msg) => {
+    zones.splice(zones.indexOf(zoneOf(msg)), 1);
+    return null;
+  });
 
   /** HA's config REST API: automation and scene entries by config id, scripts by object key. */
   const entityOf = (kind: string, id: string) =>
     kind === 'script'
       ? (`script.${id}` in configs ? `script.${id}` : undefined)
       : Object.keys(configs).find((e) => e.startsWith(`${kind}.`) && configs[e]!.id === id);
-  function rest(req: IncomingMessage, res: ServerResponse, raw: string) {
-    const json = (status: number, value: unknown) => void res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
-    const match = /^\/api\/config\/(automation|script|scene)\/config\/([^/]+)$/.exec(req.url ?? '');
-    if (!match) return json(404, { message: 'Not found' });
-    const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
-    if (!options.users[token]?.is_admin) return void res.writeHead(401, { 'content-type': 'text/plain' }).end('401: Unauthorized');
-    const body = raw === '' ? undefined : (JSON.parse(raw) as Record<string, unknown>);
-    const type = `${req.method} ${req.url}`;
-    received.push({ token, message: { type, ...(body !== undefined && { body }) } });
-    if (drop.has(type)) return void req.socket.destroy();
-    if (hung) return;
-    const [, kind, key] = match as unknown as [string, string, string];
-    const id = decodeURIComponent(key);
-    const entity = entityOf(kind, id);
-    if (req.method === 'GET') return entity ? json(200, configs[entity]) : json(404, { message: 'Resource not found' });
-    if (req.method === 'DELETE') {
+  type Json = (status: number, value: unknown) => void;
+  type Route = (match: RegExpExecArray, method: string | undefined, body: Record<string, unknown> | undefined, json: Json) => void;
+  function configRoute([, kind, key]: RegExpExecArray, method: string | undefined, body: Record<string, unknown> | undefined, json: Json) {
+    const id = decodeURIComponent(key!);
+    const entity = entityOf(kind!, id);
+    if (method === 'GET') return entity ? json(200, configs[entity]) : json(404, { message: 'Resource not found' });
+    if (method === 'DELETE') {
       if (!entity) return json(400, { message: 'Resource not found' });
       delete configs[entity];
       return json(200, { result: 'ok' });
     }
-    const missing = REQUIRED_KEYS[kind]!.find((k) => !(k in (body ?? {})));
+    const missing = REQUIRED_KEYS[kind!]!.find((k) => !(k in (body ?? {})));
     if (missing) return json(400, { message: `Message malformed: required key not provided @ data['${missing}']` });
     configs[entity ?? `${kind}.${id}`] = kind === 'script' ? body! : { id, ...body };
     json(200, { result: 'ok' });
+  }
+  /** A flow's current step as HA's flow REST answers it, with HA's keys. */
+  function stepOf(flow: FakeFlow, step: { menu: string[] } | { fields: Record<string, boolean> } = FLOW_STEPS[flow.handler]![flow.step_id]!) {
+    const common = { flow_id: flow.flow_id, handler: flow.handler, step_id: flow.step_id, description_placeholders: null };
+    if ('menu' in step) return { type: 'menu', ...common, menu_options: step.menu };
+    const data_schema = Object.entries(step.fields).map(([name, required]) => ({ name, required, selector: { text: {} } }));
+    return { type: 'form', ...common, data_schema, errors: null, last_step: null, preview: null };
+  }
+  function flowRoute([, id]: RegExpExecArray, method: string | undefined, body: Record<string, unknown> | undefined, json: Json) {
+    const flow = flows.find((f) => f.flow_id === id);
+    if (!flow) return json(404, { message: 'Invalid flow specified' });
+    if (method === 'GET') return json(200, stepOf(flow));
+    if (method === 'DELETE') {
+      flows.splice(flows.indexOf(flow), 1);
+      return json(200, { message: 'Flow aborted' });
+    }
+    const step = FLOW_STEPS[flow.handler]![flow.step_id]!;
+    if ('menu' in step) {
+      flow.step_id = String(body?.next_step_id);
+      return json(200, stepOf(flow));
+    }
+    const input = body ?? {};
+    const missing = Object.keys(step.fields).filter((k) => step.fields[k] && !(k in input));
+    if (missing.length > 0) return json(400, { errors: Object.fromEntries(missing.map((k) => [k, 'required key not provided'])) });
+    flows.splice(flows.indexOf(flow), 1);
+    const entry = { entry_id: newFlowId(), domain: flow.handler, title: String(input[step.title]), source: flow.source, options: input };
+    entries.push(entry);
+    json(200, { type: 'create_entry', flow_id: flow.flow_id, handler: flow.handler, title: entry.title, description: null, description_placeholders: null, options: input, version: 1, minor_version: 1, result: served(entry) });
+  }
+  /** An options flow's one form: a step that passes it saves the input over the entry's options. */
+  function optionsRoute([, id]: RegExpExecArray, method: string | undefined, body: Record<string, unknown> | undefined, json: Json) {
+    const flow = optionsFlows.find((f) => f.flow_id === id);
+    if (!flow) return json(404, { message: 'Invalid flow specified' });
+    const entry = entries.find((e) => e.entry_id === flow.handler)!;
+    const form = OPTIONS_FORMS[entry.domain]!;
+    if (method === 'GET') return json(200, stepOf(flow, form));
+    const input = body ?? {};
+    const missing = Object.keys(form.fields).filter((k) => form.fields[k] && !(k in input));
+    if (method === 'POST' && missing.length > 0) return json(400, { errors: Object.fromEntries(missing.map((k) => [k, 'required key not provided'])) });
+    optionsFlows.splice(optionsFlows.indexOf(flow), 1);
+    if (method === 'DELETE') return json(200, { message: 'Flow aborted' });
+    entry.options = { ...entry.options, ...input };
+    json(200, { type: 'create_entry', flow_id: flow.flow_id, handler: flow.handler, title: '', description: null, description_placeholders: null, version: 1, minor_version: 1 });
+  }
+  /** An entry as HA serves it: its options stay in HA. */
+  const served = ({ entry_id, domain, title, source }: FakeConfigEntry) => ({ entry_id, domain, title, source, state: 'loaded' });
+  const newFlowId = () => randomBytes(16).toString('hex');
+  /** HA's admin-only config REST, matched against the whole URL, query included. */
+  const routes: [RegExp, Route][] = [
+    [/^\/api\/config\/(automation|script|scene)\/config\/([^/]+)$/, configRoute],
+    [/^\/api\/config\/config_entries\/flow_handlers(\?type=helper)?$/, ([, helper], _m, _b, json) => json(200, helper ? HELPER_HANDLERS : [...HELPER_HANDLERS, 'hue'])],
+    [
+      /^\/api\/config\/config_entries\/entry(\?type=helper)?$/,
+      ([, helper], _m, _b, json) => json(200, entries.filter((e) => !helper || HELPER_HANDLERS.includes(e.domain)).map(served)),
+    ],
+    [
+      /^\/api\/config\/config_entries\/flow$/,
+      (_, _m, body, json) => {
+        const handler = String(body?.handler);
+        if (!(handler in FLOW_STEPS)) return json(404, { message: 'Invalid handler specified' });
+        const flow = { flow_id: newFlowId(), handler, source: 'user', step_id: 'user' };
+        flows.push(flow);
+        json(200, stepOf(flow));
+      },
+    ],
+    [/^\/api\/config\/config_entries\/flow\/([^/]+)$/, flowRoute],
+    [
+      /^\/api\/config\/config_entries\/options\/flow$/,
+      (_, _m, body, json) => {
+        const entry = entries.find((e) => e.entry_id === body?.handler);
+        if (!entry || !(entry.domain in OPTIONS_FORMS)) return json(404, { message: 'Invalid handler specified' });
+        const flow = { flow_id: newFlowId(), handler: entry.entry_id, source: 'user', step_id: OPTIONS_FORMS[entry.domain]!.step_id };
+        optionsFlows.push(flow);
+        json(200, stepOf(flow, OPTIONS_FORMS[entry.domain]));
+      },
+    ],
+    [/^\/api\/config\/config_entries\/options\/flow\/([^/]+)$/, optionsRoute],
+    [
+      /^\/api\/config\/config_entries\/entry\/([^/?]+)$/,
+      ([, id], method, _b, json) => {
+        const entry = entries.find((e) => e.entry_id === id);
+        if (method !== 'DELETE' || !entry) return json(method === 'DELETE' ? 404 : 405, { message: 'Invalid entry specified' });
+        entries.splice(entries.indexOf(entry), 1);
+        json(200, { require_restart: false });
+      },
+    ],
+  ];
+  function rest(req: IncomingMessage, res: ServerResponse, raw: string) {
+    const json: Json = (status, value) => void res.writeHead(status, { 'content-type': 'application/json' }).end(JSON.stringify(value));
+    const token = /^Bearer (.+)$/.exec(req.headers.authorization ?? '')?.[1] ?? '';
+    const body = raw === '' ? undefined : (JSON.parse(raw) as Record<string, unknown>);
+    const type = `${req.method} ${req.url}`;
+    received.push({ token, message: { type, ...(body !== undefined && { body }) } });
+    for (const [pattern, route] of routes) {
+      const match = pattern.exec(req.url ?? '');
+      if (!match) continue;
+      if (!options.users[token]?.is_admin) return void res.writeHead(401, { 'content-type': 'text/plain' }).end('401: Unauthorized');
+      if (drop.has(type)) return void req.socket.destroy();
+      if (hung) return;
+      return route(match, req.method, body, json);
+    }
+    json(404, { message: 'Not found' });
   }
 
   const http = createServer((req, res) => {
@@ -379,6 +708,7 @@ export async function startFakeHa(options: FakeHaOptions) {
     }
     let token: string | undefined;
     let lastId = 0;
+    const subscriptions = new Set<number>();
     const send = (m: unknown) => ws.send(JSON.stringify(m));
     send({ type: 'auth_required', ha_version: version });
     ws.on('message', (raw) => {
@@ -408,7 +738,11 @@ export async function startFakeHa(options: FakeHaOptions) {
         return send({ id, type: 'result', success: false, error: { code: 'unknown_command', message: 'Unknown command.' } });
       }
       try {
-        send({ id, type: 'result', success: true, result: handler(token, msg) });
+        const events: unknown[] = [];
+        const result = handler(token, msg, { emit: (event) => void events.push(event), subscriptions });
+        send({ id, type: 'result', success: true, result });
+        if (events.length > 0) subscriptions.add(id);
+        for (const event of events) send({ id, type: 'event', event });
       } catch (e) {
         if (!(e instanceof HaError)) throw e;
         send({ id, type: 'result', success: false, error: { code: e.code, message: e.message } });
@@ -423,6 +757,13 @@ export async function startFakeHa(options: FakeHaOptions) {
     received,
     configs,
     helpers,
+    zones,
+    blueprints,
+    dashboards,
+    layouts,
+    entries,
+    flows,
+    optionsFlows,
     /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
     drop,
     /** Command types recorded and never answered while pings still are, as HA does with a script called directly until it ends. */

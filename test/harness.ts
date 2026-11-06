@@ -68,6 +68,22 @@ export const CONFIGS: Partial<FakeHaOptions> = {
     },
   },
   helpers: { input_text: [{ id: 'nas_url', name: 'NAS URL', initial: 'https://bob:HELPERSECRET@nas.local' }] },
+  blueprints: {
+    automation: {
+      'homeassistant/motion_light.yaml': {
+        metadata: {
+          name: 'Motion-activated Light',
+          description: 'Turn on a light when motion is detected.',
+          domain: 'automation',
+          source_url: 'https://github.com/home-assistant/core/blob/dev/homeassistant/components/automation/blueprints/motion_light.yaml',
+          author: 'Home Assistant',
+          input: { motion_entity: { name: 'Motion Sensor' }, hook: { name: 'Webhook', default: { api_key: 'BPSECRET' } } },
+        },
+      },
+      'mine/broken.yaml': { error: 'Failed to load blueprint: Unable to read file mine/broken.yaml' },
+    },
+    script: { 'homeassistant/confirmable_notification.yaml': { metadata: { name: 'Confirmable Notification', domain: 'script', input: { notify_device: { name: 'Device' } } } } },
+  },
   traces: ['run_1', 'run_2', 'run_3'].map((run_id, i) => ({
     domain: 'automation' as const,
     item_id: 'porch_light_1',
@@ -87,6 +103,18 @@ export const CONFIGS: Partial<FakeHaOptions> = {
   })),
 };
 
+/** Two storage dashboards, one never saved and with a collection id HA suffixed, and a layout with an inline secret; `lovelace` keys the default dashboard's layout. */
+export const DASHBOARDS: Partial<FakeHaOptions> = {
+  dashboards: [
+    { id: 'kitchen_wall', url_path: 'kitchen-wall', title: 'Kitchen wall', icon: 'mdi:tablet', show_in_sidebar: true, require_admin: false, mode: 'storage' },
+    { id: 'spare_room_2', url_path: 'spare-room', title: 'Spare room', show_in_sidebar: false, require_admin: false, mode: 'storage' },
+  ],
+  layouts: {
+    lovelace: { title: 'Home', views: [{ title: 'Home', cards: [{ type: 'entities', entities: ['light.kitchen'] }] }] },
+    'kitchen-wall': { views: [{ title: 'Wall', cards: [{ type: 'iframe', url: 'https://bob:DASHSECRET@cam.local/live' }] }] },
+  },
+};
+
 export function newKey() {
   const key = `hamcp_${randomBytes(32).toString('base64url')}`;
   return { key, sha256: createHash('sha256').update(key).digest('hex') };
@@ -103,6 +131,7 @@ export async function fakeHa(t: TestContext, options: Partial<FakeHaOptions> = {
     services: { light: { turn_on: { target: { entity: [{ domain: ['light'] }] } } } },
     ...REGISTRIES,
     ...CONFIGS,
+    ...DASHBOARDS,
     ...options,
   });
   t.after(() => ha.close());
@@ -200,3 +229,13 @@ export function runImage(image: string, policy: string, env: Record<string, stri
   const logged = (msg: string, ms = 60_000) => until(() => records.some((r) => r.msg === msg), msg, ms);
   return { name, records, exited, logged, url: () => `http://${String(records.find((r) => r.msg === 'listening')?.address)}/mcp` };
 }
+
+/** A template sensor set up through its wizard, and a Hue bridge, an integration no helper_entry call may change; ids are HA's ULIDs. */
+export const TEMPLATE_ENTRY = '01K9W1ZARDTEMP1ATESENS0R01';
+export const HUE_ENTRY = '01K9HUEBR1DGE0000000000001';
+export const WIZARD_ENTRIES: Partial<FakeHaOptions> = {
+  entries: [
+    { entry_id: TEMPLATE_ENTRY, domain: 'template', title: 'Door open minutes', source: 'user', options: { template_type: 'sensor', name: 'Door open minutes', state: '{{ 3 }}' } },
+    { entry_id: HUE_ENTRY, domain: 'hue', title: 'Hue bridge', source: 'zeroconf', options: {} },
+  ],
+};

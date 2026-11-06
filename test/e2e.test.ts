@@ -170,6 +170,8 @@ suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP
       - domain: automation
   - caller: operator
     config_write: automation
+  - caller: operator
+    config_write: helper_entry
   - caller: expander
     services: [switch.turn_on]
     targets:
@@ -179,6 +181,8 @@ suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP
     services: [button.press]
     targets:
       - domain: button
+  - caller: operator
+    config_write: entity_name
 denies:
   - caller: expander
     services: [button.press]
@@ -198,7 +202,7 @@ denies:
     for (const fn of cleanups.reverse()) fn();
   });
 
-  e2e('each of the ten tools runs once, and no canary appears in any byte they return', async (t) => {
+  e2e('every read, a service call and a config write run once, and no canary appears in any byte they return', async (t) => {
     // Each canary sits in what HA itself returns, so only the server keeps it out.
     const tokens = new Set<string>();
     const collectTokens = async () => {
@@ -236,6 +240,13 @@ denies:
     let traces: { run_id: string }[] = [];
     await eventually(async () => (traces = listed<{ run_id: string }>((await call('ha_list_traces', { kind: 'automation', id: 'canary' })).traces)).length > 0, 'a trace', 30_000);
     await call('ha_get_trace', { kind: 'automation', id: 'canary', run_id: traces[0]!.run_id, sections: ['trace', 'config', 'context'] });
+    await call('ha_get_statistics', {});
+    assert.deepEqual((await call('ha_get_statistics', { statistic_ids: ['sensor.e2e_none'], period: 'day' })).statistics, []);
+    await call('ha_render_template', { template: "{{ states('switch.e2e_plug') }}" });
+    await call('ha_get_dashboard', {});
+    await call('ha_get_logs', { limit: 10 });
+    assert.ok(Number((await call('ha_list_blueprints', {})).total) > 0, "HA's own blueprints are listed");
+    assert.ok(((await call('ha_helper_flow', { action: 'list' })).handlers as string[]).includes('template'));
     await call('ha_write_config', {
       kind: 'automation',
       action: 'create',
@@ -289,6 +300,19 @@ denies:
     assert.deepEqual([audit?.uncovered, audit?.denies], [[], [0]]);
   });
 
+  e2e('an entity_name write renames and aliases an entity in HA, and HA keeps every other registry field', async (t) => {
+    const client = await connect(t, server.url(), operator.key, 'modern');
+    const entity_id = 'switch.e2e_hub_outlet_b';
+    const entry = async () => (await owner.sendMessagePromise<Record<string, Record<string, unknown>>>({ type: 'config/entity_registry/get_entries', entity_ids: [entity_id] }))[entity_id]!;
+    const before = await entry();
+    const config = { name: 'Kettle', icon: 'mdi:kettle', aliases: ['Tea maker'] };
+    const write = await client.callTool({ name: 'ha_write_config', arguments: { kind: 'entity_name', action: 'update', id: entity_id, config } });
+    assert.equal(write.isError, undefined, JSON.stringify(write.content));
+    const after = await entry();
+    assert.deepEqual([after.name, after.icon, after.aliases], [config.name, config.icon, config.aliases]);
+    for (const key of ['entity_id', 'area_id', 'labels', 'hidden_by', 'disabled_by', 'device_id']) assert.deepEqual(after[key], before[key], key);
+  });
+
   e2e('startup refuses a users-tier token that belongs to an HA admin', async (t) => {
     const refused = runImage(image!, readerPolicy, { HAMCP_HA_URL: HA, HAMCP_HA_USERS_TOKEN: adminToken }, (fn) => t.after(fn));
     assert.equal(await refused.exited, 1);
@@ -302,5 +326,77 @@ denies:
     await agent.sendMessagePromise({ type: 'auth/delete_refresh_token', refresh_token_id: tokens.find((r) => r.client_name === 'hamcp-e2e-revoked')?.id });
     assert.equal(await running.exited, 1);
     assert.ok(running.records.some((r) => r.level === 'error' && /rejected the users-tier token/.test(String(r.msg))));
+  });
+
+  e2e('a template renders from its subscription\'s first event, and a render error or an over-long render comes back as HA\'s error', async (t) => {
+    const client = await connect(t, server.url(), operator.key, 'modern');
+    const render = (args: Record<string, unknown>) => client.callTool({ name: 'ha_render_template', arguments: args });
+    const plug = (await owner.sendMessagePromise<{ entity_id: string; state: string }[]>({ type: 'get_states' })).find((s) => s.entity_id === 'switch.e2e_plug');
+    const rendered = await render({ template: "{{ states('switch.e2e_plug') }} at {{ when }}", variables: { when: 'dusk' } });
+    assert.deepEqual(body(rendered), { result: `${plug?.state} at dusk`, listeners: { all: false, domains: [], entities: ['switch.e2e_plug'], time: false } });
+    const undefinedName = await render({ template: '{{ nope }}' });
+    assert.ok(undefinedName.isError);
+    assert.match(JSON.stringify(undefinedName.content), /could not render the template: UndefinedError: 'nope' is undefined/);
+    const slow = await render({ template: '{% for i in range(100000) %}{% for j in range(100000) %}{% endfor %}{% endfor %}', timeout: 0.5 });
+    assert.ok(slow.isError);
+    assert.match(JSON.stringify(slow.content), /Exceeded maximum execution time of 0\.5s/);
+  });
+
+  e2e('a blueprint saved from YAML is listed under its path with .yaml added, and a delete by that path removes it', async (t) => {
+    const client = await connect(t, server.url(), operator.key, 'modern');
+    const yaml = 'blueprint:\n  name: E2E dusk\n  domain: automation\n  input:\n    lamp:\n      name: Lamp\ntriggers:\n  - trigger: sun\n    event: sunset\nactions:\n  - action: light.turn_on\n    target:\n      entity_id: !input lamp\n';
+    const saved = await client.callTool({ name: 'ha_write_blueprint', arguments: { domain: 'automation', action: 'create', path: 'e2e/dusk', yaml } });
+    assert.ok(!saved.isError, JSON.stringify(saved.content));
+    type Listed = { path: string; name?: string; inputs?: Record<string, { name?: string }> };
+    const list = async () => (body(await client.callTool({ name: 'ha_list_blueprints', arguments: { domain: 'automation', limit: 500 } })) as { blueprints: Listed[] }).blueprints;
+    const dusk = (await list()).find((b) => b.path === 'e2e/dusk.yaml');
+    assert.deepEqual([dusk?.name, dusk?.inputs?.lamp?.name], ['E2E dusk', 'Lamp']);
+    const deleted = await client.callTool({ name: 'ha_write_blueprint', arguments: { domain: 'automation', action: 'delete', path: 'e2e/dusk' } });
+    assert.ok(!deleted.isError, JSON.stringify(deleted.content));
+    assert.equal((await list()).some((b) => b.path === 'e2e/dusk.yaml'), false);
+  });
+
+  e2e("wizard helpers are set up, edited and deleted through HA's own flows: a template sensor end to end, and a switch_as_x light that hides its switch", async (t) => {
+    const client = await connect(t, server.url(), operator.key, 'modern');
+    const flow = async (args: Record<string, unknown>) => {
+      const result = await client.callTool({ name: 'ha_helper_flow', arguments: args });
+      assert.ok(!result.isError, JSON.stringify(result.content));
+      return body(result) as Record<string, unknown>;
+    };
+    const states = () => owner.sendMessagePromise<(HaState & { state: string })[]>({ type: 'get_states' });
+
+    const menu = await flow({ action: 'start', handler: 'template' });
+    assert.deepEqual([menu.type, (menu.menu_options as string[]).includes('sensor')], ['menu', true]);
+    const step = (input: Record<string, unknown>) => ({ action: 'step', flow_id: menu.flow_id, input });
+    assert.equal((await flow(step({ next_step_id: 'sensor' }))).step_id, 'sensor');
+    const rejected = await client.callTool({ name: 'ha_helper_flow', arguments: step({ name: 'E2E minutes' }) });
+    assert.ok(rejected.isError);
+    assert.match(JSON.stringify(rejected.content), /refused the input: .*state.*still open/);
+    const sensor = await flow(step({ name: 'E2E minutes', state: '{{ 6 * 7 }}' }));
+    assert.equal(sensor.type, 'create_entry');
+    await eventually(async () => (await states()).some((s) => s.entity_id === 'sensor.e2e_minutes' && s.state === '42'), 'the template sensor', 30_000);
+
+    const wrap = await flow({ action: 'start', handler: 'switch_as_x' });
+    const wrapped = await flow({ action: 'step', flow_id: wrap.flow_id, input: { entity_id: 'switch.e2e_plug', target_domain: 'light' } });
+    const entryId = (wrapped.result as { entry_id: string }).entry_id;
+    // Removing the entry unhides the switch for the other cases.
+    t.after(() => fetch(`${HA}/api/config/config_entries/entry/${entryId}`, { method: 'DELETE', headers: { authorization: `Bearer ${adminToken}` } }));
+    const plug = await owner.sendMessagePromise<{ hidden_by: string | null }>({ type: 'config/entity_registry/get', entity_id: 'switch.e2e_plug' });
+    assert.equal(plug.hidden_by, 'integration');
+
+    const { handlers, entries } = await flow({ action: 'list' });
+    assert.ok((handlers as string[]).includes('template') && !(handlers as string[]).includes('hamcp_house'));
+    assert.deepEqual((entries as { domain: string }[]).map((e) => e.domain).sort(), ['switch_as_x', 'template']);
+    const refused = await client.callTool({ name: 'ha_helper_flow', arguments: { action: 'start', handler: 'hamcp_house' } });
+    assert.match(JSON.stringify(refused.content), /does not list hamcp_house as a helper integration/);
+
+    // The template's options form skips its empty first step to the sensor's own form.
+    const sensorEntry = (sensor.result as { entry_id: string }).entry_id;
+    const options = await flow({ action: 'edit', entry_id: sensorEntry });
+    assert.deepEqual([options.type, options.step_id], ['form', 'sensor']);
+    assert.equal((await flow({ action: 'step', flow_id: options.flow_id, input: { state: '{{ 6 * 8 }}' } })).type, 'create_entry');
+    await eventually(async () => (await states()).some((s) => s.entity_id === 'sensor.e2e_minutes' && s.state === '48'), 'the edited template sensor', 30_000);
+    assert.deepEqual(await flow({ action: 'delete', entry_id: sensorEntry }), { require_restart: false });
+    assert.equal(((await flow({ action: 'list' })).entries as { entry_id: string }[]).some((e) => e.entry_id === sensorEntry), false);
   });
 });

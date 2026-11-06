@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fc from 'fast-check';
-import { decideServiceCall, planServiceCall, type Expansion, type Selectors } from '../src/evaluator.ts';
-import { parsePolicy, type Policy } from '../src/policy.ts';
+import { decideConfigRead, decideConfigWrite, decideHelperFlow, decideServiceCall, planServiceCall, type Expansion, type HelperFlow, type Selectors } from '../src/evaluator.ts';
+import { CONFIG_KINDS, parsePolicy, type Policy } from '../src/policy.ts';
 
 const HASH = 'a'.repeat(64);
 const policyOf = (rules: string) => parsePolicy(`version: 1\ncallers:\n  agent:\n    keys: [{ sha256: ${HASH} }]\n${rules}`);
@@ -161,4 +161,88 @@ test('property: an allowed call has every entity covered by a Grant, so one unco
 
 test('property: adding a Grant never turns an allow into a deny', () => {
   fc.assert(fc.property(scenario, (s) => !decide(s) || decide(s, [...s.grants, s.extra])));
+});
+
+test('property: an entity_name write is decided by its own Grant only, and its command carries only name, icon and aliases', () => {
+  const grant = fc.record({ caller: fc.constantFrom('agent', 'other'), config_write: fc.constantFrom(...CONFIG_KINDS) });
+  const config = fc.dictionary(fc.constantFrom('name', 'icon', 'aliases', 'area_id', 'labels', 'hidden_by', 'disabled_by', 'new_entity_id'), fc.string());
+  fc.assert(
+    fc.property(fc.array(grant, { maxLength: 6 }), config, (grants, config) => {
+      const policy = { version: 1, callers: { agent: { keys: [] }, other: { keys: [] } }, grants, denies: [], sha256: '' } as unknown as Policy;
+      const { allowed } = decideConfigWrite(policy, 'agent', { kind: 'entity_name', action: 'update', id: 'lock.garage', config });
+      assert.equal(allowed !== undefined, grants.some((g) => g.caller === 'agent' && g.config_write === 'entity_name'));
+      if (allowed?.write.via !== 'websocket') return;
+      const { type, entity_id, ...fields } = allowed.write.command;
+      assert.deepEqual([type, entity_id], ['config/entity_registry/update', 'lock.garage']);
+      assert.deepEqual(Object.keys(fields).sort(), Object.keys(config).filter((k) => ['name', 'icon', 'aliases'].includes(k)).sort());
+    }),
+  );
+});
+
+const writeGrants = fc.array(fc.record({ caller: fc.constantFrom('agent', 'other'), config_write: fc.constantFrom(...CONFIG_KINDS) }), { maxLength: 4 });
+const flow: fc.Arbitrary<HelperFlow> = fc.oneof(
+  fc.record({ action: fc.constant('start' as const), handler: fc.constantFrom('template', 'hue') }),
+  fc.record({ action: fc.constant('step' as const), flow_id: fc.oneof(fc.constant('9f2c4e1a7b3d4c8e'), fc.constant('../../automation/config/x'), fc.string()), input: fc.constant({}) }),
+  fc.record({ action: fc.constant('abort' as const), flow_id: fc.oneof(fc.constant('9f2c4e1a7b3d4c8e'), fc.constant('../../automation/config/x'), fc.string()) }),
+  fc.record({ action: fc.constantFrom('step', 'abort' as const), flow_id: fc.constantFrom('9f2c4e1a7b3d4c8e', '../x'), input: fc.constant({}), options: fc.boolean() }),
+  fc.record({ action: fc.constantFrom('edit', 'delete' as const), entry_id: fc.oneof(fc.constant('01K9W1ZARDTEMP1ATESENS0R01'), fc.constant('../../automation/config/x'), fc.string()) }),
+);
+const holds = (grants: { caller: string; config_write: string }[], kind: string) => grants.some((g) => g.caller === 'agent' && g.config_write === kind);
+
+test('property: only helper_entry allows a wizard-helper flow, never helper, and helper_entry allows no helper write', () => {
+  fc.assert(
+    fc.property(writeGrants, flow, (grants, f) => {
+      const policy = asPolicy(grants as unknown as Rule[], []);
+      const integration = f.action === 'start' ? f.handler : 'template';
+      const allowed = decideHelperFlow(policy, 'agent', f, { integration }, ['template']).allowed !== undefined;
+      const helper = decideConfigWrite(policy, 'agent', { kind: 'helper', action: 'create', id: 'input_boolean.x', config: {} }).allowed !== undefined;
+      const entry = decideConfigWrite(policy, 'agent', { kind: 'helper_entry', action: 'create', id: 'x', config: {} }).allowed !== undefined;
+      return (!allowed || holds(grants, 'helper_entry')) && helper === holds(grants, 'helper') && !entry;
+    }),
+  );
+});
+
+test('property: a zone write and zone config read need a zone Grant, which writes nothing but zones', () => {
+  const kinds = fc.uniqueArray(fc.constantFrom(...CONFIG_KINDS));
+  fc.assert(
+    fc.property(kinds, fc.constantFrom(...CONFIG_KINDS), (held, kind) => {
+      const policy = { grants: held.map((config_write) => ({ caller: 'agent', config_write })), denies: [] } as unknown as Policy;
+      const write = decideConfigWrite(policy, 'agent', { kind, action: 'delete', id: 'office' }).allowed?.write;
+      const command = write?.via === 'websocket' ? write.command.type : undefined;
+      // A wizard helper is written only through its flow.
+      assert.equal(write !== undefined, held.includes(kind) && kind !== 'helper_entry');
+      assert.equal(command?.startsWith('zone/') ?? false, kind === 'zone' && held.includes('zone'));
+      if (kind === 'zone') assert.equal(decideConfigRead(policy, 'agent', kind).allowed !== undefined, held.includes('zone'));
+    }),
+  );
+});
+
+test('property: a dashboard write or config read is decided by a dashboard Grant alone, and is a lovelace WebSocket command', () => {
+  const grant = fc.record({ caller: fc.constantFrom('agent', 'other'), config_write: fc.constantFrom(...CONFIG_KINDS) });
+  const write = fc.record({ action: fc.constantFrom('create', 'update', 'delete' as const), id: fc.constantFrom('lovelace', 'kitchen-wall', 'map') });
+  fc.assert(
+    fc.property(fc.array(grant), write, fc.constantFrom(...CONFIG_KINDS), (grants, { action, id }, other) => {
+      const policy = asPolicy(grants as unknown as Rule[], []);
+      const holds = (kind: string) => grants.some((g) => g.caller === 'agent' && g.config_write === kind);
+      const { allowed } = decideConfigWrite(policy, 'agent', { kind: 'dashboard', action, id, config: action === 'delete' ? undefined : { title: 'x' } });
+      assert.equal(allowed !== undefined, holds('dashboard'));
+      assert.equal(decideConfigRead(policy, 'agent', 'dashboard').allowed !== undefined, holds('dashboard'));
+      if (other !== 'dashboard' && !holds(other)) assert.equal(decideConfigWrite(policy, 'agent', { kind: other, action: 'delete', id: 'x' }).allowed, undefined);
+      if (allowed?.write.via !== 'websocket') return allowed === undefined;
+      return /^lovelace\/(dashboards\/(create|delete)|config\/save)$/.test(allowed.write.command.type);
+    }),
+  );
+});
+
+test("property: a flow is allowed only for an integration in HA's helper list, never for one HA started, and only within HA's flow API", () => {
+  fc.assert(
+    fc.property(flow, fc.constantFrom('template', 'hue'), fc.boolean(), (f, integration, discovered) => {
+      const policy = asPolicy([{ caller: 'agent', config_write: 'helper_entry' }] as unknown as Rule[], []);
+      const { allowed } = decideHelperFlow(policy, 'agent', f, { integration, discovered }, ['template']);
+      if (allowed?.write.via !== 'rest') return allowed === undefined;
+      const { path } = allowed.write.request;
+      const api = /^\/api\/config\/config_entries\/((options\/)?flow|entry\/)/.test(new URL(path, 'http://ha').pathname);
+      return integration === 'template' && !discovered && api && !path.includes('..') && (f.action !== 'delete' || allowed.write.request.method === 'DELETE');
+    }),
+  );
 });
