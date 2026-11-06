@@ -287,7 +287,7 @@ export function decideBlueprintWrite(policy: Policy, caller: string, { domain, a
 /** HA names a flow by a random hex id and an entry by a ULID; anything else could walk the REST path out of the flow API. */
 export const FLOW_ID = /^[0-9A-Za-z]+$/;
 
-/** One request to HA's setup or options flow for a wizard helper, or the removal of its entry; `options` marks an options flow. */
+/** `options` marks an options flow, which HA serves under its own path. */
 export type HelperFlow =
   | { action: 'start'; handler: string }
   | { action: 'step'; flow_id: string; input: Record<string, unknown>; options?: boolean }
@@ -297,7 +297,6 @@ export type HelperFlow =
 
 export const FLOW_PATH = '/api/config/config_entries/flow';
 export const OPTIONS_PATH = '/api/config/config_entries/options/flow';
-/** HA's helper integrations, and the entries of those it has set up. */
 export const HELPER_LISTS = { handlers: '/api/config/config_entries/flow_handlers?type=helper', entries: '/api/config/config_entries/entry?type=helper' } as const;
 function flowRequest(flow: HelperFlow): RestRequest {
   if (flow.action === 'start') return { method: 'POST', path: FLOW_PATH, body: { handler: flow.handler } };
@@ -308,7 +307,6 @@ function flowRequest(flow: HelperFlow): RestRequest {
   return flow.action === 'step' ? { method: 'POST', path, body: flow.input } : { method: 'DELETE', path };
 }
 
-/** A flow's or entry's integration as HA reports it; `discovered` when HA, not a user, started the flow. */
 export interface FlowOrigin {
   integration: string;
   discovered?: boolean;

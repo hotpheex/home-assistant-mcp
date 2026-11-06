@@ -66,7 +66,11 @@ const OPERATION_NAME: Record<Operation, string> = {
   service_call: 'service calls',
   config_write: 'config writes',
 };
-const writesOf = (kinds: readonly string[]) => `config writes of ${kinds.join(' or ')}`;
+const lackingKinds = (kinds: readonly string[]) => `config writes of ${kinds.join(' or ')}`;
+function bodyFor(action: string, key: string, body: unknown, ctx: z.RefinementCtx): void {
+  if (action !== 'delete' && body === undefined) ctx.addIssue({ code: 'custom', path: [key], message: `is required to ${action}` });
+  if (action === 'delete' && body !== undefined) ctx.addIssue({ code: 'custom', path: [key], message: 'is not taken by delete' });
+}
 
 /** The allowing Grants, what a denial names, and the names to audit. */
 interface Decided {
@@ -830,8 +834,7 @@ const writeConfig = defineTool({
     })
     .superRefine(({ kind, action, id, config }, ctx) => {
       if (kind === 'helper' && !helperId.test(id)) ctx.addIssue({ code: 'custom', path: ['id'], message: HELPER_ID_RULE });
-      if (action !== 'delete' && config === undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: `is required to ${action}` });
-      if (action === 'delete' && config !== undefined) ctx.addIssue({ code: 'custom', path: ['config'], message: 'is not taken by delete' });
+      bodyFor(action, 'config', config, ctx);
       if (kind === 'entity_name' && action !== 'update') ctx.addIssue({ code: 'custom', path: ['action'], message: 'entity_name takes only update' });
       if (kind === 'entity_name' && !entityId.safeParse(id).success) ctx.addIssue({ code: 'custom', path: ['id'], message: 'must be an entity_id such as light.kitchen' });
       if (kind === 'dashboard' && id === 'lovelace' && action !== 'update') ctx.addIssue({ code: 'custom', path: ['id'], message: 'the default dashboard lovelace can only be updated' });
@@ -841,11 +844,10 @@ const writeConfig = defineTool({
       if (kind === 'helper_entry') ctx.addIssue({ code: 'custom', path: ['kind'], message: NOT_A_CONFIG });
     }),
   annotations: { readOnlyHint: false, destructiveHint: true },
-  // A wizard helper is written only through its flow.
   kinds: CONFIG_KINDS.filter((k) => k !== 'helper_entry'),
   decide: (change: ConfigWrite, policy, caller) => ({
     ...decideConfigWrite(policy, caller, change),
-    lacking: writesOf([change.kind]),
+    lacking: lackingKinds([change.kind]),
     request: { kind: change.kind, action: change.action, id: change.id },
   }),
   async run(change: ConfigWrite, ctx) {
@@ -986,15 +988,12 @@ const writeBlueprint = defineTool({
       path: blueprintPath.describe('The path within the domain blueprint folder, such as mine/porch_light.yaml.'),
       yaml: z.string().min(1).optional().describe('The whole blueprint YAML; omitted for delete.'),
     })
-    .superRefine(({ action, yaml }, ctx) => {
-      if (action !== 'delete' && yaml === undefined) ctx.addIssue({ code: 'custom', path: ['yaml'], message: `is required to ${action}` });
-      if (action === 'delete' && yaml !== undefined) ctx.addIssue({ code: 'custom', path: ['yaml'], message: 'is not taken by delete' });
-    }),
+    .superRefine(({ action, yaml }, ctx) => bodyFor(action, 'yaml', yaml, ctx)),
   annotations: { readOnlyHint: false, destructiveHint: true },
   kinds: ['automation', 'script'],
   decide: (change: BlueprintWrite, policy, caller) => ({
     ...decideBlueprintWrite(policy, caller, change),
-    lacking: writesOf([change.domain]),
+    lacking: lackingKinds([change.domain]),
     request: { domain: change.domain, action: change.action, path: change.path },
   }),
   async run({ domain, action, path, yaml }: BlueprintWrite, ctx) {
@@ -1008,7 +1007,6 @@ const writeBlueprint = defineTool({
   },
 });
 
-/** The arguments each action takes; any other is refused. */
 const FLOW_ARGS = { list: [], start: ['handler'], edit: ['entry_id'], step: ['flow_id', 'input'], abort: ['flow_id'], delete: ['entry_id'] } as const;
 
 /** Reads the entry rather than a flow, so naming the integration runs no flow step. */
@@ -1034,6 +1032,25 @@ async function flowOf(ctx: Context, flowId: string): Promise<FlowOrigin & { entr
   const options = await read(OPTIONS_PATH);
   if (!options) throw new ToolFailure(`No setup or options flow ${flowId} is in progress; start or edit one.`);
   return { integration: await entryDomain(ctx, options.handler), entry_id: options.handler };
+}
+
+/** Built per action, not cast, so the type the evaluator decides on is checked; input validation has already required each field. */
+function flowAsked(args: { action: HelperFlow['action']; handler?: string; flow_id?: string; entry_id?: string; input?: Record<string, unknown> }, options: boolean): HelperFlow {
+  const given = <T>(value: T | undefined): T => {
+    if (value === undefined) throw new Error(`${args.action} reached its decision without a validated field`);
+    return value;
+  };
+  switch (args.action) {
+    case 'start':
+      return { action: 'start', handler: given(args.handler) };
+    case 'step':
+      return { action: 'step', flow_id: given(args.flow_id), input: given(args.input), options };
+    case 'abort':
+      return { action: 'abort', flow_id: given(args.flow_id), options };
+    case 'edit':
+    case 'delete':
+      return { action: args.action, entry_id: given(args.entry_id) };
+  }
 }
 
 const helperFlow = defineTool({
@@ -1067,37 +1084,35 @@ const helperFlow = defineTool({
   // The Allowed here is for the lookups; the write is decided once HA has named the flow's integration.
   decide: ({ action, handler, flow_id, entry_id }, policy, caller) => ({
     ...decideConfigRead(policy, caller, 'helper_entry'),
-    lacking: writesOf(['helper_entry']),
+    lacking: lackingKinds(['helper_entry']),
     request: { kind: 'helper_entry', action, handler, flow_id, entry_id },
   }),
   async run({ action, handler, flow_id, entry_id, input }, ctx) {
     const lookup = async <T>(path: string) => (await rest(ctx, ctx.allowed, { method: 'GET', path })) as T;
     if (action === 'list') {
       const [handlers, entries] = await Promise.all([lookup<string[]>(HELPER_LISTS.handlers), lookup<{ entry_id: string; domain: string; title: string }[]>(HELPER_LISTS.entries)]);
-      const named = entries.map(({ entry_id, domain, title }) => ({ entry_id, domain, title }));
-      return text(maskSecrets({ handlers: handlers.sort(), entries: named }));
+      const listed = entries.map(({ entry_id, domain, title }) => ({ entry_id, domain, title }));
+      return text(maskSecrets({ handlers: handlers.sort(), entries: listed }));
     }
-    const names = { kind: 'helper_entry', action, flow_id, entry_id };
-    refuseRedacted(ctx, names, 'input', input);
+    const asked = { kind: 'helper_entry', action, flow_id, entry_id };
+    refuseRedacted(ctx, asked, 'input', input);
     const found = handler !== undefined ? { integration: handler } : entry_id !== undefined ? { integration: await entryDomain(ctx, entry_id), entry_id } : await flowOf(ctx, flow_id!);
     const { integration } = found;
     const options = found.entry_id !== undefined;
-    const flow = (
-      action === 'start' ? { action, handler } : action === 'step' ? { action, flow_id, input, options } : action === 'abort' ? { action, flow_id, options } : { action, entry_id }
-    ) as HelperFlow;
+    const flow = flowAsked({ action, handler, flow_id, entry_id, input }, options);
     const decision = decideHelperFlow(ctx.policy, ctx.auth.caller, flow, found, await lookup<string[]>(HELPER_LISTS.handlers));
-    const named = { ...names, handler: integration, entry_id: found.entry_id };
+    const audited = { ...asked, handler: integration, entry_id: found.entry_id };
     if (!decision.allowed) {
       const [reason, why] = found.discovered
         ? ['a discovery', `Home Assistant started flow ${flow_id} itself, such as a discovery, so this Caller may not drive it`]
         : ['not a helper integration', `Home Assistant does not list ${integration} as a helper integration, so this Caller may not drive its flows or delete its entries`];
-      ctx.audit({ ...named, decision: 'deny', grants: [], reason });
+      ctx.audit({ ...audited, decision: 'deny', grants: [], reason });
       throw new ToolFailure(`Denied: ${why}. Do not retry this call.`);
     }
     const { write } = decision.allowed;
     if (write.via !== 'rest') throw new Error('a helper flow is driven over REST');
     type Answer = { flow_id?: string; type?: string; result?: { entry_id?: string } } | null;
-    const result = await writing(ctx, named, decision.grants, async () => (await rest(ctx, decision.allowed, write.request)) as Answer, (r) => ({
+    const result = await writing(ctx, audited, decision.grants, async () => (await rest(ctx, decision.allowed, write.request)) as Answer, (r) => ({
       flow_id: flow_id ?? r?.flow_id,
       entry_id: found.entry_id ?? (r?.type === 'create_entry' ? r.result?.entry_id : undefined),
     }));
@@ -1179,7 +1194,7 @@ export function buildServer(policy: Policy, gate: Gate, audit: Audit, auth: Auth
     if (!holds(name)) {
       audited({ decision: 'deny', grants: [] });
       const { kinds } = TOOLS[name];
-      const lacking = kinds === undefined ? OPERATION_NAME[operation] : writesOf(kinds);
+      const lacking = kinds === undefined ? OPERATION_NAME[operation] : lackingKinds(kinds);
       return failure(`Denied: this Caller holds no Grant for ${lacking}. Do not retry this call.`);
     }
     const tool = TOOLS[name];
