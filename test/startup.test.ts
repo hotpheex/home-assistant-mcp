@@ -60,7 +60,6 @@ for (const { name, policy, error, env: extra } of refusals) {
     const errors = errorsOf(cli.records());
     assert.match(String(errors[0]), error);
     if (extra) return;
-    // A Policy error: check reports it with startup's message.
     const check = await runCli(t, ['check', writePolicy(policy)], {});
     assert.equal(await check.exited, 1);
     assert.deepEqual(errorsOf(check.records()), errors);
@@ -204,7 +203,6 @@ test('the server exits when the users-tier token belongs to an HA admin', async 
   assert.ok(!ha.received.some((r) => r.message.type === 'get_states'));
 });
 
-/** The pinned-stable HA the PR workflow's e2e runs against, which Renovate bumps. */
 const pinnedStable = /# renovate: pinned-stable HA\n\s*[\w-]+:\s*(\d+)\.(\d+)\.\d+/.exec(
   readFileSync(new URL('../.github/workflows/ci.yml', import.meta.url), 'utf8'),
 );
@@ -229,7 +227,6 @@ test('an admin token no Grant needs is warned about and never used', async (t) =
   assert.deepEqual(new Set(ha.received.map((r) => r.token)), new Set([USERS_TOKEN]));
 });
 
-/** What an orchestrator's probe sees: the status and body, with no key. */
 async function probe(address: string, path: '/healthz' | '/readyz') {
   const res = await fetch(`http://${address}${path}`);
   return { status: res.status, body: await res.text() };
@@ -304,7 +301,6 @@ denies:
 test('check, given HA, resolves every name against live HA with read-only commands, and reports each unknown one as an error', async (t) => {
   const ha = await fakeHa(t);
   const checkAgainstHa = (policy: string) => runCli(t, ['check', writePolicy(policy)], { HAMCP_HA_URL: ha.url, HAMCP_HA_USERS_TOKEN: USERS_TOKEN });
-  // lock has entities but no services in the house, so a lock domain is still known.
   const known = await checkAgainstHa(namedPolicy({ area: 'utility_room', label: 'security', domain: 'lock', services: 'light.turn_on, light.*' }));
   assert.equal(await known.exited, 0, known.lines.join('\n'));
   assert.deepEqual(errorsOf(known.records()), []);

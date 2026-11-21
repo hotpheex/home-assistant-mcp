@@ -7,16 +7,15 @@ import {
   ERR_INVALID_AUTH,
   type Connection,
 } from 'home-assistant-js-websocket';
-import { FLOW_ID, FLOW_PATH, HELPER_DOMAINS, HELPER_LISTS, isIssued, OPTIONS_PATH, type Allowed, type Operation, type Tier } from './evaluator.ts';
+import { isIssued, type Allowed, type Operation, type Tier } from './evaluator.ts';
+import { FLOW_ID, FLOW_PATH, HELPER_DOMAINS, HELPER_LISTS, isSafeConfigId, OPTIONS_PATH, type Command, type RestRequest } from './ha.ts';
 import type { Log } from './log.ts';
 
 const MINIMUM_HA = [2026, 10] as const;
-/** The client has no timeout, so a half-open connection would hang every send; a ping unanswered for a whole beat drops it. */
+// home-assistant-js-websocket has no request timeout; unanswered pings drop half-open sockets.
 const HEARTBEAT_MS = 30_000;
-/** The pinned-stable HA release in ci.yml; a startup test keeps the two in step. */
 const TESTED_HA = [2026, 10] as const;
 
-/** Read Operations, and a service call's lookups, may send only these read-only commands. */
 const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
   plain_read: new Set([
     'get_states',
@@ -35,7 +34,6 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
     'lovelace/dashboards/list',
     'lovelace/config',
   ]),
-  // The entity registry only tells a trace call whether its item exists; none of it is returned.
   config_read: new Set([
     'automation/config',
     'script/config',
@@ -53,26 +51,28 @@ const READ_COMMANDS: Partial<Record<Operation, ReadonlySet<string>>> = {
   ]),
   service_call: new Set(['get_services', 'get_states', 'extract_from_target']),
 };
-/** HA answers a template render only as a subscription, so plain read may open one, for its first event only. */
+
 const ONE_SHOT: Partial<Record<Operation, ReadonlySet<string>>> = {
   plain_read: new Set(['render_template']),
 };
-const CONFIG_PATH = /^\/api\/config\/(automation|script|scene)\/config\/[^/]+$/;
-/** Config read may GET a stored config, and the lookups a helper flow needs; any other REST request must be the exact write an Allowed names. */
+
+const CONFIG_PATH = /^\/api\/config\/(automation|script|scene)\/config\/([^/]+)$/;
+
+function isConfigLookupPath(path: string): boolean {
+  const match = CONFIG_PATH.exec(path);
+  if (!match) return false;
+  try {
+    return isSafeConfigId(decodeURIComponent(match[2]!));
+  } catch {
+    return false;
+  }
+}
+
 const lookupable = (path: string) =>
-  CONFIG_PATH.test(path) ||
+  isConfigLookupPath(path) ||
   (Object.values(HELPER_LISTS) as string[]).includes(path) ||
   [FLOW_PATH, OPTIONS_PATH].some((flows) => path.startsWith(`${flows}/`) && FLOW_ID.test(path.slice(flows.length + 1)));
 
-export type Command = { type: string } & Record<string, unknown>;
-/** A request to HA's config REST API, the only REST the server makes. */
-export interface RestRequest {
-  method: 'GET' | 'POST' | 'DELETE';
-  path: string;
-  body?: unknown;
-}
-
-/** HA did not answer; `sent` when the request may have left the process, which only a read may report. */
 export class HaUnavailable extends Error {
   readonly sent: boolean;
   constructor(sent = false) {
@@ -80,34 +80,33 @@ export class HaUnavailable extends Error {
     this.sent = sent;
   }
 }
-/** The connection dropped after a write was sent, so it may or may not have run. */
+
 export class OutcomeUnknown extends Error {}
-/** A request still unanswered a whole beat after the heartbeat saw it. */
+
 class Abandoned extends Error {}
 
-/** The client rejects with a bare 3 when nothing was sent, and with a whole envelope coded 3 when the result never came. */
+// home-assistant-js-websocket rejects with bare code 3 before send, and `{ error: { code: 3 } }` if lost in flight.
 function failureOf(e: unknown, write: boolean): unknown {
   if (e === ERR_CONNECTION_LOST) return new HaUnavailable();
-  const lost = e instanceof Abandoned || (typeof e === 'object' && e !== null && 'error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST);
+  const lost =
+    e instanceof Abandoned || (typeof e === 'object' && e !== null && 'error' in e && (e.error as { code?: unknown } | null)?.code === ERR_CONNECTION_LOST);
   if (lost) return write ? new OutcomeUnknown() : new HaUnavailable(true);
   return e;
 }
 
 export interface Gate {
   send(allowed: Allowed, command: Command): Promise<unknown>;
-  /** Every needed tier is connected and checked. */
   ready(): boolean;
   connected: Promise<void>;
-  /** Answers with HA's status and JSON body, leaving their meaning to the caller. */
   rest(allowed: Allowed, request: RestRequest): Promise<{ status: number; body: unknown }>;
   close(): void;
   subscribeOnce(allowed: Allowed, command: Command): Promise<unknown>;
 }
 
 const releaseOf = (version: string) => version.split('.').slice(0, 2).map(Number);
-const compare = (a: number[], b: readonly number[]) => (a[0]! - b[0]!) || (a[1]! - b[1]!);
+const compare = (a: number[], b: readonly number[]) => a[0]! - b[0]! || a[1]! - b[1]!;
 
-/** A 401 from HA is text/plain. */
+// HA returns text/plain on 401 responses from its REST API.
 function jsonOf(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -120,13 +119,18 @@ function issuedOnly(allowed: Allowed) {
   if (!isIssued(allowed)) throw new Error('the gate sends only an Allowed the evaluator issued');
 }
 
-/** The only code that reaches HA: one connection per needed tier, plus REST for config; `fatal` exits the server. */
 export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Log, fatal: (reason: string) => void): Gate {
   const connections = new Map<Tier, Connection>();
   const opened = new Set<Connection>();
   let closed = false;
   const ready = () => [...tokens.keys()].every((tier) => connections.get(tier)?.connected);
   const { promise: connected, resolve: resolveConnected } = Promise.withResolvers<void>();
+
+  function connectionFor(tier: Tier): Connection {
+    const conn = connections.get(tier);
+    if (!conn?.connected) throw new HaUnavailable();
+    return conn;
+  }
 
   async function check(tier: Tier, conn: Connection) {
     const release = releaseOf(conn.haVersion);
@@ -145,7 +149,6 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
     if (ready()) resolveConnected();
   }
 
-  /** A connection lost during the checks only delays them: the client reconnects, and `ready` runs them again. */
   const checked = (tier: Tier, conn: Connection) =>
     check(tier, conn).catch((e: unknown) => {
       if (!(failureOf(e, false) instanceof HaUnavailable)) fatal(`the ${tier}-tier check failed: ${String(e)}`);
@@ -153,7 +156,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
 
   async function connect(tier: Tier, token: string) {
     let conn: Connection | undefined;
-    // Our own backoff loop rather than the client's, so close() also stops a server still waiting for HA.
+    // home-assistant-js-websocket's connect has no abort hook, so own the retry loop to honour close().
     for (let attempt = 1; !conn; attempt++) {
       try {
         conn = await createConnection({ auth: createLongLivedTokenAuth(url, token) });
@@ -178,9 +181,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
   for (const [tier, token] of tokens) void connect(tier, token);
 
   const unanswered = new Set<Connection>();
-  /** Requests in flight, marked once a beat has seen them, so one unanswered at the next beat is abandoned: a 30–60 s timeout. */
   const requests = new Map<AbortController, boolean>();
-  /** HA answers a script called directly only when the script ends, and a connection that still answers pings is never dropped. */
   async function timed<T>(request: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const abort = new AbortController();
     requests.set(abort, false);
@@ -198,11 +199,13 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
     }
     for (const conn of opened) {
       if (!conn.connected) continue;
-      // Dropping rejects the sends waiting on it, readiness falls, and the client reconnects.
       if (unanswered.delete(conn)) conn.reconnect(true);
       else {
         unanswered.add(conn);
-        conn.ping().then(() => unanswered.delete(conn), () => unanswered.delete(conn));
+        conn.ping().then(
+          () => unanswered.delete(conn),
+          () => unanswered.delete(conn),
+        );
       }
     }
   }, HEARTBEAT_MS);
@@ -215,8 +218,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       if (!write && !READ_COMMANDS[allowed.operation]?.has(command.type)) {
         throw new Error(`${allowed.operation} may not send ${command.type}`);
       }
-      const conn = connections.get(allowed.tier);
-      if (!conn?.connected) throw new HaUnavailable();
+      const conn = connectionFor(allowed.tier);
       try {
         return await timed((signal) => Promise.race([conn.sendMessagePromise({ ...command }), abandoned(signal)]));
       } catch (e) {
@@ -230,7 +232,7 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
       const write = allowed.write?.via === 'rest' && request === allowed.write.request;
       const lookup = allowed.operation === 'config_read' && request.method === 'GET' && lookupable(request.path);
       if (!write && !lookup) throw new Error(`${allowed.operation} may not send ${request.method} ${request.path}`);
-      if (!connections.get(allowed.tier)?.connected) throw new HaUnavailable();
+      connectionFor(allowed.tier);
       try {
         return await timed(async (signal) => {
           const res = await fetch(`${url}${request.path}`, {
@@ -242,15 +244,14 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
           return { status: res.status, body: jsonOf(await res.text()) };
         });
       } catch {
-        // fetch cannot tell a refused connection from one dropped or abandoned mid-request, so a write errs towards unknown.
+        // fetch does not distinguish connection-refused from a mid-flight drop.
         throw write ? new OutcomeUnknown() : new HaUnavailable(true);
       }
     },
     async subscribeOnce(allowed, command) {
       issuedOnly(allowed);
       if (!ONE_SHOT[allowed.operation]?.has(command.type)) throw new Error(`${allowed.operation} may not subscribe to ${command.type}`);
-      const conn = connections.get(allowed.tier);
-      if (!conn?.connected) throw new HaUnavailable();
+      const conn = connectionFor(allowed.tier);
       try {
         return await timed(async (signal) => {
           const gone = abandoned(signal);
@@ -260,8 +261,10 @@ export function openGate(url: string, tokens: ReadonlyMap<Tier, string>, log: Lo
             await Promise.race([subscribed, gone]);
             return await Promise.race([first.promise, gone]);
           } finally {
-            // Ends it even once abandoned, as HA may still answer; a failed unsubscribe does not fail the read.
-            const ended = subscribed.then((unsubscribe) => unsubscribe(), () => {});
+            const ended = subscribed.then(
+              (unsubscribe) => unsubscribe(),
+              () => {},
+            );
             await Promise.race([ended, gone]).catch(() => {});
           }
         });

@@ -18,7 +18,6 @@ const policy = policyOf(
 `,
 );
 
-/** Flows the operator has open: two HA discovered, the second for a helper integration, and one started in the UI. */
 const DISCOVERED = 'd15c0e2ed15c0e2ed15c0e2ed15c0e2e';
 const DISCOVERED_HELPER = 'd15c0e2e7e3f1a7ed15c0e2e7e3f1a7e';
 const OPERATOR_STARTED = '0be2a7020be2a7020be2a7020be2a702';
@@ -71,12 +70,14 @@ test('a template sensor is created through its menu and form steps, each request
   const { handlers, entries } = body(listed.result) as { handlers: string[]; entries: unknown[] };
   assert.ok(handlers.includes('template') && handlers.includes('switch_as_x') && !handlers.includes('hue'));
   assert.deepEqual(entries, [{ entry_id: created.result.entry_id, domain: 'template', title: 'Door open minutes' }]);
-  // A list is a read, so it is audited only on the reads opt-in, and an oversize one is refused whole.
   ha.entries.push({ ...ha.entries[0]!, entry_id: 'big', title: 'x'.repeat(48_000) });
   const oversize = await call('ha_helper_flow', { action: 'list' });
   assert.match(JSON.stringify(oversize.result.content), /over 48000 characters, so nothing was returned, and this tool offers no narrower query/);
   const reads = server.audits().filter((a) => a.request !== undefined);
-  assert.deepEqual(reads.map((a) => [a.decision, a.request]), [['allow', { action: 'list' }], ['allow', { action: 'list' }]]);
+  assert.deepEqual(
+    reads.map((a) => [a.operation, a.decision, a.request]),
+    [['config_read', 'allow', { action: 'list' }], ['config_read', 'allow', { action: 'list' }]],
+  );
 
   const named = (a: Record<string, unknown>) => [a.action, a.handler, a.flow_id, a.decision ?? a.outcome];
   const writes = server.audits().filter((a) => a.request === undefined);
@@ -89,7 +90,7 @@ test('a template sensor is created through its menu and form steps, each request
     ['step', 'template', flow_id, 'done'],
   ]);
   assert.equal(writes.at(-1)?.entry_id, created.result.entry_id);
-  assert.ok(writes.every((a) => a.kind === 'helper_entry' && a.tool === 'ha_helper_flow'));
+  assert.ok(writes.every((a) => a.operation === 'config_write' && a.kind === 'helper_entry' && a.tool === 'ha_helper_flow'));
   assert.doesNotMatch(JSON.stringify(server.audits()), /Door open|\{\{|next_step_id/, 'audit lines carry names, never step input');
 });
 
@@ -118,7 +119,6 @@ test('a setup, step or abort of a discovery, or of an integration HA does not li
   };
   const progress = { type: 'config_entries/flow/progress' };
   await refused({ action: 'start', handler: 'hue' }, [{ type: HELPERS }]);
-  // A discovery is named by HA's progress list, so its step is never run, even by a read, whatever its integration.
   const discovery = /Home Assistant started flow \w+ itself, such as a discovery.*Do not retry/;
   for (const flow_id of [DISCOVERED, DISCOVERED_HELPER]) {
     await refused({ action: 'step', flow_id, input: { host: '10.0.0.9' } }, [progress, { type: HELPERS }], discovery);
@@ -205,7 +205,6 @@ test("a template sensor's state template is changed through its options form, an
 
   const step = await call('ha_helper_flow', { action: 'step', flow_id, input: { state: '{{ 4 }}' } });
   assert.equal((body(step.result) as { type: string }).type, 'create_entry');
-  // A flow the Caller started is not in the progress list, and is not a config flow, so HA names its entry only when asked for it as an options flow.
   assert.deepEqual(step.sent, [
     progress,
     { type: `GET /api/config/config_entries/flow/${flow_id}` },

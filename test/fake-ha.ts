@@ -20,9 +20,7 @@ export interface FakeEntity {
   disabled_by?: string | null;
   entity_category?: 'config' | 'diagnostic' | null;
   platform?: string;
-  /** An automation's config id, or a script's object id. */
   unique_id?: string;
-  /** Served only by get_entries, as in HA. */
   aliases?: string[];
 }
 export interface ServiceDescription {
@@ -31,7 +29,6 @@ export interface ServiceDescription {
   target?: Record<string, unknown>;
   response?: { optional: boolean };
 }
-/** A device, area, label or floor registry entry, served as given. */
 export type FakeEntry = Record<string, unknown>;
 export interface FakeChange {
   entity_id: string;
@@ -48,11 +45,9 @@ export interface FakeLogEntry {
 
 export interface FakeHaOptions {
   version?: string;
-  /** Accepted tokens, each mapped to its HA user. */
   users: Record<string, { is_admin: boolean }>;
   states?: FakeState[];
   services?: Record<string, Record<string, ServiceDescription>>;
-  /** What a responding service returns, by `domain.service`. */
   responses?: Record<string, unknown>;
   entities?: FakeEntity[];
   devices?: FakeEntry[];
@@ -61,33 +56,21 @@ export interface FakeHaOptions {
   floors?: FakeEntry[];
   history?: FakeChange[];
   logbook?: FakeLogEntry[];
-  /** Automation, script and scene configs, keyed by entity_id; automation and scene entries carry their config `id`. */
   configs?: Record<string, Record<string, unknown>>;
   traces?: FakeTrace[];
-  /** Stored (UI) helpers, keyed by helper domain. */
   helpers?: Record<string, Record<string, unknown>[]>;
   statistics?: FakeStatistic[];
-  /** How each template renders; one not listed renders as its own text, as a static template does. */
   templates?: Record<string, FakeTemplate>;
-  /** HA's system log entries, oldest first, in `system_log/list`'s shape. */
   systemLog?: Record<string, unknown>[];
-  /** Stored (UI) zones. */
   zones?: Record<string, unknown>[];
-  /** Installed blueprints by domain and path, each as `blueprint/list` gives it: `{metadata}` or `{error}`. */
   blueprints?: Record<string, Record<string, Record<string, unknown>>>;
-  /** Dashboard collection items, as `lovelace/dashboards/list` serves them. */
   dashboards?: Record<string, unknown>[];
-  /** Saved layouts by url_path; `lovelace` is the default dashboard, which HA reaches by omitting url_path. */
   layouts?: Record<string, Record<string, unknown>>;
-  /** Config entries, of helper integrations and others. */
   entries?: FakeConfigEntry[];
-  /** Config flows already in progress, such as a discovery HA started. */
   flows?: FakeFlow[];
-  /** Options flows in progress; each one's `handler` is its entry's id. */
   optionsFlows?: FakeFlow[];
 }
 
-/** A config entry, with the fields HA's entry list serves that the tools read. */
 export interface FakeConfigEntry {
   entry_id: string;
   domain: string;
@@ -95,16 +78,13 @@ export interface FakeConfigEntry {
   source: string;
   options: Record<string, unknown>;
 }
-/** A config flow in progress: its integration, how it began, and its current step. */
 export interface FakeFlow {
   flow_id: string;
   handler: string;
   source: string;
   step_id: string;
 }
-/** HA 2026.10.4's helper list, which it builds from integration manifests. */
 const HELPER_HANDLERS = ['derivative', 'filter', 'generic_hygrostat', 'generic_thermostat', 'group', 'history_stats', 'integration', 'min_max', 'mold_indicator', 'otp', 'random', 'statistics', 'switch_as_x', 'template', 'threshold', 'tod', 'trend', 'utility_meter'];
-/** Setup steps, cut to what the tests drive: a menu's options, or a form's fields and the field that titles the entry it creates. */
 type FlowStep = { menu: string[] } | { fields: Record<string, boolean>; title: string };
 const FLOW_STEPS: Record<string, Record<string, FlowStep>> = {
   template: {
@@ -112,20 +92,16 @@ const FLOW_STEPS: Record<string, Record<string, FlowStep>> = {
     sensor: { fields: { name: true, state: true, unit_of_measurement: false }, title: 'name' },
   },
   switch_as_x: { user: { fields: { entity_id: true, invert: false, target_domain: true }, title: 'entity_id' } },
-  // An integration, not a helper: no helper_entry call may ever drive it.
   hue: { user: { fields: { host: true }, title: 'host' } },
 };
-/** Each integration's options form, cut to one step: HA's template options skip their empty `init` to the entry's own type. */
 const OPTIONS_FORMS: Record<string, { step_id: string; fields: Record<string, boolean> }> = {
   template: { step_id: 'sensor', fields: { state: true, unit_of_measurement: false } },
   hue: { step_id: 'init', fields: { allow_hue_groups: false } },
 };
 
 const HELPER_DOMAINS = ['input_boolean', 'input_number', 'input_select', 'input_text', 'input_datetime', 'input_button', 'counter', 'timer', 'schedule'];
-/** What HA's `config/entity_registry/update` schema takes besides `entity_id`. */
 const REGISTRY_UPDATE_KEYS = ['aliases', 'area_id', 'categories', 'device_class', 'icon', 'labels', 'name', 'new_entity_id', 'disabled_by', 'hidden_by', 'options_domain', 'options'];
 const DAYS = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday'];
-/** Each helper's storage schema in HA 2026.10: its required keys, the defaults it fills, and its other keys besides `icon`. */
 const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<string, unknown>; optional: string[] }> = {
   input_boolean: { required: ['name'], defaults: {}, optional: ['initial'] },
   input_number: { required: ['name', 'min', 'max'], defaults: { step: 1, mode: 'slider' }, optional: ['initial', 'unit_of_measurement'] },
@@ -137,10 +113,8 @@ const HELPER_SCHEMAS: Record<string, { required: string[]; defaults: Record<stri
   timer: { required: ['name'], defaults: { duration: '0:00:00', restore: false }, optional: [] },
   schedule: { required: ['name'], defaults: Object.fromEntries(DAYS.map((d) => [d, []])), optional: [] },
 };
-/** HA validates the whole body of a config POST, so a partial one is refused. */
 const REQUIRED_KEYS: Record<string, string[]> = { automation: ['triggers', 'actions'], script: ['sequence'], scene: ['name', 'entities'] };
 
-/** A long-term statistic's metadata, and its rows per period, each with an ISO `start` and its type values. */
 export interface FakeStatistic {
   statistic_id: string;
   name: string | null;
@@ -151,7 +125,6 @@ export interface FakeStatistic {
   periods: Partial<Record<'5minute' | 'hour' | 'day' | 'week' | 'month', ({ start: string } & Partial<Record<'min' | 'max' | 'mean' | 'sum' | 'state' | 'change', number>>)[]>>;
 }
 
-/** A stored run: summary fields plus the sections only trace/get returns. */
 export interface FakeTrace extends Record<string, unknown> {
   domain: 'automation' | 'script';
   item_id: string;
@@ -160,7 +133,6 @@ export interface FakeTrace extends Record<string, unknown> {
 }
 const TRACE_SECTIONS = ['trace', 'config', 'blueprint_inputs', 'context'];
 
-/** A template's render: its result, needing `variable` if named, a compile or render error, or `seconds` of work. */
 export interface FakeTemplate {
   result?: unknown;
   variable?: string;
@@ -168,16 +140,13 @@ export interface FakeTemplate {
   renderError?: string;
   seconds?: number;
 }
-/** Python's str() of the float HA coerces a timeout to. */
 const pyFloat = (n: number) => (Number.isInteger(n) ? n.toFixed(1) : String(n));
 
-/** A command the server sent after authenticating, with the token of the connection it came on. */
 export interface Received {
   token: string;
   message: { type: string; id?: number } & Record<string, unknown>;
 }
 
-/** Thrown by a handler to answer with an HA error result. */
 class HaError extends Error {
   code: string;
   constructor(code: string, message: string) {
@@ -192,7 +161,6 @@ const haError = (code: string, message: string): never => {
 type Target = Partial<Record<'entity_id' | 'device_id' | 'area_id' | 'floor_id' | 'label_id', string | string[]>>;
 type Entity = Required<Omit<FakeEntity, 'name' | 'aliases' | 'platform' | 'unique_id'>>;
 type Device = { id: string; area_id: string | null; labels: string[]; parent_device_id: string | null };
-/** The registry fields `extract_from_target` reads, with HA's defaults filled in. */
 export type Registry = {
   entities: Entity[];
   devices: Device[];
@@ -213,7 +181,6 @@ function registryOf(o: Pick<FakeHaOptions, 'entities' | 'devices' | 'areas' | 'f
 
 const ids = (v: string | string[] | undefined): Set<string> => (v === undefined || v === 'none' ? new Set() : new Set(Array.isArray(v) ? v : [v]));
 
-/** A port of HA 2026.10's `helpers/target.py` expansion, rule for rule. */
 function extractFromTarget(h: Registry, target: Target, primaryEntitiesOnly = true) {
   const t ={ e: ids(target.entity_id), d: ids(target.device_id), a: ids(target.area_id), f: ids(target.floor_id), l: ids(target.label_id) };
   for (const e of t.e) if (!/^[a-z0-9_]+\.[a-z0-9_]+$/.test(e)) haError('invalid_format', `Entity ID ${e} is an invalid entity ID`);
@@ -280,7 +247,6 @@ const inWindow = (when: string, msg: Message) =>
   Date.parse(when) >= Date.parse(msg.start_time as string) &&
   Date.parse(when) <= (msg.end_time === undefined ? Date.now() : Date.parse(msg.end_time as string));
 
-/** Hand-written HA 2026.10: speaks the WebSocket protocol to the real client, answers config REST, and records every command and request. */
 export async function startFakeHa(options: FakeHaOptions) {
   let version = options.version ?? '2026.10.4';
   const received: Received[] = [];
@@ -290,21 +256,17 @@ export async function startFakeHa(options: FakeHaOptions) {
   let down = false;
   let hung = false;
   let refused = 0;
-  // A copy, since a registry update changes it and the seed is shared across tests.
   const entities = structuredClone(options.entities ?? []);
   const entityEntry = (e: FakeEntity) => {
     const entry: Partial<FakeEntity> = { name: null, device_id: null, area_id: null, labels: [], hidden_by: null, disabled_by: null, entity_category: null, ...e };
     delete entry.aliases;
     return entry;
   };
-  /** The command's connection, for a handler that opens a subscription. */
   interface Connection {
-    /** Queues an `event` on this command's subscription, sent after its `result`. */
     emit(event: unknown): void;
     subscriptions: Set<number>;
   }
   type Handler = (token: string, msg: Message, conn: Connection) => unknown;
-  /** HA's require_admin. */
   const adminOnly = (handler: Handler): Handler => (token, msg, conn) =>
     options.users[token]?.is_admin ? handler(token, msg, conn) : haError('unauthorized', 'Unauthorized');
   const configs = structuredClone(options.configs ?? {});
@@ -316,7 +278,6 @@ export async function startFakeHa(options: FakeHaOptions) {
   const blueprints = structuredClone(options.blueprints ?? {});
   const dashboards = structuredClone(options.dashboards ?? []);
   const layouts = structuredClone(options.layouts ?? {});
-  /** HA's `_handle_errors`: no url_path is the default dashboard, and any other must be a listed one. */
   const layoutKey = (msg: Message) =>
     msg.url_path === undefined || msg.url_path === null
       ? 'lovelace'
@@ -409,7 +370,6 @@ export async function startFakeHa(options: FakeHaOptions) {
         options.traces?.find((tr) => tr.domain === msg.domain && tr.item_id === msg.item_id && tr.run_id === msg.run_id) ??
         haError('not_found', 'The trace could not be found'),
     ),
-    // Only flows a user did not start, such as discoveries.
     'config_entries/flow/progress': adminOnly(() =>
       flows.filter((f) => !['user', 'reconfigure'].includes(f.source)).map((f) => ({ flow_id: f.flow_id, handler: f.handler, step_id: f.step_id, context: { source: f.source } })),
     ),
@@ -448,7 +408,6 @@ export async function startFakeHa(options: FakeHaOptions) {
       }
       return out;
     },
-    // HA 2026.10's handle_render_template: the timeout check, then a compile error as the result, then events.
     render_template: (_, msg, conn) => {
       const template = typeof msg.template === 'string' ? msg.template : haError('invalid_format', "required key not provided @ data['template']");
       const render = options.templates?.[template] ?? { result: template };
@@ -467,10 +426,8 @@ export async function startFakeHa(options: FakeHaOptions) {
       conn.emit({ result: missing ? '' : render.result, listeners: { all: false, domains: [], entities, time: false } });
       return null;
     },
-    // HA lists its deduplicated log newest first.
     'system_log/list': adminOnly(() => [...(options.systemLog ?? [])].reverse()),
     'blueprint/list': adminOnly((_, msg) => blueprints[msg.domain as string] ?? {}),
-    // HA appends `.yaml` to a saved path, but deletes the path exactly as given.
     'blueprint/save': adminOnly((_, msg) => {
       const domain = msg.domain as string;
       const metadata = (parse(msg.yaml as string) as { blueprint?: { domain?: string } } | null)?.blueprint;
@@ -495,7 +452,6 @@ export async function startFakeHa(options: FakeHaOptions) {
       layouts[layoutKey(msg)] = msg.config as Record<string, unknown>;
       return null;
     }),
-    // The default panel always exists, so no dashboard can take lovelace; a collection id is the slugified path, suffixed if taken.
     'lovelace/dashboards/create': adminOnly((_, msg) => {
       const fields = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'allow_single_word'].includes(k)));
       const path = fields.url_path as string;
@@ -529,7 +485,6 @@ export async function startFakeHa(options: FakeHaOptions) {
       items().push(item);
       return item;
     });
-    // HA validates an update against the full schema and replaces the item, keeping only its id.
     handlers[`${domain}/update`] = adminOnly((_, msg) => {
       const item = find(msg);
       const fields = fieldsOf(msg);
@@ -548,7 +503,6 @@ export async function startFakeHa(options: FakeHaOptions) {
       return null;
     });
   }
-  // HA 2026.10's zone collection: a create fills radius and passive, and an update validates only the keys it sends and merges them.
   const ZONE_KEYS = ['name', 'latitude', 'longitude', 'radius', 'passive', 'icon'];
   const zoneFields = (msg: Message) => {
     const fields = Object.fromEntries(Object.entries(msg).filter(([k]) => !['id', 'type', 'zone_id'].includes(k)));
@@ -571,7 +525,6 @@ export async function startFakeHa(options: FakeHaOptions) {
     return null;
   });
 
-  /** HA's config REST API: automation and scene entries by config id, scripts by object key. */
   const entityOf = (kind: string, id: string) =>
     kind === 'script'
       ? (`script.${id}` in configs ? `script.${id}` : undefined)
@@ -592,7 +545,6 @@ export async function startFakeHa(options: FakeHaOptions) {
     configs[entity ?? `${kind}.${id}`] = kind === 'script' ? body! : { id, ...body };
     json(200, { result: 'ok' });
   }
-  /** A flow's current step as HA's flow REST answers it, with HA's keys. */
   function stepOf(flow: FakeFlow, step: { menu: string[] } | { fields: Record<string, boolean> } = FLOW_STEPS[flow.handler]![flow.step_id]!) {
     const common = { flow_id: flow.flow_id, handler: flow.handler, step_id: flow.step_id, description_placeholders: null };
     if ('menu' in step) return { type: 'menu', ...common, menu_options: step.menu };
@@ -620,7 +572,6 @@ export async function startFakeHa(options: FakeHaOptions) {
     entries.push(entry);
     json(200, { type: 'create_entry', flow_id: flow.flow_id, handler: flow.handler, title: entry.title, description: null, description_placeholders: null, options: input, version: 1, minor_version: 1, result: served(entry) });
   }
-  /** An options flow's one form: a step that passes it saves the input over the entry's options. */
   function optionsRoute([, id]: RegExpExecArray, method: string | undefined, body: Record<string, unknown> | undefined, json: Json) {
     const flow = optionsFlows.find((f) => f.flow_id === id);
     if (!flow) return json(404, { message: 'Invalid flow specified' });
@@ -635,10 +586,8 @@ export async function startFakeHa(options: FakeHaOptions) {
     entry.options = { ...entry.options, ...input };
     json(200, { type: 'create_entry', flow_id: flow.flow_id, handler: flow.handler, title: '', description: null, description_placeholders: null, version: 1, minor_version: 1 });
   }
-  /** An entry as HA serves it: its options stay in HA. */
   const served = ({ entry_id, domain, title, source }: FakeConfigEntry) => ({ entry_id, domain, title, source, state: 'loaded' });
   const newFlowId = () => randomBytes(16).toString('hex');
-  /** HA's admin-only config REST, matched against the whole URL, query included. */
   const routes: [RegExp, Route][] = [
     [/^\/api\/config\/(automation|script|scene)\/config\/([^/]+)$/, configRoute],
     [/^\/api\/config\/config_entries\/flow_handlers(\?type=helper)?$/, ([, helper], _m, _b, json) => json(200, helper ? HELPER_HANDLERS : [...HELPER_HANDLERS, 'hue'])],
@@ -764,27 +713,21 @@ export async function startFakeHa(options: FakeHaOptions) {
     entries,
     flows,
     optionsFlows,
-    /** Command types answered by dropping the connection after recording them, as when HA goes away mid-call. */
     drop,
-    /** Command types recorded and never answered while pings still are, as HA does with a script called directly until it ends. */
     stall,
-    /** Drops every connection and refuses new ones, until the client has seen the outage by trying to reconnect. */
     async outage() {
       down = true;
       for (const ws of wss.clients) ws.terminate();
       const before = refused;
       for (let i = 0; i < 300 && refused === before; i++) await new Promise((r) => setTimeout(r, 10));
     },
-    /** Accepts connections again after an outage, and answers again after a hang. */
     restore() {
       down = false;
       hung = false;
     },
-    /** Keeps every connection and REST request open but answers nothing, as a half-open TCP connection does. */
     hang() {
       hung = true;
     },
-    /** Drops every connection, as an HA restart does, optionally coming back at another version or without a token. */
     restart(change: { version?: string; revoke?: string } = {}) {
       version = change.version ?? version;
       if (change.revoke !== undefined) delete options.users[change.revoke];

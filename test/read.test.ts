@@ -23,7 +23,6 @@ async function readerOn(t: TestContext, options: Partial<FakeHaOptions> = {}, en
   return { ha, server, client, call, sent };
 }
 
-/** Asserts an ISO time lies within a few seconds of `minutes` ago. */
 const near = (actual: unknown, minutes: number) =>
   assert.ok(Math.abs(Date.parse(String(actual)) - (Date.now() - minutes * 60_000)) < 5000, `${String(actual)} is not ${minutes} min ago`);
 
@@ -61,7 +60,6 @@ test('ha_get_history reads the last 24 h by default, pages rows, and summarises'
 
   const summary = await call('ha_get_history', { entity_ids, summary: true });
   const rounded = (summary.history as Record<string, unknown>[]).map((e) => (e.mean === undefined ? e : { ...e, mean: Math.round(Number(e.mean) * 100) / 100 }));
-  // 20 for 23 h and 30 for 1 h; 100 for 22 h and 200 for 1 h around an hour of unavailable and unknown.
   assert.deepEqual(rounded, [
     { entity_id: 'light.kitchen', changes: 4, first: 'off', last: 'on', states: { off: 2, on: 2 } },
     { entity_id: 'light.living_room', changes: 0, first: 'off', last: 'off', states: { off: 1 } },
@@ -194,7 +192,6 @@ for (const era of ERAS) {
   test(`server instructions follow the visible tools, never the Grants (${era})`, async (t) => {
     const [twin, idle] = [newKey(), newKey()];
     const ha = await fakeHa(t);
-    // twin sees the same tools as reader through a different Policy; idle sees none.
     const policy = policyOf(
       { reader, twin, idle },
       `grants:
@@ -395,7 +392,6 @@ test('ha_get_dashboard lists the dashboards, and reads a stored layout masked, o
     dashboard: 'kitchen-wall',
     config: { views: [{ title: 'Wall', cards: [{ type: 'iframe', url: `https://${M}@cam.local/live` }] }] },
   });
-  // A layout too big to return whole is read one view at a time, by index or path.
   const whole = await client.callTool({ name: 'ha_get_dashboard', arguments: { dashboard: 'lovelace' } });
   assert.match(JSON.stringify(whole.content), /narrow the query with a `view`, by its index or path/);
   assert.deepEqual(await call('ha_get_dashboard', { dashboard: 'lovelace', view: 0 }), { dashboard: 'lovelace', view: home });

@@ -8,7 +8,6 @@ const ID_HINT = "Name it by an automation's config id or a script's object id (t
 const auditor = newKey();
 const policy = policyOf({ auditor }, 'grants:\n  - caller: auditor\n    read: config\n');
 
-/** The registry entries that tell trace calls their item exists; yaml_porch_1 is an automation from YAML with no runs. */
 const ITEMS = [
   { entity_id: 'automation.porch_light', platform: 'automation', unique_id: 'porch_light_1' },
   { entity_id: 'automation.yaml_porch', platform: 'automation', unique_id: 'yaml_porch_1' },
@@ -65,7 +64,6 @@ test('ha_list_traces requires kind and id, always sends item_id, and pages newes
   assert.deepEqual(Object.keys(listed.traces[0]!).sort(), ['domain', 'item_id', 'last_step', 'run_id', 'script_execution', 'state', 'timestamp', 'trigger']);
 
   assert.deepEqual(body((await call('ha_list_traces', { kind: 'automation', id: 'yaml_porch_1' })).result), { total: 0, offset: 0, has_more: false, traces: [] });
-  // A typo, an entity_id or the wrong kind names nothing.
   for (const [kind, id] of [['automation', 'porch_light_9'], ['automation', 'automation.porch_light'], ['script', 'porch_light_1']]) {
     const wrong = await call('ha_list_traces', { kind, id });
     assert.equal(wrong.result.isError, true);
@@ -101,7 +99,6 @@ test('ha_get_trace returns the summary plus the sections asked for, masked and w
   assert.deepEqual(wrong.result.content, [{ type: 'text', text: `No automation has the id automation.porch_light. ${ID_HINT}` }]);
 });
 
-/** HA's system log, oldest first as recorded; HA lists it newest first. */
 const SYSTEM_LOG = [
   { name: 'homeassistant.components.hue', level: 'WARNING', message: ['Bridge slow to answer'], source: ['components/hue/bridge.py', 80], timestamp: 1_793_000_000, exception: '', count: 1, first_occurred: 1_793_000_000 },
   {
@@ -129,11 +126,9 @@ test('ha_get_logs lists the system log newest first, filtered by minimum level a
   assert.deepEqual(await names({}), ['custom_components.nas', 'homeassistant.components.automation.porch_light', 'homeassistant.components.hue']);
   assert.deepEqual(await names({ level: 'warning' }), ['homeassistant.components.automation.porch_light', 'homeassistant.components.hue']);
   assert.deepEqual(await names({ level: 'critical' }), []);
-  // The query matches the logger name, the source path or a message, case-insensitively.
   assert.deepEqual(await names({ query: 'HUE' }), ['homeassistant.components.hue']);
   assert.deepEqual(await names({ query: 'nas/sensor.py' }), ['custom_components.nas']);
   assert.deepEqual(await names({ query: 'error in action', level: 'error' }), ['homeassistant.components.automation.porch_light']);
-  // It matches the masked text, so a query cannot probe for a secret.
   assert.deepEqual(await names({ query: 'LOGSECRET' }), []);
 
   const page = body((await call('ha_get_logs', { level: 'error' })).result);

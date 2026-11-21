@@ -4,13 +4,15 @@ import * as z from 'zod';
 
 const name = z.string().regex(/^[a-z0-9_]+$/, 'must be a Home Assistant id such as living_room');
 
-const service = z
-  .string()
-  .check((ctx) => {
-    if (ctx.value === '*') ctx.issues.push({ code: 'custom', input: ctx.value, message: 'a bare * service is not allowed; name a domain.* or a service' });
-    else if (ctx.value === 'homeassistant.*') ctx.issues.push({ code: 'custom', input: ctx.value, message: 'homeassistant services delegate to other domains; name each one exactly' });
-    else if (!/^[a-z0-9_]+\.([a-z0-9_]+|\*)$/.test(ctx.value)) ctx.issues.push({ code: 'custom', input: ctx.value, message: 'must be <domain>.<service> or <domain>.*' });
-  });
+const service = z.string().check((ctx) => {
+  if (ctx.value === '*') {
+    ctx.issues.push({ code: 'custom', input: ctx.value, message: 'a bare * service is not allowed; name a domain.* or a service' });
+  } else if (ctx.value === 'homeassistant.*') {
+    ctx.issues.push({ code: 'custom', input: ctx.value, message: 'homeassistant services delegate to other domains; name each one exactly' });
+  } else if (!/^[a-z0-9_]+\.([a-z0-9_]+|\*)$/.test(ctx.value)) {
+    ctx.issues.push({ code: 'custom', input: ctx.value, message: 'must be <domain>.<service> or <domain>.*' });
+  }
+});
 
 export const CONFIG_KINDS = [
   'automation',
@@ -23,11 +25,12 @@ export const CONFIG_KINDS = [
   'helper_entry',
 ] as const;
 
+export type ConfigKind = (typeof CONFIG_KINDS)[number];
+
 const target = z
   .strictObject({ domain: z.union([z.literal('*'), name]).optional(), area: name.optional(), label: name.optional() })
   .refine((t) => Object.keys(t).length === 1, 'each target holds exactly one of domain, area or label');
 
-/** An empty list would read as "no Targets", which on a Deny errs open; omit `targets` to mean that instead. */
 const targets = z.array(target).min(1, 'list at least one target, or omit targets').optional();
 
 const grant = z
@@ -52,7 +55,12 @@ const schema = z
     callers: z.record(
       z.string().min(1),
       z.strictObject({
-        keys: z.array(z.strictObject({ sha256: z.string().regex(/^[0-9a-f]{64}$/, 'must be 64 lowercase hex characters from keygen'), expires: z.iso.date().optional() })),
+        keys: z.array(
+          z.strictObject({
+            sha256: z.string().regex(/^[0-9a-f]{64}$/, 'must be 64 lowercase hex characters from keygen'),
+            expires: z.iso.date().optional(),
+          }),
+        ),
       }),
     ),
     grants: z.array(grant).default([]),
@@ -62,13 +70,17 @@ const schema = z
     const owner = new Map<string, string>();
     for (const [caller, { keys }] of Object.entries(policy.callers)) {
       keys.forEach(({ sha256 }, i) => {
-        if (owner.has(sha256)) ctx.addIssue({ code: 'custom', path: ['callers', caller, 'keys', i, 'sha256'], message: `key hash is already bound to Caller "${owner.get(sha256)}"` });
+        if (owner.has(sha256)) {
+          ctx.addIssue({ code: 'custom', path: ['callers', caller, 'keys', i, 'sha256'], message: `key hash is already bound to Caller "${owner.get(sha256)}"` });
+        }
         owner.set(sha256, caller);
       });
     }
     for (const list of ['grants', 'denies'] as const) {
       policy[list].forEach(({ caller }, i) => {
-        if (!Object.hasOwn(policy.callers, caller)) ctx.addIssue({ code: 'custom', path: [list, i, 'caller'], message: `Caller "${caller}" is not declared under callers` });
+        if (!Object.hasOwn(policy.callers, caller)) {
+          ctx.addIssue({ code: 'custom', path: [list, i, 'caller'], message: `Caller "${caller}" is not declared under callers` });
+        }
       });
     }
   });
@@ -78,13 +90,12 @@ export type Grant = Policy['grants'][number];
 
 export class PolicyError extends Error {}
 
-/** The Policy's shape for editors, published with each release; rules JSON Schema cannot carry, such as one kind per Grant, are left to `check`. */
 export const policyJsonSchema = () => z.toJSONSchema(schema, { io: 'input' });
 
-/** Parses a Policy file as YAML 1.2, so `on` and `off` stay strings. Throws PolicyError listing every problem. */
 export function parsePolicy(text: string): Policy {
   let doc: unknown;
   try {
+    // YAML 1.2 core schema keeps `on` and `off` as strings instead of YAML 1.1 booleans.
     doc = parse(text, { version: '1.2', schema: 'core', uniqueKeys: true });
   } catch (e) {
     throw new PolicyError(`Policy is not valid YAML: ${(e as Error).message}`);
@@ -103,7 +114,6 @@ const overlaps = (a: string, b: string) => {
   return da === db && (sa === sb || sa === '*' || sb === '*');
 };
 
-/** Policy that loads but does nothing. */
 export function policyWarnings(policy: Policy, now: Date): string[] {
   const warnings: string[] = [];
   for (const [caller, { keys }] of Object.entries(policy.callers)) {

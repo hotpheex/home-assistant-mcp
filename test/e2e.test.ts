@@ -9,7 +9,6 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { createConnection, createLongLivedTokenAuth, type Connection } from 'home-assistant-js-websocket';
 import { body, connect, newKey, policyOf, runImage, until, writePolicy } from './harness.ts';
 
-/** The built image and the HA container image it runs against; CI sets both, and without them there is nothing to run. */
 const image = process.env.HAMCP_IMAGE;
 const haImage = process.env.HAMCP_HA_IMAGE;
 
@@ -19,7 +18,6 @@ const canary = (where: string) => `hamcp-canary-${where}-${randomBytes(8).toStri
 const SECRET_CANARY = canary('secrets-yaml');
 const HEADER_CANARY = canary('rest-command');
 
-/** HA's config directory: a secret behind `!secret` in an automation, a secret header on a rest_command, and the e2e house. */
 const CONFIG = {
   'configuration.yaml': `homeassistant:
   name: hamcp e2e
@@ -57,7 +55,6 @@ interface HaState {
   attributes: Record<string, unknown>;
 }
 
-/** Polls a check that may throw while HA is still starting. */
 async function eventually(check: () => Promise<boolean>, what: string, ms: number) {
   const end = Date.now() + ms;
   while (!(await check().catch(() => false))) {
@@ -81,7 +78,6 @@ async function accessToken(code: unknown) {
   return ((await res.json()) as { access_token: string }).access_token;
 }
 
-/** Logs in through HA's login flow, as the frontend does. */
 async function login(username: string, password: string) {
   const flow = await post('/auth/login_flow', { client_id: CLIENT_ID, handler: ['homeassistant', null], redirect_uri: CLIENT_ID });
   const done = await post(`/auth/login_flow/${String(flow.flow_id)}`, { client_id: CLIENT_ID, username, password });
@@ -108,7 +104,6 @@ suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP
   let areaId: string;
   let server: ReturnType<typeof runImage>;
 
-  /** Marks the run failed, so teardown prints HA's log. */
   const e2e = (name: string, fn: (t: TestContext) => Promise<void>) =>
     void test(name, { timeout: 180_000 }, async (t) => {
       await fn(t).catch((e: unknown) => {
@@ -129,7 +124,6 @@ suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP
       cleanup(() => spawnSync('docker', ['rm', '--force', haName], { stdio: 'ignore' }));
       await eventually(async () => (await fetch(`${HA}/api/onboarding`)).ok, 'HA to serve', 300_000);
 
-      // Onboarding: an admin owner, then a non-admin agent, each with long-lived tokens.
       const ownerPassword = randomBytes(16).toString('hex');
       const onboarded = await post('/api/onboarding/users', { client_id: CLIENT_ID, name: 'Owner', username: 'owner', password: ownerPassword, language: 'en' });
       owner = await createConnection({ auth: createLongLivedTokenAuth(HA, await accessToken(onboarded.auth_code)) });
@@ -143,7 +137,6 @@ suite('the built image against a real HA', { skip: !(image && haImage) && 'HAMCP
       const usersToken = await longLived(agent, 'hamcp-e2e-users');
       revocableToken = await longLived(agent, 'hamcp-e2e-revoked');
 
-      // The house: the plug's device in an area, and the hub's device under a label.
       await eventually(
         async () => (await owner.sendMessagePromise<HaState[]>({ type: 'get_states' })).some((s) => s.entity_id === 'camera.e2e_camera'),
         'the e2e house',
@@ -203,7 +196,6 @@ denies:
   });
 
   e2e('every read, a service call and a config write run once, and no canary appears in any byte they return', async (t) => {
-    // Each canary sits in what HA itself returns, so only the server keeps it out.
     const tokens = new Set<string>();
     const collectTokens = async () => {
       for (const s of await owner.sendMessagePromise<HaState[]>({ type: 'get_states' })) {
@@ -280,21 +272,16 @@ denies:
       const result = await client.callTool({ name: 'ha_call_service', arguments: { domain, service, target } });
       if (result.isError) await until(() => audits().length > seen, 'the denial audit line', 5000);
       const audit = audits().at(-1);
-      // A refusal shows up whole in a failed assertion on `acted`.
       return { result, audit, acted: result.isError ? { refused: result.content, audit } : (body(result) as { entity_ids: string[] }).entity_ids.sort() };
     };
 
-    // A labelled hub's child devices are covered by the label.
     assert.deepEqual((await call('switch.turn_on', { entity_id: ['switch.e2e_hub_outlet_a', 'switch.e2e_hub_outlet_b'] })).acted, ['switch.e2e_hub_outlet_a', 'switch.e2e_hub_outlet_b']);
-    // The area holds the plug's primary switch, but neither its hidden nor its config entity...
     assert.deepEqual((await call('switch.turn_on', { area_id: areaId })).acted, ['switch.e2e_plug']);
-    // ...so the area Grant covers neither.
     for (const entity of ['switch.e2e_plug_led', 'switch.e2e_plug_child_lock']) {
       const { result, audit } = await call('switch.turn_on', { entity_id: entity });
       assert.ok(result.isError, entity);
       assert.deepEqual(audit?.uncovered, [entity]);
     }
-    // An area Deny reaches the plug's config button, which the domain Grant covers.
     const { result, audit } = await call('button.press', { entity_id: 'button.e2e_plug_restart' });
     assert.ok(result.isError);
     assert.deepEqual([audit?.uncovered, audit?.denies], [[], [0]]);
@@ -379,7 +366,6 @@ denies:
     const wrap = await flow({ action: 'start', handler: 'switch_as_x' });
     const wrapped = await flow({ action: 'step', flow_id: wrap.flow_id, input: { entity_id: 'switch.e2e_plug', target_domain: 'light' } });
     const entryId = (wrapped.result as { entry_id: string }).entry_id;
-    // Removing the entry unhides the switch for the other cases.
     t.after(() => fetch(`${HA}/api/config/config_entries/entry/${entryId}`, { method: 'DELETE', headers: { authorization: `Bearer ${adminToken}` } }));
     const plug = await owner.sendMessagePromise<{ hidden_by: string | null }>({ type: 'config/entity_registry/get', entity_id: 'switch.e2e_plug' });
     assert.equal(plug.hidden_by, 'integration');
@@ -390,7 +376,6 @@ denies:
     const refused = await client.callTool({ name: 'ha_helper_flow', arguments: { action: 'start', handler: 'hamcp_house' } });
     assert.match(JSON.stringify(refused.content), /does not list hamcp_house as a helper integration/);
 
-    // The template's options form skips its empty first step to the sensor's own form.
     const sensorEntry = (sensor.result as { entry_id: string }).entry_id;
     const options = await flow({ action: 'edit', entry_id: sensorEntry });
     assert.deepEqual([options.type, options.step_id], ['form', 'sensor']);

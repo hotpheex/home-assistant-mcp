@@ -3,7 +3,6 @@ import { test, type TestContext } from 'node:test';
 import type { FakeHaOptions } from './fake-ha.ts';
 import { body, connect, fakeHa, newKey, policyOf, startServer, until, withoutId } from './harness.ts';
 
-/** A house with each ADR 0008 case: area fallback, a labelled hub's child, a hidden entity and a config entity. */
 const REGISTRY = {
   areas: [{ area_id: 'kitchen', floor_id: 'ground' }, { area_id: 'living_room', floor_id: 'ground' }, { area_id: 'garage' }],
   floors: [{ floor_id: 'ground' }],
@@ -21,7 +20,6 @@ const REGISTRY = {
   ],
 } satisfies Partial<FakeHaOptions>;
 const STATES = REGISTRY.entities.map((e) => ({ entity_id: e.entity_id, state: 'off', attributes: {} }));
-/** A service's declared `target.entity` domain filter, as get_services serves it; no domain declares none. */
 const targeted = (...domain: string[]) => ({ target: { entity: [domain.length ? { domain } : {}] } });
 const SERVICES: FakeHaOptions['services'] = {
   light: { turn_on: { name: 'Turn on', fields: { brightness: { selector: { number: {} } } }, ...targeted('light') }, turn_off: targeted('light') },
@@ -40,7 +38,6 @@ async function serve(t: TestContext, rules: string, env: Record<string, string> 
   const server = await startServer(t, policyOf({ agent }, rules), ha, env);
   const client = await connect(t, server.url, agent.key, 'modern');
   const before = ha.received.length;
-  /** The commands sent since the client connected, without their ids. */
   const sent = () => ha.received.slice(before).map(withoutId);
   const call = (args: Record<string, unknown>) => client.callTool({ name: 'ha_call_service', arguments: args });
   return { ha, server, client, sent, call };
@@ -70,7 +67,6 @@ test('with HAMCP_AUDIT_WRITES an allowed write is audited by names only, before 
   assert.deepEqual(record, { ...who, decision: 'allow', entities: ['light.kitchen'], grants: [0] });
   assert.deepEqual(outcome, { ...who, outcome: 'done', context_id: 'ctx-1' });
 
-  // Recorded before sending, so a call whose outcome is unknown still leaves its allow line.
   audited.ha.drop.add('call_service');
   assert.equal((await audited.call(args)).isError, true);
   assert.deepEqual(audited.server.audits().slice(2).map((a) => [a.decision, a.outcome]), [['allow', undefined]]);
@@ -250,7 +246,6 @@ test('"HA unavailable" when nothing was sent; "outcome unknown" when the call wa
   await new Promise((resolve) => setTimeout(resolve, 50));
   t.mock.timers.tick(30_000);
   assert.equal(textOf(await stalled), unknown);
-  // The pong came back, so the call was abandoned on its own and the connection kept.
   assert.equal(server.records().filter((r) => r.msg === 'connected to Home Assistant').length, 1);
   ha.stall.clear();
 
@@ -266,7 +261,6 @@ test('"HA unavailable" when nothing was sent; "outcome unknown" when the call wa
   const read = await client.callTool({ name: 'ha_get_states', arguments: {} });
   assert.equal(textOf(read), 'HA unavailable: nothing was sent to Home Assistant. Try again later.');
 
-  // Nothing was queued: once HA is back, the refused call never fires.
   ha.restore();
   await until(() => server.records().filter((r) => r.msg === 'connected to Home Assistant').length === 2, 'HA reconnection', 5000);
   assert.equal(sent().filter((m) => m.type === 'call_service').length, 2);

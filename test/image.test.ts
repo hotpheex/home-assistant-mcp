@@ -3,7 +3,6 @@ import { execFileSync } from 'node:child_process';
 import { test } from 'node:test';
 import { body, connect, fakeHa, newKey, policyOf, runImage, USERS_TOKEN, writePolicy } from './harness.ts';
 
-/** The built image under test; CI builds one and sets this, and without it there is nothing to run. */
 const image = process.env.HAMCP_IMAGE;
 
 test('the image serves as UID 65532 on a read-only root filesystem', { skip: !image && 'HAMCP_IMAGE is not set' }, async (t) => {

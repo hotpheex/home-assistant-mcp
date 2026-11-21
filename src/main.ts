@@ -3,14 +3,15 @@ import { readFileSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { parseArgs } from 'node:util';
 import { expiryWarnings, hashKey } from './auth.ts';
-import { check } from './check.ts';
 import { NAME_LOOKUP, neededTiers } from './evaluator.ts';
-import { openGate } from './gate.ts';
+import { HaUnavailable, openGate } from './gate.ts';
 import { createHttp } from './http.ts';
-import { logger } from './log.ts';
-import { parsePolicy, policyWarnings } from './policy.ts';
+import { logger, type Log } from './log.ts';
+import { parsePolicy, policyWarnings, type Policy } from './policy.ts';
 import { unknownNames } from './resolver.ts';
-import { readSettings, readTokens } from './settings.ts';
+import { readSettings, readTokens, SettingsError } from './settings.ts';
+
+const CONNECT_WAIT_MS = 10_000;
 
 export interface Io {
   write: (line: string) => void;
@@ -22,7 +23,41 @@ export interface Running {
   close(): Promise<void>;
 }
 
-/** The CLI: `serve` (the default), `check` and `keygen`. Errors log one line and exit non-zero. */
+function loadPolicy(path: string, log: Log): Policy {
+  const policy = parsePolicy(readFileSync(path, 'utf8'));
+  log('info', 'policy loaded', { policy_sha256: policy.sha256 });
+  return policy;
+}
+
+async function checkPolicy(path: string, env: Record<string, string | undefined>, log: Log): Promise<boolean> {
+  const policy = loadPolicy(path, log);
+  const now = new Date();
+  for (const warning of [...policyWarnings(policy, now), ...expiryWarnings(policy, now)]) log('warn', warning);
+  if (env.HAMCP_HA_URL === undefined) return true;
+
+  const { HAMCP_HA_URL } = readSettings(env, path);
+  if (!env.HAMCP_HA_USERS_TOKEN && !env.HAMCP_HA_USERS_TOKEN_FILE) {
+    throw new SettingsError('check resolves names at the users tier; set HAMCP_HA_USERS_TOKEN or HAMCP_HA_USERS_TOKEN_FILE');
+  }
+  const aborted = Promise.withResolvers<never>();
+  aborted.promise.catch(() => {});
+  const gate = openGate(HAMCP_HA_URL, readTokens(env, ['users']), log, (reason) => aborted.reject(new Error(reason)));
+  const timer = setTimeout(() => aborted.reject(new Error(`Home Assistant at ${HAMCP_HA_URL} is unavailable`)), CONNECT_WAIT_MS);
+  timer.unref();
+  try {
+    await Promise.race([gate.connected, aborted.promise]);
+    const unknown = await Promise.race([unknownNames(policy, (command) => gate.send(NAME_LOOKUP, command)), aborted.promise]);
+    for (const problem of unknown) log('error', problem);
+    return unknown.length === 0;
+  } catch (e) {
+    if (e instanceof HaUnavailable) throw new Error(`Home Assistant at ${HAMCP_HA_URL} is unavailable`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    gate.close();
+  }
+}
+
 export async function run(argv: string[], env: Record<string, string | undefined>, io: Io): Promise<Running | undefined> {
   const { log, audit } = logger(io.write);
   const fail = (message: string) => {
@@ -49,7 +84,7 @@ export async function run(argv: string[], env: Record<string, string | undefined
     const path = args.positionals[1] ?? args.values.policy ?? env.HAMCP_POLICY;
     if (!path) return fail('usage: check <policy>');
     try {
-      io.exit((await check(path, env, log)) ? 0 : 1);
+      io.exit((await checkPolicy(path, env, log)) ? 0 : 1);
     } catch (e) {
       return fail((e as Error).message);
     }
@@ -60,8 +95,7 @@ export async function run(argv: string[], env: Record<string, string | undefined
   let settings, policy, tokens;
   try {
     settings = readSettings(env, args.values.policy);
-    policy = parsePolicy(readFileSync(settings.HAMCP_POLICY, 'utf8'));
-    log('info', 'policy loaded', { policy_sha256: policy.sha256 });
+    policy = loadPolicy(settings.HAMCP_POLICY, log);
     for (const warning of expiryWarnings(policy, new Date())) log('warn', warning);
     tokens = readTokens(env, neededTiers(policy));
     if (!tokens.has('admin') && (env.HAMCP_HA_ADMIN_TOKEN || env.HAMCP_HA_ADMIN_TOKEN_FILE)) {
@@ -88,7 +122,6 @@ export async function run(argv: string[], env: Record<string, string | undefined
     log('error', reason);
     void close().then(() => io.exit(1));
   });
-  // Startup's warnings wait for HA, so a name about to be created never blocks startup.
   void gate.connected
     .then(async () => {
       for (const warning of policyWarnings(policy, new Date())) log('warn', warning);

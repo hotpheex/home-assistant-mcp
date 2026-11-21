@@ -107,6 +107,11 @@ test('deletes, and script and scene writes, go to their own config endpoints', a
   assert.equal(ha.configs['automation.porch_light'], undefined);
   const gone = await automator.call('ha_write_config', { kind: 'automation', action: 'delete', id: 'porch_light_1' });
   assert.match(JSON.stringify(gone.result.content), /Resource not found/);
+  for (const badId of ['.', '..', 'a/b']) {
+    const escaped = await automator.call('ha_write_config', { kind: 'automation', action: 'delete', id: badId });
+    assert.match(JSON.stringify(escaped.result.content), /Input validation error: id:/);
+    assert.deepEqual(escaped.sent, []);
+  }
 
   const script = await (await as('scripter')).call('ha_write_config', { kind: 'script', action: 'update', id: 'morning', config: { alias: 'Early' } });
   assert.deepEqual(script.sent.map((s) => s.type), ['GET /api/config/script/config/morning', 'POST /api/config/script/config/morning']);
@@ -140,7 +145,6 @@ test('helper writes go through the helper domain WebSocket commands; an update s
   assert.deepEqual(created.sent, [{ type: 'input_boolean/create', name: 'Guest mode' }]);
   assert.deepEqual(body(created.result), { kind: 'helper', action: 'create', id: 'input_boolean.guest_mode', result: { id: 'guest_mode', name: 'Guest mode' } });
 
-  // HA replaces a helper on update, so a partial update would reset step and mode and drop the unit.
   const thermostat = { name: 'Target temp', min: 10, max: 30, step: 0.5, mode: 'box', unit_of_measurement: '°C', icon: 'mdi:thermometer' };
   await call('ha_write_config', { kind: 'helper', action: 'create', id: 'input_number.target_temp', config: thermostat });
   const icon = await call('ha_write_config', { kind: 'helper', action: 'update', id: 'input_number.target_temp', config: { icon: 'mdi:fire' } });
@@ -228,6 +232,9 @@ test('ha_get_config serves scene and helper config, masked, only to a Caller tha
   const extraEntity = await scener.call('ha_get_config', { kind: 'scene', id: 'movie_night_1', entity_id: 'scene.movie_night' });
   assert.match(JSON.stringify(extraEntity.result.content), /entity_id: is not taken for a scene, which takes only id/);
   assert.deepEqual(extraEntity.sent, []);
+  const escapedScene = await scener.call('ha_get_config', { kind: 'scene', id: '..' });
+  assert.match(JSON.stringify(escapedScene.result.content), /Input validation error: id:/);
+  assert.deepEqual(escapedScene.sent, []);
 
   for (const [who, args] of [
     ['auditor', { kind: 'scene', id: 'movie_night_1' }],
@@ -253,7 +260,6 @@ test('a config write dropped or left unanswered after it was sent reports outcom
   assert.equal(dropped.result.isError, true);
   assert.match(JSON.stringify(dropped.result.content), /Outcome unknown/);
 
-  // A REST request still unanswered a whole heartbeat beat after one saw it is abandoned.
   const scripter = (await as('scripter')).client;
   ha.hang();
   const deleted = client.callTool({ name: 'ha_write_config', arguments: { kind: 'automation', action: 'delete', id: 'porch_light_1' } });
@@ -364,7 +370,6 @@ test('zone writes share the helper path: zone WebSocket commands, an update merg
   const gone = await call('ha_get_config', { kind: 'zone', id: 'office' });
   assert.match(JSON.stringify(gone.result.content), /Zone office not found/);
 
-  // A helper Grant writes no zone, and a zone Grant no helper.
   const helperer = adminCaller(ha, await connect(t, server.url, people.helperer.key, 'modern'));
   for (const [who, args] of [
     [helperer, { kind: 'zone', action: 'create', id: 'office', config: office }],
@@ -435,7 +440,6 @@ test('a blueprint write is refused with nothing sent for the other domain, anoth
   assert.match(JSON.stringify(crossed[0]!.result.content), /no Grant for config writes of automation\. Do not retry/);
   assert.match(JSON.stringify(crossed[1]!.result.content), /no Grant for config writes of script\. Do not retry/);
 
-  // A scene writer holds config writes, but not of a kind blueprints serve, so the tool is hidden and refused.
   const scener = await as('scener');
   assert.equal((await scener.client.listTools()).tools.some((d) => d.name === 'ha_write_blueprint'), false);
   const hidden = await scener.call('ha_write_blueprint', { domain: 'automation', action: 'delete', path: 'porch' });
