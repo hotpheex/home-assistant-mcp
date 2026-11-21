@@ -1,9 +1,3 @@
-"""The e2e's fixed house, since no built-in integration makes config entities and child devices without hardware.
-
-A hub with two child devices, a plug whose hidden and config entities share its area, and a camera and an image
-whose entity_picture carries a bearer token.
-"""
-
 from homeassistant.config_entries import SOURCE_IMPORT, ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant

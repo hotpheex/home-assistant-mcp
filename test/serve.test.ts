@@ -76,14 +76,12 @@ test('a request with an Origin outside HAMCP_ALLOWED_ORIGINS gets 403 and is aud
   );
 });
 
-/** A Grant that gives each Operation, for the matrix rows that hold it. */
 const GRANT_FOR: Record<Operation, string> = {
   plain_read: 'read: plain',
   config_read: 'read: config',
   service_call: 'services: [light.turn_on]\n    targets: [{ domain: light }]',
   config_write: 'config_write: automation',
 };
-/** A holder Grant for a tool whose sample call needs more than its Operation's Grant. */
 const HOLDER_GRANT: Partial<Record<ToolName, string>> = {
   ha_helper_flow: 'config_write: helper_entry',
 };
@@ -106,11 +104,9 @@ const SAMPLE_ARGS: Record<ToolName, Record<string, unknown>> = {
   ha_write_blueprint: { domain: 'automation', action: 'create', path: 'mine/dusk', yaml: 'blueprint:\n  name: Dusk\n  domain: automation\n' },
   ha_helper_flow: { action: 'start', handler: 'template' },
 };
-/** Further holder calls, for the actions a tool's sample leaves out. */
 const MORE_ARGS: Partial<Record<ToolName, Record<string, unknown>[]>> = {
   ha_helper_flow: [{ action: 'list' }, { action: 'edit', entry_id: TEMPLATE_ENTRY }, { action: 'delete', entry_id: TEMPLATE_ENTRY }],
 };
-/** The read-only commands a read tool may send, written out here rather than taken from the gate. */
 const PURE_READS = new Set([
   'get_states',
   'get_services',
@@ -154,11 +150,14 @@ test('the gate sends only an Allowed the evaluator issued, as issued: a forged, 
   await assert.rejects(gate.subscribeOnce(forged[0]!, { type: 'render_template', template: '{{ 1 }}' }), /evaluator issued/);
   assert.throws(() => Object.assign(NAME_LOOKUP, { operation: 'service_call', write: { via: 'websocket', command: unlock } }), TypeError);
   await assert.rejects(gate.send(NAME_LOOKUP, unlock), /may not send call_service/);
-  // Only a template render may subscribe, and it may not go as a plain send, which would leave its subscription open.
   const render = { type: 'render_template', template: '{{ 1 }}' };
+  const configReadAllowed = decideRead(parsePolicy('version: 1\ncallers: { agent: { keys: [] } }\ngrants:\n  - caller: agent\n    read: config\n'), 'agent', 'config_read').allowed!;
   await assert.rejects(gate.subscribeOnce(NAME_LOOKUP, { type: 'subscribe_events', event_type: 'state_changed' }), /may not subscribe to subscribe_events/);
-  await assert.rejects(gate.subscribeOnce(decideRead(parsePolicy('version: 1\ncallers: { agent: { keys: [] } }\ngrants:\n  - caller: agent\n    read: config\n'), 'agent', 'config_read').allowed!, render), /config_read may not subscribe/);
+  await assert.rejects(gate.subscribeOnce(configReadAllowed, render), /config_read may not subscribe/);
   await assert.rejects(gate.send(NAME_LOOKUP, render), /may not send render_template/);
+  for (const path of ['/api/config/automation/config/..', '/api/config/automation/config/.', '/api/config/automation/config/%2e%2e']) {
+    await assert.rejects(gate.rest(configReadAllowed, { method: 'GET', path }), /may not send/);
+  }
   assert.equal(await gate.subscribeOnce(NAME_LOOKUP, render).then((e) => (e as { result: unknown }).result), '{{ 1 }}');
 
   const policy = parsePolicy(`version: 1\ncallers: { agent: { keys: [] } }\ngrants:\n  - caller: agent\n    services: [light.turn_on]\n    targets: [{ domain: light }]\n`);
@@ -173,7 +172,6 @@ test('the gate sends only an Allowed the evaluator issued, as issued: a forged, 
   assert.deepEqual(writes().map((r) => r.message.target), [{ entity_id: ['light.kitchen'] }]);
 });
 
-// The coverage matrix: every tool, from the code's own maps, against holding or lacking its kind.
 for (const era of ERAS) {
   for (const [tool, kind] of Object.entries(TOOL_KIND) as [ToolName, Operation][]) {
     test(`matrix: ${tool} for a Caller holding or lacking ${kind} (${era})`, async (t) => {
@@ -198,7 +196,6 @@ for (const era of ERAS) {
       }
       const sent = ha.received.slice(before);
       assert.ok(sent.length > 0);
-      // The admin pin, written out here rather than read from the code it pins.
       assert.deepEqual(new Set(sent.map((r) => r.token)), new Set([kind.startsWith('config_') ? ADMIN_TOKEN : USERS_TOKEN]));
       if (definition.annotations?.readOnlyHint) {
         assert.deepEqual(sent.map((r) => r.message.type).filter((type) => !PURE_READS.has(type)), [], 'a read tool sends only read-only commands');
@@ -207,7 +204,6 @@ for (const era of ERAS) {
       const lacking = await connect(t, server.url, idle.key, era);
       assert.deepEqual((await lacking.listTools()).tools, []);
       const quiet = ha.received.length;
-      // Refused before its input is read: valid and invalid arguments get the same denial.
       for (const args of [SAMPLE_ARGS[tool], { not_an_input: true }]) {
         const denied = await lacking.callTool({ name: tool, arguments: args });
         assert.equal(denied.isError, true);
@@ -227,7 +223,6 @@ for (const era of ERAS) {
   }
 }
 
-/** A config-write kind that only its own Grant gives, with a seeded house, a sample update of it, and a config read where ha_get_config serves the kind. */
 const KIND_SAMPLES: Partial<Record<ConfigKind, { seed: Partial<FakeHaOptions>; read?: Record<string, unknown>; write: Record<string, unknown> }>> = {
   zone: {
     seed: { zones: [{ id: 'office', name: 'Office', latitude: -33.86, longitude: 151.2, radius: 250, passive: false }] },

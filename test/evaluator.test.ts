@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import fc from 'fast-check';
-import { decideConfigRead, decideConfigWrite, decideHelperFlow, decideServiceCall, planServiceCall, type Expansion, type HelperFlow, type Selectors } from '../src/evaluator.ts';
+import { decideConfigRead, decideConfigWrite, decideHelperFlow, decideServiceCall, mergedUpdate, planServiceCall, type Expansion, type HelperFlow, type Selectors } from '../src/evaluator.ts';
 import { CONFIG_KINDS, parsePolicy, type Policy } from '../src/policy.ts';
 
 const HASH = 'a'.repeat(64);
@@ -74,8 +74,6 @@ test('an allowed call carries exactly the checked entity_id list, sorted, and no
   });
 });
 
-// Properties over generated Policies. HA's expansion is modelled as a fixed map from selector to entities,
-// wider for Denies, as primary_entities_only=false is.
 const ENTITIES = ['light.a', 'light.b', 'lock.c', 'switch.d', 'scene.e'];
 const SERVICES = ['light.turn_on', 'lock.unlock', 'switch.toggle', 'scene.apply', 'homeassistant.turn_off'];
 const PATTERNS = [...SERVICES, 'light.*', 'lock.*', 'scene.*'];
@@ -123,7 +121,6 @@ function decide(s: Scenario, grants = s.grants) {
   return decideServiceCall(policy, plan, expansion, { domain, service, data: {}, responds: false }).allowed !== undefined;
 }
 
-/** The naive oracle: does this rule reach this entity of this call, read straight from ADR 0008 and the spec? */
 function reaches(r: Rule, s: Scenario, entity: string | undefined, w: Record<string, string[]>, deny: boolean) {
   if (r.caller !== 'agent') return false;
   const delegating = s.service === 'scene.apply' || s.service.startsWith('homeassistant.');
@@ -175,6 +172,7 @@ test('property: an entity_name write is decided by its own Grant only, and its c
       const { type, entity_id, ...fields } = allowed.write.command;
       assert.deepEqual([type, entity_id], ['config/entity_registry/update', 'lock.garage']);
       assert.deepEqual(Object.keys(fields).sort(), Object.keys(config).filter((k) => ['name', 'icon', 'aliases'].includes(k)).sort());
+      assert.throws(() => mergedUpdate(allowed, { area_id: 'garage' }), /only an issued config update merges/);
     }),
   );
 });
@@ -209,10 +207,12 @@ test('property: a zone write and zone config read need a zone Grant, which write
       const policy = { grants: held.map((config_write) => ({ caller: 'agent', config_write })), denies: [] } as unknown as Policy;
       const write = decideConfigWrite(policy, 'agent', { kind, action: 'delete', id: 'office' }).allowed?.write;
       const command = write?.via === 'websocket' ? write.command.type : undefined;
-      // A wizard helper is written only through its flow.
       assert.equal(write !== undefined, held.includes(kind) && kind !== 'helper_entry');
       assert.equal(command?.startsWith('zone/') ?? false, kind === 'zone' && held.includes('zone'));
       if (kind === 'zone') assert.equal(decideConfigRead(policy, 'agent', kind).allowed !== undefined, held.includes('zone'));
+      if (kind === 'automation' || kind === 'script' || kind === 'scene') {
+        for (const badId of ['.', '..', 'a/b']) assert.equal(decideConfigWrite(policy, 'agent', { kind, action: 'delete', id: badId }).allowed, undefined);
+      }
     }),
   );
 });

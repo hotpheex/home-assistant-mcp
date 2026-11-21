@@ -4,12 +4,9 @@ import fc from 'fast-check';
 import type { Registry } from './fake-ha.ts';
 import { connect, fakeHa, newKey, startServer, USERS_TOKEN } from './harness.ts';
 
-// The path property test: generated houses, Policies and calls run through the real server against the fake,
-// and a naive oracle, written from ADR 0008 rather than from target.py, judges every call_service HA receives.
 const AREAS = ['a1', 'a2'];
 const LABELS = ['l1', 'l2'];
 const ENTITY_IDS = ['light.one', 'light.two', 'lock.three', 'lock.four', 'switch.five'];
-/** Each service's declared `target.entity` domain filter; HA acts on nothing outside it, and null declares none. */
 const FILTERS: Record<string, string[] | null> = { 'light.turn_on': ['light'], 'lock.unlock': ['lock'], 'homeassistant.turn_on': null };
 const SERVICES = Object.keys(FILTERS);
 const admits = (service: string, entityId: string) => FILTERS[service]?.includes(entityId.split('.')[0]!) ?? true;
@@ -46,7 +43,6 @@ const ruleOf = (target: fc.Arbitrary<{ domain: string } | { area: string } | { l
     { requiredKeys },
   );
 const rule = ruleOf(fc.oneof(byDomain, byArea, byLabel), ['caller', 'services']);
-// A domain Deny or one withholding entirely hides how area and label Denies expand, so those are drawn most often.
 const deny = fc.oneof({ arbitrary: rule, weight: 1 }, { arbitrary: ruleOf(fc.oneof(byArea, byLabel), ['caller', 'services', 'targets']), weight: 3 });
 const callTarget = fc.oneof(
   fc.record({ entity_id: fc.oneof(fc.constant('all'), fc.subarray(ENTITY_IDS, { minLength: 1 })) }),
@@ -64,7 +60,6 @@ type Entity = Registry['entities'][number];
 const delegating = (s: string) => s.startsWith('homeassistant.') || s === 'scene.apply';
 const names = (r: Rule, s: string, deny: boolean) => r.services.some((p) => p === s || (p.endsWith('.*') && s.startsWith(p.slice(0, -1)) && (deny || !delegating(s))));
 
-/** In an area: its own area, or no area and its device's (or parent device's) area. Hidden never; config only for a Deny. */
 function inArea(h: House, e: Entity, area: string, primary: boolean) {
   if (e.hidden_by !== null || (primary && e.entity_category !== null)) return false;
   if (e.area_id !== null) return e.area_id === area;
@@ -73,7 +68,6 @@ function inArea(h: House, e: Entity, area: string, primary: boolean) {
   return (device?.area_id ?? parent?.area_id ?? null) === area;
 }
 
-/** Reached by a label: labelled directly, through a labelled device or its parent, or through a labelled area. */
 function hasLabel(h: House, e: Entity, label: string, primary: boolean) {
   if (e.hidden_by !== null) return false;
   if (e.labels.includes(label)) return true;

@@ -28,7 +28,7 @@ const schema = z.object({
   HAMCP_AUDIT_WRITES: z.stringbool().default(false),
 });
 
-export type Settings = z.output<typeof schema>;
+type Settings = z.output<typeof schema>;
 
 export function readSettings(env: Record<string, string | undefined>, policyFlag?: string): Settings {
   const result = schema.safeParse({ ...env, HAMCP_POLICY: policyFlag ?? env.HAMCP_POLICY ?? '' });
@@ -38,7 +38,6 @@ export function readSettings(env: Record<string, string | undefined>, policyFlag
   return result.data;
 }
 
-/** Reads only the HA tokens a Grant needs, so a token nobody needs is never in memory. */
 export function readTokens(env: Record<string, string | undefined>, tiers: Iterable<Tier>): Map<Tier, string> {
   const tokens = new Map<Tier, string>();
   for (const tier of tiers) {

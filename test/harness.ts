@@ -13,7 +13,6 @@ import { startFakeHa, type FakeHaOptions, type FakeState, type Received } from '
 export const USERS_TOKEN = 'users-token';
 export const ADMIN_TOKEN = 'admin-token';
 export const ERAS = ['legacy', 'modern'] as const;
-/** All startup and `check` may send: the client's handshake, the admin check and name lookups; nothing refreshed or subscribed. */
 export const STARTUP_COMMANDS = ['supported_features', 'auth/current_user', 'get_services', 'get_states', 'extract_from_target'];
 
 const state = (entity_id: string, friendly_name: string, value: string): FakeState => ({
@@ -38,7 +37,6 @@ export const HOUSE: FakeState[] = [
     attributes: { friendly_name: 'Den Speaker', entity_picture: '/api/media_player_proxy/media_player.den?token=MEDIASECRET&cache=42' },
   },
 ];
-/** The house's registries: the coffee maker is in an area through its device, the lamp has an alias, and the lock a label. */
 export const REGISTRIES: Partial<FakeHaOptions> = {
   entities: [
     { entity_id: 'switch.coffee_maker', device_id: 'dev_coffee' },
@@ -51,7 +49,6 @@ export const REGISTRIES: Partial<FakeHaOptions> = {
   floors: [{ floor_id: 'ground', name: 'Ground Floor' }],
 };
 
-/** Admin-only content: configs and a helper with inline secrets, and runs whose trace holds a camera state and a password. */
 export const CONFIGS: Partial<FakeHaOptions> = {
   configs: {
     'automation.porch_light': {
@@ -103,7 +100,6 @@ export const CONFIGS: Partial<FakeHaOptions> = {
   })),
 };
 
-/** Two storage dashboards, one never saved and with a collection id HA suffixed, and a layout with an inline secret; `lovelace` keys the default dashboard's layout. */
 export const DASHBOARDS: Partial<FakeHaOptions> = {
   dashboards: [
     { id: 'kitchen_wall', url_path: 'kitchen-wall', title: 'Kitchen wall', icon: 'mdi:tablet', show_in_sidebar: true, require_admin: false, mode: 'storage' },
@@ -120,7 +116,6 @@ export function newKey() {
   return { key, sha256: createHash('sha256').update(key).digest('hex') };
 }
 
-/** A Policy declaring a Caller per key, followed by `rules`, its grants and denies in YAML. */
 export const policyOf = (keys: Record<string, { sha256: string }>, rules: string) =>
   `version: 1\ncallers:\n${Object.entries(keys).map(([name, { sha256 }]) => `  ${name}:\n    keys: [{ sha256: ${sha256} }]\n`).join('')}${rules}`;
 
@@ -138,7 +133,6 @@ export async function fakeHa(t: TestContext, options: Partial<FakeHaOptions> = {
   return ha;
 }
 
-/** Runs the CLI in-process as a deployer would: argv and env in; stdout lines and the exit code out. */
 export async function runCli(t: TestContext, args: string[], env: Record<string, string | undefined>) {
   const lines: string[] = [];
   let exit: (code: number) => void = () => {};
@@ -160,7 +154,6 @@ export async function until(check: () => boolean, what: string, ms = 2000) {
   if (!check()) throw new Error(`timed out waiting for ${what}`);
 }
 
-/** Starts the server against `ha` and waits until every needed tier is connected and startup's warnings are logged. */
 export async function startServer(
   t: TestContext,
   policy: string,
@@ -200,7 +193,6 @@ export function body(result: unknown): unknown {
 
 export const withoutId = ({ message }: Received) => Object.fromEntries(Object.entries(message).filter(([k]) => k !== 'id'));
 
-/** Calls a tool, returning the result and what reached HA, after asserting all of it went at the admin tier and no secret came back. */
 export const adminCaller = (ha: { received: Received[] }, client: Client) => async (name: string, args: Record<string, unknown>) => {
   const before = ha.received.length;
   const result = await client.callTool({ name, arguments: args });
@@ -210,10 +202,6 @@ export const adminCaller = (ha: { received: Received[] }, client: Client) => asy
   return { result, sent: sent.map(withoutId) };
 };
 
-/**
- * Runs the built image as a deployer would, read-only and on the host network so it reaches HA on loopback.
- * Each stdout line is a log record, and `cleanup` registers the container's removal.
- */
 export function runImage(image: string, policy: string, env: Record<string, string>, cleanup: (fn: () => void) => void) {
   const name = `hamcp-image-test-${randomBytes(4).toString('hex')}`;
   const settings = { HAMCP_POLICY: '/policy.yaml', HAMCP_LISTEN: '127.0.0.1:0', ...env };
@@ -230,7 +218,6 @@ export function runImage(image: string, policy: string, env: Record<string, stri
   return { name, records, exited, logged, url: () => `http://${String(records.find((r) => r.msg === 'listening')?.address)}/mcp` };
 }
 
-/** A template sensor set up through its wizard, and a Hue bridge, an integration no helper_entry call may change; ids are HA's ULIDs. */
 export const TEMPLATE_ENTRY = '01K9W1ZARDTEMP1ATESENS0R01';
 export const HUE_ENTRY = '01K9HUEBR1DGE0000000000001';
 export const WIZARD_ENTRIES: Partial<FakeHaOptions> = {

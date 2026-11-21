@@ -7,9 +7,8 @@ import { auditFor, type Audit, type Log } from './log.ts';
 import type { Policy } from './policy.ts';
 import { buildServer, type AuditOptions } from './tools.ts';
 
-const status = (res: ServerResponse, status: number, headers: Record<string, string> = {}) => void res.writeHead(status, headers).end();
+const status = (res: ServerResponse, code: number, headers: Record<string, string> = {}) => void res.writeHead(code, headers).end();
 
-/** Streamable HTTP at /mcp for both protocol eras, statelessly. Each request is checked in order: Origin, key, then the SDK. */
 export function createHttp(policy: Policy, allowedOrigins: ReadonlySet<string>, gate: Gate, log: Log, audit: Audit, options: AuditOptions) {
   const authenticate = authenticator(policy);
   const mcp = createMcpHandler(({ authInfo }) => buildServer(policy, gate, audit, authInfo?.extra?.caller as Authenticated, options), {
@@ -18,7 +17,6 @@ export function createHttp(policy: Policy, allowedOrigins: ReadonlySet<string>, 
   const handle = toNodeHandler(mcp);
   const http = createServer((req: IncomingMessage & { auth?: AuthInfo }, res) => {
     const path = new URL(req.url ?? '/', 'http://x').pathname;
-    // Probes are unauthenticated, so they answer with a status and nothing else.
     if (path === '/healthz') return status(res, 200);
     if (path === '/readyz') return status(res, gate.ready() ? 200 : 503);
     if (path !== '/mcp') return status(res, 404);

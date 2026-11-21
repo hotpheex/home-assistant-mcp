@@ -3,7 +3,6 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import { ESLint } from 'eslint';
 
-/** The whole runtime-dependency allowlist; any other direct runtime dependency fails CI. */
 const RUNTIME_ALLOWLIST = [
   '@modelcontextprotocol/node',
   '@modelcontextprotocol/server',
@@ -52,9 +51,10 @@ test('lint fails on any import of the HA client or any fetch outside the gate', 
     assert.ok(outside.length > 0 && outside.every((id) => /^(@typescript-eslint\/)?no-restricted-/.test(id ?? '')), code);
     assert.deepEqual(await ruleIds(code, 'src/gate.ts'), [], code);
   }
-  // The listener needs node:http's server side, and a type import carries no code.
   const server = "import { createServer, type IncomingMessage } from 'node:http';\nimport type { AddressInfo } from 'node:net';\nexport type T = [IncomingMessage, AddressInfo];\nexport { createServer };\n";
   assert.deepEqual(await ruleIds(server, 'src/tools.ts'), []);
+  assert.ok((await ruleIds(reachesHa[0]!, 'src/tools/reads.ts')).length > 0);
+  assert.ok((await ruleIds(reachesHa[0]!, 'src/ha.ts')).length > 0);
 });
 
 test('lint fails on minting an Allowed outside the evaluator', async () => {
